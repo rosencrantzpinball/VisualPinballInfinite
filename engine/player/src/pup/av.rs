@@ -32,6 +32,7 @@ struct RawItem {
     pcm: *const f32,
 }
 
+#[cfg(windows)]
 unsafe extern "C" {
     fn vpi_av_load(dir: *const u16) -> i32;
     fn vpi_av_open(path: *const c_char, want_video: i32, want_audio: i32, out_rate: i32, info: *mut RawInfo) -> *mut c_void;
@@ -43,6 +44,42 @@ unsafe extern "C" {
     fn vpi_av_writer_sound(writer: *mut c_void, samples: *const f32, frames: i32) -> i32;
     fn vpi_av_writer_close(writer: *mut c_void) -> i32;
 }
+
+/// Off on Linux for now (the bridge loads FFmpeg's libraries the Windows way): FFmpeg is never found
+/// there, so a pack's screens show without their media, and nothing else is called.
+#[cfg(not(windows))]
+#[allow(clippy::missing_safety_doc)]
+mod off {
+    use super::{RawInfo, RawItem};
+    use std::ffi::{c_char, c_void};
+    pub unsafe fn vpi_av_load(_dir: *const u16) -> i32 {
+        0
+    }
+    pub unsafe fn vpi_av_open(_path: *const c_char, _video: i32, _audio: i32, _rate: i32, _info: *mut RawInfo) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+    pub unsafe fn vpi_av_next(_media: *mut c_void, _item: *mut RawItem) -> i32 {
+        0
+    }
+    pub unsafe fn vpi_av_rewind(_media: *mut c_void) -> i32 {
+        0
+    }
+    pub unsafe fn vpi_av_close(_media: *mut c_void) {}
+    pub unsafe fn vpi_av_writer_open(_path: *const c_char, _w: i32, _h: i32, _fps: i32, _rate: i32, _error: *mut c_char, _len: i32) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+    pub unsafe fn vpi_av_writer_frame(_writer: *mut c_void, _rgba: *const u8) -> i32 {
+        0
+    }
+    pub unsafe fn vpi_av_writer_sound(_writer: *mut c_void, _samples: *const f32, _frames: i32) -> i32 {
+        0
+    }
+    pub unsafe fn vpi_av_writer_close(_writer: *mut c_void) -> i32 {
+        0
+    }
+}
+#[cfg(not(windows))]
+use off::*;
 
 /// The folders FFmpeg's libraries are looked for in, in order.
 fn folders() -> Vec<PathBuf> {

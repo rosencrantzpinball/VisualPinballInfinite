@@ -48,15 +48,17 @@ pub struct Report {
     pub seconds: f64,
 }
 
-/// Where the headless runner is: beside this program, else the repository's build (developing).
+/// Where the headless runner is: beside this program, or a folder up (the headset's panel, in the
+/// Frame's game's `panel`), else the repository's build (developing).
 pub fn runner() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    let beside = dir.join("vpi-headless.exe");
-    if beside.exists() {
-        return Some(beside);
+    let name = format!("vpi-headless{}", std::env::consts::EXE_SUFFIX);
+    let near = [Some(dir.join(&name)), dir.parent().map(|up| up.join(&name))];
+    if let Some(found) = near.into_iter().flatten().find(|p| p.exists()) {
+        return Some(found);
     }
-    dir.ancestors().take(4).map(|up| up.join(r"target\release\vpi-headless.exe")).find(|p| p.exists())
+    dir.ancestors().take(4).map(|up| up.join("target").join("release").join(&name)).find(|p| p.exists())
 }
 
 fn quiet(cmd: &mut Command) -> &mut Command {

@@ -252,13 +252,13 @@ fn check(file: &str, exact: bool) {
 }
 
 #[test]
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn collision_search_matches_exact_vpx() {
     check("vpx-trees-5436-precise.txt", true);
 }
 
 #[test]
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn collision_search_matches_shipped_vpx() {
     check("vpx-trees-5436.txt", false);
 }

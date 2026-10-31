@@ -204,6 +204,8 @@ pub struct World {
     pub vpx: Arc<VPX>,
     /// Which of the table's views is shown (scripts ask: `ShowDT`).
     pub view: crate::camera::View,
+    /// Played in VR (scripts ask: `RenderingMode` is 2), whatever the view.
+    pub vr: bool,
     pub gravity: TableGravity,
     pub table_name: String,
     pub parts: Vec<Part>,
@@ -612,6 +614,7 @@ impl World {
         };
         World {
             view,
+            vr: false,
             gravity,
             table_name: if vpx.gamedata.name.is_empty() { "Table1".into() } else { vpx.gamedata.name.clone() },
             vpx,

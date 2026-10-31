@@ -27,25 +27,6 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-#[cfg(target_arch = "x86_64")]
-fn set_ftz_daz() -> u32 {
-    let mut old: u32 = 0;
-    // SAFETY: reads and writes the SSE control register of the current thread only; the inputs
-    // are read from a file at run time, so no constant folding is involved.
-    unsafe {
-        std::arch::asm!("stmxcsr [{}]", in(reg) &mut old, options(nostack));
-        let new = old | 0x8040;
-        std::arch::asm!("ldmxcsr [{}]", in(reg) &new, options(nostack));
-    }
-    old
-}
-
-#[cfg(target_arch = "x86_64")]
-fn restore_mxcsr(old: u32) {
-    // SAFETY: restores the value saved by set_ftz_daz on the same thread.
-    unsafe { std::arch::asm!("ldmxcsr [{}]", in(reg) &old, options(nostack)) };
-}
-
 /// Reads one line's tokens by type.
 struct Cursor<'a> {
     t: Vec<&'a str>,
@@ -258,7 +239,8 @@ struct KindStats {
 }
 
 #[test]
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg_attr(target_arch = "aarch64", ignore = "on ARM, glibc's sinf and cosf differ from Microsoft's in the last bit for about 1 % of angles, and an invalid result's NaN is positive: run with --ignored for the report")]
 fn ported_colliders_and_ball_match_exact_vpx_bit_for_bit() {
     let data = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/vpx-collide-5436-precise.txt"))
         .expect("reference data");
@@ -268,7 +250,7 @@ fn ported_colliders_and_ball_match_exact_vpx_bit_for_bit() {
 }
 
 #[test]
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn shipped_vpx_drifts_from_the_port_only_by_float_noise() {
     let data = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/vpx-collide-5436.txt"))
         .expect("reference data");
@@ -278,7 +260,9 @@ fn shipped_vpx_drifts_from_the_port_only_by_float_noise() {
 }
 
 fn compare(data: &str, mode: Mode) -> (String, usize) {
-    let old_csr = set_ftz_daz();
+    // VPX's processor mode (flush-to-zero, denormals-are-zero); the inputs are read from a file at
+    // run time, so no constant folding is involved
+    let float_mode = physics_compat::fpmode::VpxFloatMode::enter();
 
     let mut env = PhysicsEnv::default();
     let mut stats: BTreeMap<&str, KindStats> = BTreeMap::new();
@@ -551,7 +535,7 @@ fn compare(data: &str, mode: Mode) -> (String, usize) {
             }
         }
     }
-    restore_mxcsr(old_csr);
+    drop(float_mode);
 
     let mut report = String::new();
     let mut total_bad = 0;

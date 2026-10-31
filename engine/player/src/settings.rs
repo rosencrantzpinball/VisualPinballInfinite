@@ -48,11 +48,12 @@ impl Settings {
     }
 
     /// These with the table's own settings file over them (VPX's `<table>.ini` beside the
-    /// table, `PinTable::GetSettingsFileName`): its values count before these, as VPX's table
-    /// settings come before their parent, the application's (`LayeredINIPropertyStore`). As
+    /// table, `PinTable::GetSettingsFileName`; VPI's copy of it once it has saved one where tables
+    /// are only read, `vpi_settings::table_settings_read`): its values count before these, as VPX's
+    /// table settings come before their parent, the application's (`LayeredINIPropertyStore`). As
     /// they were when the table has none.
     pub fn with_table(self, table: &Path) -> Settings {
-        let file = table.with_extension("ini");
+        let file = vpi_settings::table_settings_read(&table.with_extension("ini"));
         let own = std::fs::read(&file).ok().map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
         // a screen preset the table's settings (or the main ones) name, between the two (a No Topper
         // preset and the like, chosen for a table)
@@ -325,7 +326,7 @@ pub unsafe fn physical_size_cm(id: sdl3_sys::everything::SDL_DisplayID) -> Optio
 /// # Safety
 /// None needed.
 #[cfg(not(windows))]
-pub unsafe fn physical_size_cm(_id: u32) -> Option<(f32, f32)> {
+pub unsafe fn physical_size_cm(_id: sdl3_sys::everything::SDL_DisplayID) -> Option<(f32, f32)> {
     None
 }
 

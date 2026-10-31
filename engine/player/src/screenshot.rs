@@ -88,10 +88,11 @@ pub fn screens(settings: &crate::settings::Settings) -> Option<Vec<String>> {
 /// The table's folder of screenshots: `Screenshots\<table>` in the player's data folder.
 pub fn folder(table: &Path) -> Option<PathBuf> {
     let stem = table.file_stem()?.to_string_lossy().into_owned();
-    Some(PathBuf::from(std::env::var_os("APPDATA")?).join("Visual Pinball Infinite").join("Screenshots").join(stem))
+    Some(vpi_settings::data_folder()?.join("Screenshots").join(stem))
 }
 
 /// Now, local time, as a file's name begins: `2025-01-02 21-14-05`.
+#[cfg(windows)]
 pub(crate) fn stamp() -> String {
     #[repr(C)]
     #[derive(Default)]
@@ -113,6 +114,13 @@ pub(crate) fn stamp() -> String {
     // SAFETY: fills the structure it's given
     unsafe { GetLocalTime(&mut t) };
     format!("{:04}-{:02}-{:02} {:02}-{:02}-{:02}", t.year, t.month, t.day, t.hour, t.minute, t.second)
+}
+
+/// Now, local time, as a file's name begins: `2025-01-02 21-14-05`.
+#[cfg(not(windows))]
+pub(crate) fn stamp() -> String {
+    let t = crate::local_time::local();
+    format!("{:04}-{:02}-{:02} {:02}-{:02}-{:02}", t.year + 1900, t.mon + 1, t.mday, t.hour, t.min, t.sec)
 }
 
 /// The pictures taken, each window's RGBA pixels and size, saved as PNGs on a thread of their own

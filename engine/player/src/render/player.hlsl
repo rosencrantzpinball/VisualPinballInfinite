@@ -45,7 +45,9 @@ struct Varyings
     float3 normal : TEXCOORD1;
     float2 uv : TEXCOORD2;
     float3 to_eye : TEXCOORD3;
+#ifndef NO_CLIP
     float clip_distance : SV_ClipDistance0;
+#endif
 };
 
 Varyings vs_main(VertexInput input)
@@ -60,7 +62,39 @@ Varyings vs_main(VertexInput input)
     result.uv = input.uv;
     result.to_eye = eye.xyz - world.xyz;
     // VPX's reflection probes: the mirrored view keeps what's above the mirror (vs_basic.sc's CLIP)
+#ifndef NO_CLIP
     result.clip_distance = dot(clip_plane, float4(world.xyz, 1.0));
+#endif
+    return result;
+}
+
+// Test runs only (VPI_TEST_NULL_VS=1): no vertex read nor shaded, every point right of the view, so
+// what's left is each triangle's own cost (its assembly and rejection), weighed against vs_main's
+Varyings vs_null()
+{
+    Varyings result = (Varyings)0;
+    result.clip = float4(2.0, 0.0, 0.5, 1.0);
+    return result;
+}
+
+// Test runs only (VPI_TEST_POSITION_VS=1): each vertex's position read and placed, as vs_main does, and nothing
+// else read or handed on, every point then right of the view (as VPI_TEST_OFFSCREEN has it): weighs what a vertex
+// carries against how many there are
+struct PositionInput
+{
+    float3 position : TEXCOORD0;
+};
+
+struct PositionOnly
+{
+    float4 clip : SV_Position;
+};
+
+PositionOnly vs_position(PositionInput input)
+{
+    float4 world = mul(float4(input.position, 1.0), model);
+    PositionOnly result;
+    result.clip = mul(float4(world.xyz - camera.xyz, 1.0), rot_view_proj);
     return result;
 }
 

@@ -3,6 +3,7 @@
 //! window has them again, as VPX's `IsPlaying` holds play while its window isn't focused. Which
 //! window took them is said in the log, as VPX's `OnFocusChanged` says it. Ours.
 
+#[cfg(windows)]
 use std::ffi::c_void;
 
 /// The notice the table's window shows while play waits for the keyboard.
@@ -10,6 +11,7 @@ pub const NOTICE: &str = "Paused: another window has the keyboard. Click the tab
 
 /// The program and title of the window that has the keyboard now, for the log: "Discord.exe
 /// (“Friends”)", or "no window" when none has it.
+#[cfg(windows)]
 pub fn foreground_window() -> String {
     unsafe extern "system" {
         fn GetForegroundWindow() -> *mut c_void;
@@ -49,4 +51,10 @@ pub fn foreground_window() -> String {
         }
         if title.is_empty() { program } else { format!("{program} (\u{201c}{title}\u{201d})") }
     }
+}
+
+/// Elsewhere (Linux) another program's windows can't be asked about.
+#[cfg(not(windows))]
+pub fn foreground_window() -> String {
+    "another window".into()
 }

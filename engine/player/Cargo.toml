@@ -35,9 +35,6 @@ colour-link = { path = "../colour-link" }
 dof-link = { path = "../dof-link" }
 dmd-link = { path = "../dmd-link" }
 roxmltree = "0.21"
-# Built into the program, with no C runtime of its own: the program carries the
-# runtime it uses itself, and two copies would clash.
-sdl3-sys = { version = "0.7", default-features = false, features = ["build-from-source-static", "no-sdl-libc"] }
 # PinUP labels' text, as VPX draws it: SDL_ttf with its own FreeType and HarfBuzz, built in
 # statically like SDL; no SVG glyphs (plutosvg), which packs' fonts don't use
 sdl3-ttf-sys = { version = "0.7", default-features = false, features = ["build-static-vendored", "no-sdlttf-plutosvg"] }
@@ -48,6 +45,20 @@ table-physics = { path = "../table-physics" }
 vpin = "0.38"
 # The settings file's own rules, shared with the app's settings pages
 vpi-settings = { path = "../settings" }
+
+# Built into the program, with no C runtime of its own: the program carries the
+# runtime it uses itself, and two copies would clash.
+[target.'cfg(windows)'.dependencies]
+sdl3-sys = { version = "0.7", default-features = false, features = ["build-from-source-static", "no-sdl-libc"] }
+
+# Built into the program too; on Linux SDL uses the system's C library, as every program there does
+# (SDL 3.4.18 doesn't build for Linux without it)
+[target.'cfg(not(windows))'.dependencies]
+sdl3-sys = { version = "0.7", default-features = false, features = ["build-from-source-static"] }
+# OpenXR's types, for VR on Linux (the Steam Frame): the loader itself is loaded at run time (src/xr)
+openxr-sys = "0.14"
+# the link to vpi-panel, the app's screens in the headset (src/panel.rs)
+panel-link = { path = "../panel-link" }
 
 [build-dependencies]
 # The bridge to FFmpeg for PinUP packs' media (native/pup_av.cpp)

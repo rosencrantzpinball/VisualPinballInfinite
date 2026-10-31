@@ -32,11 +32,11 @@ impl MachineSettings {
         Self::file_for(settings).and_then(|f| std::fs::read_to_string(f).ok()).map_or_else(MachineSettings::default, |t| Self::from_text(&t))
     }
 
-    /// Where the file is: beside the settings file, else in `%APPDATA%\Visual Pinball Infinite`.
+    /// Where the file is: beside the settings file, else in the player's data folder (`%APPDATA%\Visual Pinball Infinite`).
     pub fn file_for(settings: Option<&Path>) -> Option<PathBuf> {
         let dir = match settings.and_then(Path::parent) {
             Some(d) => d.to_path_buf(),
-            None => PathBuf::from(std::env::var_os("APPDATA")?).join("Visual Pinball Infinite"),
+            None => vpi_settings::data_folder()?,
         };
         Some(dir.join("Machine settings.ini"))
     }

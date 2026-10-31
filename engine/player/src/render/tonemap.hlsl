@@ -239,7 +239,7 @@ float3 hdr10_out(float3 col, bool gamma_out, bool wcg)
     return pow((c1 + c2 * cp) / (1.0 + c3 * cp), m2);
 }
 
-float4 tonemap_fs(TonemapVaryings v) : SV_Target0
+float4 tonemapped(TonemapVaryings v)
 {
     int2 texel = int2(v.clip.xy);
     // VPX's nudge shake, with the still parts drawn once: the whole picture moved, filtered, black
@@ -297,4 +297,22 @@ float4 tonemap_fs(TonemapVaryings v) : SV_Target0
     g = color_grade(g);
     // a target that encodes sRGB itself gets the linear value that it encodes back to this
     return float4(tonemap_flags.z != 0.0 ? tonemap_inv_srgb(g) : g, 1.0);
+}
+
+float4 tonemap_fs(TonemapVaryings v) : SV_Target0
+{
+    return tonemapped(v);
+}
+
+// ---- VR's passthrough (alpha blend), when no pass follows the tonemapping ----
+//
+// The picture's alpha from the scene's depth, as post.hlsl's environment_alpha_fs writes it otherwise: opaque
+// wherever the table or its room drew, see-through where nothing did (the depth still cleared).
+Texture2D<float> tonemap_depth : register(t4, space2);
+SamplerState tonemap_depth_sampler : register(s4, space2);
+
+float4 tonemap_environment_alpha_fs(TonemapVaryings v) : SV_Target0
+{
+    float depth = tonemap_depth.SampleLevel(tonemap_depth_sampler, v.clip.xy * tonemap_frame.yz, 0.0);
+    return float4(tonemapped(v).rgb, depth == 1.0 ? 0.0 : 1.0);
 }

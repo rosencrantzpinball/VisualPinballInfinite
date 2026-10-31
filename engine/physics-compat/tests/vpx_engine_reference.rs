@@ -285,7 +285,7 @@ fn report(file: &str, results: &[SceneResult], drift: bool) -> String {
 }
 
 #[test]
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn engine_matches_exact_vpx_bit_for_bit() {
     let file = "vpx-engine-5436-precise.txt";
     let results = compare(file, false);
@@ -296,7 +296,7 @@ fn engine_matches_exact_vpx_bit_for_bit() {
 }
 
 #[test]
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn shipped_vpx_drift_report() {
     let file = "vpx-engine-5436.txt";
     let results = compare(file, true);

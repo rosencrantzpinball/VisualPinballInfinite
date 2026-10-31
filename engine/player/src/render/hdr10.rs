@@ -263,6 +263,7 @@ mod tests {
         assert_eq!(hdr[3], 1.0);
     }
 
+    #[cfg(windows)]
     #[test]
     fn the_hdr10_shaders_compile() {
         use super::super::{OVERLAY_HLSL, TONEMAP_HLSL, fxc};

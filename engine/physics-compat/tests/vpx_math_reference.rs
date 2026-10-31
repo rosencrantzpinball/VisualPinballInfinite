@@ -20,27 +20,6 @@ use physics_compat::math::equations::solve_quadratic_eq;
 use physics_compat::math::{Matrix3, Vertex2D, Vertex3Ds, cross_product};
 use std::collections::BTreeMap;
 
-/// Sets flush-to-zero and denormals-are-zero on this thread (MXCSR | 0x8040), as VPX's player does
-/// on its physics thread, and returns the previous MXCSR.
-#[cfg(target_arch = "x86_64")]
-fn set_ftz_daz() -> u32 {
-    let mut old: u32 = 0;
-    // SAFETY: reads and writes the SSE control register of the current thread only. The floats
-    // compared here are read from a file at run time, so no constant folding is involved.
-    unsafe {
-        std::arch::asm!("stmxcsr [{}]", in(reg) &mut old, options(nostack));
-        let new = old | 0x8040;
-        std::arch::asm!("ldmxcsr [{}]", in(reg) &new, options(nostack));
-    }
-    old
-}
-
-#[cfg(target_arch = "x86_64")]
-fn restore_mxcsr(old: u32) {
-    // SAFETY: restores the value saved by set_ftz_daz on the same thread.
-    unsafe { std::arch::asm!("ldmxcsr [{}]", in(reg) &old, options(nostack)) };
-}
-
 fn f(u: u32) -> f32 {
     f32::from_bits(u)
 }
@@ -185,24 +164,28 @@ fn compute(name: &str, i: &[u32], rngs: &mut Rngs) -> Vec<u32> {
 /// Against VPX's own build (`/fp:fast`). The standalone math calls in the dump happen to compile
 /// to the source's arithmetic even with fast math, so these match bit for bit too.
 #[test]
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg_attr(target_arch = "aarch64", ignore = "on ARM, glibc's sinf and cosf differ from Microsoft's in the last bit for about 1 % of angles, and an invalid result's NaN is positive: run with --ignored for the report")]
 fn ported_math_matches_vpx_bit_for_bit() {
     compare_file("vpx-math-5436.txt");
 }
 
 /// Against VPX built with exact float semantics (`/fp:precise`).
 #[test]
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg_attr(target_arch = "aarch64", ignore = "on ARM, glibc's sinf and cosf differ from Microsoft's in the last bit for about 1 % of angles, and an invalid result's NaN is positive: run with --ignored for the report")]
 fn ported_math_matches_exact_vpx_bit_for_bit() {
     compare_file("vpx-math-5436-precise.txt");
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn compare_file(file: &str) {
     let path = format!("{}/tests/data/{file}", env!("CARGO_MANIFEST_DIR"));
     let data = std::fs::read_to_string(&path).expect("reference data");
 
-    let old_csr = set_ftz_daz();
+    // VPX's processor mode (flush-to-zero, denormals-are-zero). The floats compared here are read
+    // from a file at run time, so no constant folding is involved.
+    let float_mode = physics_compat::fpmode::VpxFloatMode::enter();
     let mut rngs = Rngs { r01: Mwc64x::new(), rm11: Mwc64x::new() };
     // per function: (lines, mismatches, first few mismatches, zero-class-only differences)
     let mut stats: BTreeMap<String, (usize, usize, Vec<String>, usize)> = BTreeMap::new();
@@ -234,7 +217,7 @@ fn compare_file(file: &str) {
             }
         }
     }
-    restore_mxcsr(old_csr);
+    drop(float_mode);
 
     let mut report = String::new();
     let mut total_bad = 0;

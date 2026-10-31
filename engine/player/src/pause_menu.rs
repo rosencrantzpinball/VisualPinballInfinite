@@ -277,6 +277,30 @@ pub struct Setup {
     pub picture_only: bool,
     /// The table's view, for its page (none: no view page).
     pub view: Option<Viewing>,
+    /// In VR, the tables the player can change to (the Frame's tables folder), and the one playing:
+    /// the "Change the table" page, whose choice ends play to start again with it (`switch_to`).
+    pub tables: Vec<PathBuf>,
+    pub playing: Option<PathBuf>,
+    /// In VR, with the headset's panel beside the player (`vpi-panel`): the library's row, which ends
+    /// play for the library (`to_library`).
+    pub library: bool,
+    /// In VR: the menu is a panel in the room, pointed at with the controllers, and its hints say so.
+    pub headset: bool,
+}
+
+/// The table chosen on the "Change the table" page, once play has ended for it.
+static SWITCH_TO: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// The library chosen, once play has ended for it.
+static TO_LIBRARY: AtomicBool = AtomicBool::new(false);
+
+/// The library chosen in the menu (VR: the player starts again on it, the headset's panel).
+pub fn to_library() -> bool {
+    TO_LIBRARY.load(Ordering::Acquire)
+}
+
+/// The table to play next, chosen in the menu (VR: the player starts again with it).
+pub fn switch_to() -> Option<PathBuf> {
+    SWITCH_TO.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// The table's view for its page: which of its setups is drawn, as it plays now, and its own — the
@@ -622,6 +646,11 @@ enum Row {
     Cam(Cam),
     /// The view back to the table's own.
     OwnView,
+    /// VR: the page of tables to change to, and one of them.
+    Tables,
+    Table(usize),
+    /// VR: the library on the headset's panel, which play ends for (`to_library`).
+    Library,
     Back,
 }
 
@@ -633,6 +662,7 @@ enum Page {
     Rules,
     Controls,
     Achievements,
+    Tables,
 }
 
 /// What a press in the menu asks of the game.
@@ -932,6 +962,8 @@ impl Menu {
                     crate::achievements::active().then_some(Row::Achievements),
                     Some(Row::Controls),
                     self.recording.is_some().then_some(Row::Record),
+                    (!self.setup.tables.is_empty()).then_some(Row::Tables),
+                    self.setup.library.then_some(Row::Library),
                 ];
                 for (k, r) in table.into_iter().flatten().enumerate() {
                     rows.push(((k == 0).then_some("Table"), r));
@@ -961,6 +993,11 @@ impl Menu {
                 rows
             }
             Page::Rules | Page::Controls | Page::Achievements => vec![(None, Row::Back)],
+            Page::Tables => {
+                let mut rows: Vec<(Option<&'static str>, Row)> = (0..self.setup.tables.len()).map(|k| (None, Row::Table(k))).collect();
+                rows.push((Some(""), Row::Back));
+                rows
+            }
         }
     }
 
@@ -1046,18 +1083,38 @@ impl Menu {
             Row::Resume => Outcome::Close,
             Row::Quit => Outcome::Quit,
             Row::Record => Outcome::Record,
-            Row::Options | Row::View | Row::Rules | Row::Controls | Row::Achievements => {
+            Row::Options | Row::View | Row::Rules | Row::Controls | Row::Achievements | Row::Tables => {
                 self.main_selected = self.selected;
                 let page = match row {
                     Row::Options => Page::Options,
                     Row::View => Page::View,
                     Row::Rules => Page::Rules,
                     Row::Achievements => Page::Achievements,
+                    Row::Tables => Page::Tables,
                     _ => Page::Controls,
                 };
-                (self.page, self.selected, self.rules_top) = (page, 0, 0);
+                // the tables' page opens on the one playing
+                let first = match page {
+                    Page::Tables => self.setup.tables.iter().position(|t| Some(t) == self.setup.playing.as_ref()).unwrap_or(0),
+                    _ => 0,
+                };
+                (self.page, self.selected, self.rules_top) = (page, first, 0);
                 Outcome::Nothing
             }
+            // another table: play ends, to start again with it; the one playing plays on
+            Row::Table(k) => match self.setup.tables.get(k) {
+                Some(t) if Some(t) != self.setup.playing.as_ref() && !self.setup.picture_only => {
+                    *SWITCH_TO.lock().unwrap_or_else(|e| e.into_inner()) = Some(t.clone());
+                    Outcome::Quit
+                }
+                _ => Outcome::Close,
+            },
+            // the library: play ends, to start again on it
+            Row::Library if !self.setup.picture_only => {
+                TO_LIBRARY.store(true, Ordering::Release);
+                Outcome::Quit
+            }
+            Row::Library => Outcome::Close,
             Row::Back => self.back(),
             Row::Level(_) | Row::Option(_) | Row::ResetLevels | Row::ResetOptions | Row::Cam(_) | Row::OwnView => Outcome::Nothing,
         }
@@ -1182,18 +1239,40 @@ impl Menu {
                     }
                 }
                 Row::Back => link(section, "Back", false),
+                Row::Tables => link(section, "Change the table", true),
+                Row::Library => link(section, "The library", false),
+                Row::Table(k) => {
+                    let t = &self.setup.tables[k];
+                    RowView {
+                        section: section.map(str::to_string),
+                        label: t.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+                        value: (Some(t) == self.setup.playing.as_ref()).then(|| "playing".to_string()),
+                        bar: None,
+                        opens: false,
+                        changes: false,
+                    }
+                }
             })
             .collect();
         // the achievements' page: each one's line, and how what's earned is kept
         let (achieved, kept) = if self.page == Page::Achievements { crate::achievements::page() } else { (Vec::new(), String::new()) };
-        let scroll = "Magna-saves, \u{2191} \u{2193} or the wheel to scroll, Esc to go back";
+        // in the headset: the controllers (`vr.rs` points into the menu; the left View button opens and closes it)
+        let headset = self.setup.headset;
+        let (scroll, change, back) = if headset {
+            ("Point at it and push the right stick to scroll, Back to go back", "The trigger on a value's left or right half changes it", "Back to go back")
+        } else {
+            ("Magna-saves, \u{2191} \u{2193} or the wheel to scroll, Esc to go back", "Flippers or arrow keys to change", "Esc to go back")
+        };
         let (heading, hint) = match self.page {
+            Page::Main if headset => ("Paused", "Point and pull the trigger: a row to choose it, a bar to set it\nResume or the left controller's View button to play on".to_string()),
             Page::Main => ("Paused", "Magna-saves, \u{2191} \u{2193} or the mouse to move, flippers or arrow keys to change\nStart, Enter or a click to choose, P or Esc to play on".to_string()),
-            Page::Options => ("Table options", "Flippers or arrow keys to change, kept for this table\nEsc to go back".to_string()),
-            Page::View => ("Its view", "Flippers or arrow keys to change, kept for this table\nEsc to go back".to_string()),
+            Page::Options => ("Table options", format!("{change}, kept for this table\n{back}")),
+            Page::View => ("Its view", format!("{change}, kept for this table\n{back}")),
             Page::Rules => ("Rules", scroll.to_string()),
+            Page::Controls if headset => ("Controls", scroll.to_string()),
             Page::Controls => ("Controls", format!("Change them in the app: Settings \u{203a} Controls\n{scroll}")),
             Page::Achievements => ("Achievements", format!("{kept}\n{scroll}")),
+            Page::Tables => ("Change the table", format!("Choose one to play it: the player starts again with it\n{back}")),
         };
         View {
             heading: heading.to_string(),
@@ -1225,7 +1304,7 @@ impl Menu {
         if self.setup.picture_only || (self.levels_changed.is_empty() && !self.options_changed && viewing.is_none()) {
             return;
         }
-        let table_text = self.setup.table_file.as_deref().map(read).unwrap_or_default();
+        let table_text = self.setup.table_file.as_deref().map(|f| read(&vpi_settings::table_settings_read(f))).unwrap_or_default();
         let table_entries = vpi_settings::parse_ini(&table_text);
         let (mut main_changes, mut table_changes) = (Vec::new(), Vec::new());
         for l in &self.levels_changed {
@@ -1241,7 +1320,8 @@ impl Menu {
             for o in options {
                 let v = option_value(o, stored);
                 let held = vpi_settings::get(&table_entries, "TableOption", &o.id).map(|t| crate::settings::table_option_value(o.min, o.max, o.step, o.default, o.names.as_deref(), Some(t)));
-                if held.unwrap_or(o.default) != v {
+                // none held: its default as the settings read it, on its steps (`option_at_default`)
+                if (held.unwrap_or_else(|| option_value(o, &[])) - v).abs() >= 1e-6 {
                     table_changes.push(Change::set("TableOption", &o.id, number(v)));
                 }
             }
@@ -1256,10 +1336,14 @@ impl Menu {
         {
             table_changes.splice(0..0, vpi_settings::first_table_settings(file));
         }
-        for (file, changes) in [(self.setup.settings_file.as_deref(), main_changes), (self.setup.table_file.as_deref(), table_changes)] {
-            if let Some(file) = file
+        // the main file in place; the table's where tables are only read into VPI's copy of it,
+        // from the file it's read from (`vpi_settings::table_settings_saved`)
+        let main = self.setup.settings_file.as_deref().map(|f| (f.to_path_buf(), f.to_path_buf()));
+        let table = self.setup.table_file.as_deref().map(|f| (vpi_settings::table_settings_read(f), vpi_settings::table_settings_saved(f)));
+        for (files, changes) in [(main, main_changes), (table, table_changes)] {
+            if let Some((from, file)) = files
                 && !changes.is_empty()
-                && let Err(e) = write_changes(file, &changes)
+                && let Err(e) = write_changes(&from, &file, &changes)
             {
                 eprintln!("vpi-player: the pause menu's changes weren't kept: {e}");
             }
@@ -1272,10 +1356,10 @@ fn read(file: &Path) -> String {
     std::fs::read(file).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default()
 }
 
-/// Changes written into a settings file in place, only what changed, comments and all
-/// (`vpi_settings::edit`), through a passing file.
-fn write_changes(file: &Path, changes: &[Change]) -> Result<(), String> {
-    let before = read(file);
+/// Changes written into a settings file, `from`'s text with only what changed, comments and all
+/// (`vpi_settings::edit`), through a passing file: in place, or into VPI's copy of a table's.
+fn write_changes(from: &Path, file: &Path, changes: &[Change]) -> Result<(), String> {
+    let before = read(from);
     let after = vpi_settings::edit(&before, changes);
     if after == before {
         return Ok(());
@@ -2038,6 +2122,18 @@ mod tests {
         set_shown(false);
     }
 
+    /// In the headset the hints name the controllers, not the keyboard's keys.
+    #[test]
+    fn the_headsets_hints_name_the_controllers() {
+        let _one = ONE_MENU.lock().unwrap_or_else(|e| e.into_inner());
+        let sounds = crate::audio::Sounds::none_played_for_tests();
+        let desk = Menu::new(Setup { picture_only: true, ..Setup::default() }).view(&sounds, &[], &[]);
+        assert!(desk.hint.contains("Esc") && !desk.hint.contains("trigger"), "{}", desk.hint);
+        let headset = Menu::new(Setup { picture_only: true, headset: true, ..Setup::default() }).view(&sounds, &[], &[]);
+        assert!(headset.hint.contains("trigger") && headset.hint.contains("View button") && !headset.hint.contains("Esc"), "{}", headset.hint);
+        set_shown(false);
+    }
+
     /// The pictures made on their own thread arrive, the newest asked for last.
     #[test]
     fn the_maker_hands_over_the_newest_picture_asked_for() {
@@ -2167,6 +2263,25 @@ mod tests {
         let kept = std::fs::read_to_string(&file).unwrap();
         let _ = std::fs::remove_file(&file);
         assert!(!kept.contains("ViewDTFOV") && kept.contains("ViewDTScaleX = 1.01") && kept.contains("ViewDTScaleZ = 1.01"), "{kept}");
+    }
+
+    /// Closing keeps only the options moved off the table's own defaults: one left at a default its
+    /// steps reach only roughly in floats (0.8 on steps of 0.01) isn't written.
+    #[test]
+    fn closing_keeps_only_the_options_that_differ() {
+        let file = std::env::temp_dir().join(format!("vpi-options-kept-{}.ini", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let colour = option("Colour", 0.0, 3.0, 1.0, 0.0, Some(&["Normal", "Less", "Grey", "Night"]));
+        let volume = option("Volume", 0.0, 1.0, 0.01, 0.8, None);
+        let mut stored = Vec::new();
+        assert!(step_option(&colour, &mut stored, 1.0, false));
+        let _one = ONE_MENU.lock().unwrap_or_else(|e| e.into_inner());
+        let mut menu = Menu::new(Setup { table_file: Some(file.clone()), ..Setup::default() });
+        menu.options_changed = true;
+        menu.close(&crate::audio::Sounds::none_played_for_tests(), &[colour, volume], &stored);
+        let kept = std::fs::read_to_string(&file).unwrap_or_default();
+        let _ = std::fs::remove_file(&file);
+        assert!(kept.contains("Colour = 1") && !kept.contains("Volume"), "{kept}");
     }
 
     #[test]

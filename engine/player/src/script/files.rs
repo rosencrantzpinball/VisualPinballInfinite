@@ -50,7 +50,8 @@ impl Rule {
         if super::fence::open() {
             return true;
         }
-        let path = path.to_lowercase();
+        // `\`-separated as the rule's folders, whichever separators libwinevbs used (`/` on Linux)
+        let path = path.replace('/', "\\").to_lowercase();
         self.write.iter().any(|f| within(&path, f)) || (!write && self.read.iter().any(|f| within(&path, f)))
     }
 }
@@ -61,13 +62,46 @@ impl Rule {
 pub fn set(data: &Path, read: &[PathBuf]) -> bool {
     *RULE.write().unwrap_or_else(|e| e.into_inner()) = Some(Rule::new(data, read));
     let fenced = super::winevbs::get().ok().and_then(|lib| lib.set_file_fence).is_some_and(|set_fence| {
-        let base: Vec<u16> = data.to_string_lossy().encode_utf16().chain(Some(0)).collect();
+        let base = super::com::wide(&data.to_string_lossy());
         // SAFETY: libwinevbs copies the base folder; `allow` lives as long as the program
         unsafe { set_fence(Some(allow), base.as_ptr()) };
         true
     });
     FENCED.store(fenced, Ordering::Release);
     fenced
+}
+
+/// A path as a table's script names it, for this system. On Windows, as it is. Elsewhere (Linux)
+/// Windows' `\` separates its parts too, and where the path isn't there with its letters' case as
+/// written, each part is matched whatever its case, as Windows' file names are: tables are made
+/// there, and name their files as they please.
+pub fn native(path: &str) -> PathBuf {
+    #[cfg(windows)]
+    return PathBuf::from(path);
+    #[cfg(not(windows))]
+    {
+        let path = PathBuf::from(path.replace('\\', "/"));
+        if path.exists() {
+            return path;
+        }
+        let mut found = PathBuf::new();
+        for (n, part) in path.components().enumerate() {
+            let exact = found.join(part);
+            if exact.exists() || n == 0 {
+                found = exact;
+                continue;
+            }
+            let name = part.as_os_str().to_string_lossy().to_lowercase();
+            let dir = if found.as_os_str().is_empty() { PathBuf::from(".") } else { found.clone() };
+            let entry = std::fs::read_dir(&dir).ok().and_then(|entries| entries.flatten().find(|e| e.file_name().to_string_lossy().to_lowercase() == name));
+            match entry {
+                Some(e) => found.push(e.file_name()),
+                // not there whatever the case: the path as written, for the error that follows
+                None => return path,
+            }
+        }
+        found
+    }
 }
 
 /// Whether the file object is held to the rule (see [`set`]).
@@ -85,7 +119,7 @@ pub fn readable(path: &Path) -> bool {
 
 /// libwinevbs's question: may the script reach `path`, for writing when
 /// `write` isn't 0?
-unsafe extern "C" fn allow(path: *const u16, write: i32) -> i32 {
+unsafe extern "C" fn allow(path: *const super::com::OLECHAR, write: i32) -> i32 {
     if path.is_null() {
         return 0;
     }

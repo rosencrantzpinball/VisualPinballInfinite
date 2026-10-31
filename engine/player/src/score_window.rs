@@ -48,7 +48,7 @@ impl ScoreWindow {
     pub fn file_for(settings: Option<&Path>) -> Option<PathBuf> {
         let dir = match settings.and_then(Path::parent) {
             Some(d) => d.to_path_buf(),
-            None => PathBuf::from(std::env::var_os("APPDATA")?).join("Visual Pinball Infinite"),
+            None => vpi_settings::data_folder()?,
         };
         Some(dir.join("Score windows.ini"))
     }

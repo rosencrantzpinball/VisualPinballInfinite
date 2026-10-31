@@ -308,10 +308,11 @@ impl Renderer {
     }
 
     /// One occlusion pass (VPX's `UpdateAmbientOcclusion`, and each of its
-    /// static passes): from `depth`, a picture of `size`, blended with the
-    /// newest result by `timeblur` (the new one's share), jittered by
-    /// `jitter`; it becomes the newest.
-    pub(super) unsafe fn record_ao(&self, command: *mut SDL_GPUCommandBuffer, depth: *mut SDL_GPUTexture, size: (u32, u32), jitter: [f32; 2], timeblur: f32) {
+    /// static passes): from `depth`, the top left `size` of pictures `made`
+    /// (VR's dynamic resolution draws a part), blended with the newest result
+    /// by `timeblur` (the new one's share), jittered by `jitter`; it becomes
+    /// the newest.
+    pub(super) unsafe fn record_ao(&self, command: *mut SDL_GPUCommandBuffer, depth: *mut SDL_GPUTexture, size: (u32, u32), made: (u32, u32), jitter: [f32; 2], timeblur: f32) {
         let Some(e) = self.effects.as_ref() else { return };
         let (last, next) = (e.ao_latest.get(), 1 - e.ao_latest.get());
         unsafe {
@@ -320,6 +321,7 @@ impl Renderer {
             info.load_op = SDL_GPU_LOADOP_DONT_CARE;
             info.store_op = SDL_GPU_STOREOP_STORE;
             let pass = SDL_BeginGPURenderPass(command, &info, 1, null());
+            Self::picture_part(pass, size, made);
             SDL_BindGPUGraphicsPipeline(pass, e.ao_pipeline);
             let bindings = [
                 SDL_GPUTextureSamplerBinding { texture: e.ao[last], sampler: self.flat_sampler },
@@ -327,7 +329,7 @@ impl Renderer {
                 SDL_GPUTextureSamplerBinding { texture: e.noise, sampler: e.repeat_point },
             ];
             SDL_BindGPUFragmentSamplers(pass, 0, bindings.as_ptr(), 3);
-            let (w, h) = (size.0 as f32, size.1 as f32);
+            let (w, h) = (made.0 as f32, made.1 as f32);
             let uniforms = EffectUniforms::new([1.0 / w, 1.0 / h, jitter[0], jitter[1]], [self.tone.ao_scale, timeblur, 0.0, 0.0]);
             SDL_PushGPUFragmentUniformData(command, 0, (&raw const uniforms).cast(), size_of::<EffectUniforms>() as u32);
             SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
@@ -338,11 +340,11 @@ impl Renderer {
 
     /// VPX's dynamic occlusion for this frame (its `UpdateAmbientOcclusion`):
     /// the new result's share 0.4, jittered by the frame's number.
-    pub(super) unsafe fn record_frame_ao(&self, command: *mut SDL_GPUCommandBuffer, size: (u32, u32)) {
+    pub(super) unsafe fn record_frame_ao(&self, command: *mut SDL_GPUCommandBuffer, size: (u32, u32), made: (u32, u32)) {
         let frame = self.frames_drawn.get() % 2048;
         let jitter = [radical_inverse(frame) * (1.0 / 8.0), radical_inverse3(frame) * (1.0 / 8.0)];
         // SAFETY: as the caller's
-        unsafe { self.record_ao(command, self.depth, size, jitter, 0.4) };
+        unsafe { self.record_ao(command, self.depth, size, made, jitter, 0.4) };
     }
 
     /// VPX's static occlusion (`RenderStaticPrepass`): 50 passes over the
@@ -362,7 +364,7 @@ impl Renderer {
                 SDL_EndGPURenderPass(SDL_BeginGPURenderPass(command, &info, 1, null()));
             }
             for i in 0..50 {
-                self.record_ao(command, s.depth, size, [radical_inverse(i) * (1.0 / 8.0), radical_inverse3(i) * (1.0 / 8.0)], 0.1);
+                self.record_ao(command, s.depth, size, size, [radical_inverse(i) * (1.0 / 8.0), radical_inverse3(i) * (1.0 / 8.0)], 0.1);
             }
             // the picture darkened: copied aside, then drawn back through the occlusion
             let copy = SDL_BeginGPUCopyPass(command);
@@ -394,9 +396,10 @@ impl Renderer {
     /// VPX's ball motion blur (`ApplyBallMotionBlur`), its first half: each
     /// ball that moved since it was last drawn, by more than a tenth of a
     /// unit and less than about 32, blurred along its path into the effects'
-    /// picture, over its part of the picture (`size`). Returns those parts,
-    /// for the tonemapping to draw again from that picture.
-    pub(super) unsafe fn record_motion_blur(&self, command: *mut SDL_GPUCommandBuffer, input: &FrameInput, size: (u32, u32)) -> Vec<BlurRegion> {
+    /// picture, over its part of the picture (`size`, the top left of
+    /// pictures `made`). Returns those parts, for the tonemapping to draw
+    /// again from that picture.
+    pub(super) unsafe fn record_motion_blur(&self, command: *mut SDL_GPUCommandBuffer, input: &FrameInput, size: (u32, u32), made: (u32, u32)) -> Vec<BlurRegion> {
         let Some(e) = self.effects.as_ref() else { return Vec::new() };
         let mut regions = Vec::new();
         // the camera's projection on its own (the frame's camera less its turn), and back
@@ -443,6 +446,7 @@ impl Renderer {
                     info.load_op = SDL_GPU_LOADOP_DONT_CARE;
                     info.store_op = SDL_GPU_STOREOP_STORE;
                     pass = SDL_BeginGPURenderPass(command, &info, 1, null());
+                    Self::picture_part(pass, size, made);
                     SDL_BindGPUGraphicsPipeline(pass, e.blur_pipeline);
                     let bindings = [
                         SDL_GPUTextureSamplerBinding { texture: self.hdr_target, sampler: self.flat_sampler },
@@ -455,7 +459,7 @@ impl Renderer {
                 let uniforms = EffectUniforms {
                     m0: proj.m,
                     m1: proj_inv.m,
-                    v0: [1.0 / w, 1.0 / h, 0.0, samples as f32],
+                    v0: [1.0 / made.0 as f32, 1.0 / made.1 as f32, 0.0, samples as f32],
                     v1: [now.x, now.y, now.z, b.radius],
                     v2: [last.x, last.y, last.z, b.radius],
                     v3: [0.0; 4],

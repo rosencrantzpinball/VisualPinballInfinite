@@ -910,6 +910,10 @@ typedef Uint32 SDL_GPUTextureUsageFlags;
 #define SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_READ                    (1u << 4) /**< Texture supports storage reads in the compute stage. */
 #define SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_WRITE                   (1u << 5) /**< Texture supports storage writes in the compute stage. */
 #define SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_SIMULTANEOUS_READ_WRITE (1u << 6) /**< Texture supports reads and writes in the same compute shader. This is NOT equivalent to READ | WRITE. */
+/* Visual Pinball Infinite: altered from SDL 3.4.18 -- (Vulkan, on a device made with
+   SDL_PROP_GPU_DEVICE_CREATE_VULKAN_FRAGMENT_SHADING_RATE_BOOLEAN) a fragment shading rate image, R8_UINT: see
+   SDL_SetGPUShadingRateImage */
+#define SDL_GPU_TEXTUREUSAGE_FRAGMENT_SHADING_RATE                   (1u << 16)
 
 /**
  * Specifies the type of a texture.
@@ -2393,6 +2397,15 @@ extern SDL_DECLSPEC SDL_GPUDevice * SDLCALL SDL_CreateGPUDeviceWithProperties(
 #define SDL_PROP_GPU_DEVICE_CREATE_D3D12_AGILITY_SDK_PATH_STRING                "SDL.gpu.device.create.d3d12.agility_sdk_path"
 #define SDL_PROP_GPU_DEVICE_CREATE_VULKAN_REQUIRE_HARDWARE_ACCELERATION_BOOLEAN "SDL.gpu.device.create.vulkan.requirehardwareacceleration"
 #define SDL_PROP_GPU_DEVICE_CREATE_VULKAN_OPTIONS_POINTER                       "SDL.gpu.device.create.vulkan.options"
+/* Visual Pinball Infinite: altered from SDL 3.4.18 -- a pointer to an SDL_GPUVulkanCreationHooks: the
+   Vulkan instance and device made by another API (OpenXR's XR_KHR_vulkan_enable2), on the physical
+   device it names. */
+#define SDL_PROP_GPU_DEVICE_CREATE_VULKAN_CREATION_HOOKS_POINTER                "SDL.gpu.device.create.vulkan.creation_hooks"
+/* Visual Pinball Infinite: altered from SDL 3.4.18 -- (Vulkan) fragment shading rate images (VK_KHR_fragment_shading_rate's
+   attachments), where the device has them: every render pass then takes one, the image SDL_SetGPUShadingRateImage
+   set or one of full rate, so any pipeline suits any pass. SDL_PROP_GPU_DEVICE_VULKAN_SHADING_RATE_TEXEL_SIZE_NUMBER
+   says whether they're on */
+#define SDL_PROP_GPU_DEVICE_CREATE_VULKAN_FRAGMENT_SHADING_RATE_BOOLEAN         "SDL.gpu.device.create.vulkan.fragment_shading_rate"
 #define SDL_PROP_GPU_DEVICE_CREATE_METAL_ALLOW_MACFAMILY1_BOOLEAN               "SDL.gpu.device.create.metal.allowmacfamily1"
 
 
@@ -2422,6 +2435,28 @@ typedef struct SDL_GPUVulkanOptions
 	Uint32 instance_extension_count; /**< Number of additional instance extensions to require. */
 	const char **instance_extension_names; /**< Pointer to a list of additional instance extensions to require. */
 } SDL_GPUVulkanOptions;
+
+/**
+ * Visual Pinball Infinite: altered from SDL 3.4.18 -- how another API makes the Vulkan instance and
+ * device SDL's Vulkan backend draws with (OpenXR's `xrCreateVulkanInstanceKHR`,
+ * `xrGetVulkanGraphicsDevice2KHR`, `xrCreateVulkanDeviceKHR`), given with
+ * `SDL_PROP_GPU_DEVICE_CREATE_VULKAN_CREATION_HOOKS_POINTER`. The Vulkan types are passed as `void *`
+ * (this header doesn't include Vulkan's). SDL still checks the device as usual; afterwards the handles
+ * it made are the device's properties `SDL_PROP_GPU_DEVICE_VULKAN_*`.
+ */
+typedef struct SDL_GPUVulkanCreationHooks
+{
+    void *userdata;
+    /** In place of vkCreateInstance: `create_info` is a `const VkInstanceCreateInfo *`, `instance` a
+     *  `VkInstance *` to fill, `get_instance_proc_addr` Vulkan's `PFN_vkGetInstanceProcAddr`; returns a
+     *  `VkResult`. */
+    int (SDLCALL *create_instance)(void *userdata, void *get_instance_proc_addr, const void *create_info, void *instance);
+    /** The `VkPhysicalDevice` to draw with, of the `VkInstance`'s; NULL leaves the choice to SDL. */
+    void *(SDLCALL *physical_device)(void *userdata, void *instance);
+    /** In place of vkCreateDevice: `create_info` is a `const VkDeviceCreateInfo *`, `device` a
+     *  `VkDevice *` to fill; returns a `VkResult`. */
+    int (SDLCALL *create_device)(void *userdata, void *get_instance_proc_addr, void *physical_device, const void *create_info, void *device);
+} SDL_GPUVulkanCreationHooks;
 
 /**
  * Destroys a GPU context previously returned by SDL_CreateGPUDevice.
@@ -2593,6 +2628,16 @@ extern SDL_DECLSPEC SDL_PropertiesID SDLCALL SDL_GetGPUDeviceProperties(SDL_GPUD
 #define SDL_PROP_GPU_DEVICE_DRIVER_NAME_STRING        "SDL.gpu.device.driver_name"
 #define SDL_PROP_GPU_DEVICE_DRIVER_VERSION_STRING     "SDL.gpu.device.driver_version"
 #define SDL_PROP_GPU_DEVICE_DRIVER_INFO_STRING        "SDL.gpu.device.driver_info"
+/* Visual Pinball Infinite: altered from SDL 3.4.18 -- the Vulkan backend's own handles, for another API
+   that draws into the same device (an OpenXR session's graphics binding) */
+#define SDL_PROP_GPU_DEVICE_VULKAN_INSTANCE_POINTER          "SDL.gpu.device.vulkan.instance"
+#define SDL_PROP_GPU_DEVICE_VULKAN_PHYSICAL_DEVICE_POINTER   "SDL.gpu.device.vulkan.physical_device"
+#define SDL_PROP_GPU_DEVICE_VULKAN_DEVICE_POINTER            "SDL.gpu.device.vulkan.device"
+#define SDL_PROP_GPU_DEVICE_VULKAN_QUEUE_FAMILY_INDEX_NUMBER "SDL.gpu.device.vulkan.queue_family_index"
+#define SDL_PROP_GPU_DEVICE_VULKAN_QUEUE_INDEX_NUMBER        "SDL.gpu.device.vulkan.queue_index"
+/* Visual Pinball Infinite: altered from SDL 3.4.18 -- with fragment shading rate images on, the pixels each of their texels
+   covers, across and down; 0 without them */
+#define SDL_PROP_GPU_DEVICE_VULKAN_SHADING_RATE_TEXEL_SIZE_NUMBER "SDL.gpu.device.vulkan.shading_rate_texel_size"
 
 
 /* State Creation */
@@ -2843,6 +2888,11 @@ extern SDL_DECLSPEC SDL_GPUTexture * SDLCALL SDL_CreateGPUTexture(
     SDL_GPUDevice *device,
     const SDL_GPUTextureCreateInfo *createinfo);
 
+/* Visual Pinball Infinite: altered from SDL 3.4.18 -- (Vulkan only) a `VkImage` made elsewhere (an OpenXR
+   swapchain's) as the texture's image: SDL neither allocates nor destroys it, never cycles the texture, and
+   takes it as being in the layout of the texture's default use already (a colour target's: OpenXR hands its
+   images over that way). */
+#define SDL_PROP_GPU_TEXTURE_CREATE_VULKAN_IMAGE_NUMBER "SDL.gpu.texture.create.vulkan.image"
 #define SDL_PROP_GPU_TEXTURE_CREATE_D3D12_CLEAR_R_FLOAT         "SDL.gpu.texture.create.d3d12.clear.r"
 #define SDL_PROP_GPU_TEXTURE_CREATE_D3D12_CLEAR_G_FLOAT         "SDL.gpu.texture.create.d3d12.clear.g"
 #define SDL_PROP_GPU_TEXTURE_CREATE_D3D12_CLEAR_B_FLOAT         "SDL.gpu.texture.create.d3d12.clear.b"
@@ -3247,6 +3297,16 @@ extern SDL_DECLSPEC void SDLCALL SDL_PushGPUComputeUniformData(
     Uint32 length);
 
 /* Graphics State */
+
+/**
+ * Visual Pinball Infinite: altered from SDL 3.4.18 -- (Vulkan, on a device with fragment shading rate images: see
+ * SDL_PROP_GPU_DEVICE_CREATE_VULKAN_FRAGMENT_SHADING_RATE_BOOLEAN) the rate image the render passes begun next on
+ * `command_buffer` take, until another is set: a texture of SDL_GPU_TEXTUREUSAGE_FRAGMENT_SHADING_RATE in
+ * SDL_GPU_TEXTUREFORMAT_R8_UINT, one texel for each SDL_PROP_GPU_DEVICE_VULKAN_SHADING_RATE_TEXEL_SIZE_NUMBER pixels
+ * square of the pass, its value VK_KHR_fragment_shading_rate's (log2 of the width << 2 | log2 of the height, so 0
+ * full rate, 5 2x2, 10 4x4); NULL: full rate. Does nothing elsewhere. Call it outside a render pass.
+ */
+extern SDL_DECLSPEC void SDLCALL SDL_SetGPUShadingRateImage(SDL_GPUCommandBuffer *command_buffer, SDL_GPUTexture *texture);
 
 /**
  * Begins a render pass on a command buffer.

@@ -204,6 +204,8 @@ pub struct GameSetup {
     pub sounds: crate::audio::Sounds,
     /// The view shown (desktop, cabinet, single screen).
     pub view: crate::camera::View,
+    /// Played in VR, in a headset (the script's `RenderingMode` is 2 then, as VPX's).
+    pub vr: bool,
     /// Write a replay of the game here.
     pub record: Option<PathBuf>,
     /// Test mode: the game's clock stops here (ms after play starts), so
@@ -675,8 +677,7 @@ fn script_override(world: &World) -> Option<(PathBuf, String)> {
     if let Some(app) = std::env::current_exe().ok().as_deref().and_then(std::path::Path::parent) {
         places.extend([app.to_path_buf(), app.join("user"), app.join("scripts"), app.join("tables")]);
     }
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        let data = PathBuf::from(appdata).join("Visual Pinball Infinite");
+    if let Some(data) = vpi_settings::data_folder() {
         places.extend([data.clone(), data.join("user"), data.join("scripts")]);
     }
     let named_after_folder = || dir.file_name().map(|f| dir.join(format!("{}.vbs", f.to_string_lossy()))).filter(|p| p.is_file());
@@ -844,6 +845,7 @@ impl Game {
             }
         }
         let mut world = World::new(setup.vpx.clone(), &engine, setup.sounds, setup.view, set_gravity);
+        world.vr = setup.vr;
         // the parts the table's achievements count, watched where the table has their hits off
         let counted = crate::achievements::watched_parts();
         if !counted.is_empty() {
@@ -1175,8 +1177,8 @@ impl Game {
             return;
         }
         let rom = self.world.controller.as_ref().map(|c| c.state.game_name.clone()).unwrap_or_default();
-        let Some(data) = std::env::var_os("APPDATA").filter(|_| !rom.is_empty()) else { return };
-        let path = std::path::PathBuf::from(data).join("Visual Pinball Infinite").join("Coloring").join(&rom).join(format!("{rom} {}.txt.gz", crate::screenshot::stamp()));
+        let Some(data) = vpi_settings::data_folder().filter(|_| !rom.is_empty()) else { return };
+        let path = data.join("Coloring").join(&rom).join(format!("{rom} {}.txt.gz", crate::screenshot::stamp()));
         match crate::frame_dump::FrameDump::create(&path) {
             Ok(d) => self.world.frame_dump = Some(d),
             Err(e) => eprintln!("frame dump: {}: {e}", path.display()),

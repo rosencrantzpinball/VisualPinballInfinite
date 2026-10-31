@@ -575,6 +575,7 @@ fn game_for(path: &Path, vpx: vpin::vpx::VPX, altsound: bool, colour: bool, cabi
         script: true,
         sounds,
         view: player::camera::View::Desktop,
+        vr: false,
         record: None,
         stop_at_ms: None,
         record_from_ms: None,

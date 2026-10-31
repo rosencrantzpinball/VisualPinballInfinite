@@ -38,6 +38,8 @@ pub mod input_map;
 pub mod opd;
 pub mod pause_menu;
 pub mod light;
+#[cfg(not(windows))]
+pub mod local_time;
 pub mod lightseq;
 pub mod machine_scores;
 pub mod machine_settings;
@@ -70,6 +72,13 @@ pub mod textbox;
 pub mod upscale;
 pub mod vblank;
 pub mod volume;
+pub mod vr;
 pub mod vpx_settings;
 pub mod waker;
 pub mod world;
+/// VR through OpenXR (Linux, the Steam Frame).
+#[cfg(not(windows))]
+pub mod xr;
+/// The app's screens in the headset (`vpi-panel`), shown by `vr`.
+#[cfg(not(windows))]
+pub mod panel;

@@ -489,7 +489,8 @@ fn compare(file: &str, mode: Mode) -> (String, usize) {
 }
 
 #[test]
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg_attr(target_arch = "aarch64", ignore = "on ARM, glibc's sinf and cosf differ from Microsoft's in the last bit for about 1 % of angles, and an invalid result's NaN is positive: run with --ignored for the report")]
 fn part_colliders_match_exact_vpx_bit_for_bit() {
     let (report, bad) = compare("vpx-parts-5436-precise.txt", Mode::Exact);
     println!("{report}");
@@ -497,7 +498,7 @@ fn part_colliders_match_exact_vpx_bit_for_bit() {
 }
 
 #[test]
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn shipped_vpx_part_colliders_drift_only_by_float_noise() {
     let (report, bad) = compare("vpx-parts-5436.txt", Mode::Fast);
     println!("{report}");

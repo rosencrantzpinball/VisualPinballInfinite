@@ -8,16 +8,69 @@
 
 mod edit;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub use edit::{Change, edit};
 
-/// The settings file: the one `VPI_SETTINGS` names, else
-/// `%APPDATA%\Visual Pinball Infinite\Settings.ini`.
+/// The settings file: the one `VPI_SETTINGS` names, else `Settings.ini` in the [`data_folder`].
 pub fn settings_path() -> Option<PathBuf> {
-    std::env::var_os("VPI_SETTINGS")
-        .map(PathBuf::from)
-        .or_else(|| Some(PathBuf::from(std::env::var_os("APPDATA")?).join("Visual Pinball Infinite").join("Settings.ini")))
+    std::env::var_os("VPI_SETTINGS").map(PathBuf::from).or_else(|| Some(data_folder()?.join("Settings.ini")))
+}
+
+/// The player's and the app's own folder, for their settings and what tables keep: the one
+/// `VPI_DATA` names, else `%APPDATA%\Visual Pinball Infinite` on Windows, and elsewhere
+/// (Linux, the Steam Frame) `VisualPinballInfinite` in the user's data folder
+/// (`$XDG_DATA_HOME`, else `~/.local/share`).
+pub fn data_folder() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("VPI_DATA") {
+        return Some(PathBuf::from(dir));
+    }
+    #[cfg(windows)]
+    return Some(PathBuf::from(std::env::var_os("APPDATA")?).join("Visual Pinball Infinite"));
+    #[cfg(not(windows))]
+    {
+        let data = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|d| d.is_absolute())
+            .or_else(|| Some(PathBuf::from(std::env::var_os("HOME")?).join(".local").join("share")))?;
+        Some(data.join("VisualPinballInfinite"))
+    }
+}
+
+/// A table's own settings file, VPX's `<table>.ini` beside the table (`file`), where it's read:
+/// VPI's copy of it where tables are only read and VPI has saved one, else the file itself. Where
+/// tables are only read (the Steam Frame, whose start command names a folder of VPI's own in
+/// `VPI_TABLE_SETTINGS`: PLAN decision 9), what changes for a table is saved into that folder under
+/// the file's own name, starting from the one beside the table, which stays as it was.
+pub fn table_settings_read(file: &Path) -> PathBuf {
+    read_from(file, kept_apart().as_deref())
+}
+
+/// Where a table's own settings file (`file`, beside the table) is saved: VPI's copy of it where
+/// tables are only read ([`table_settings_read`]), else the file itself.
+pub fn table_settings_saved(file: &Path) -> PathBuf {
+    saved_to(file, kept_apart().as_deref())
+}
+
+/// Whether tables' own settings are kept apart from them, in VPI's own folder ([`table_settings_read`]).
+pub fn table_settings_apart() -> bool {
+    kept_apart().is_some()
+}
+
+fn kept_apart() -> Option<PathBuf> {
+    std::env::var_os("VPI_TABLE_SETTINGS").filter(|d| !d.is_empty()).map(PathBuf::from)
+}
+
+fn saved_to(file: &Path, apart: Option<&Path>) -> PathBuf {
+    match (apart, file.file_name()) {
+        (Some(dir), Some(name)) => dir.join(name),
+        _ => file.to_path_buf(),
+    }
+}
+
+fn read_from(file: &Path, apart: Option<&Path>) -> PathBuf {
+    let own = saved_to(file, apart);
+    if own.is_file() { own } else { file.to_path_buf() }
 }
 
 /// The library's folders, as first setup keeps them in the settings file: the tables', VPX's scripts' and PinUP's packs' (`[VPI]` `TablesFolder`, `ScriptsFolder`,
@@ -391,14 +444,15 @@ pub fn pov_entries(text: &str) -> Vec<(String, String, String)> {
     out
 }
 
-/// What a table's settings file starts with when one is first made beside it: the views of its
-/// POV file, `<table>.pov`, which VPX imports into a table's settings while it has no file of its
-/// own (`PinTable::LoadGameFromFilename`, `ImportBackdropPOV`) and saves with them. Once the file
-/// is there the POV is read no more, so its views go into it. Nothing where the file is there
+/// What a table's settings file starts with when one is first made (beside it, or VPI's copy where
+/// tables are only read: [`table_settings_read`]): the views of its POV file, `<table>.pov`, which
+/// VPX imports into a table's settings while it has no file of its own
+/// (`PinTable::LoadGameFromFilename`, `ImportBackdropPOV`) and saves with them. Once the file is
+/// there the POV is read no more, so its views go into it. Nothing where the file is there
 /// already, or there's no POV.
-pub fn first_table_settings(table: &std::path::Path) -> Vec<Change> {
+pub fn first_table_settings(table: &Path) -> Vec<Change> {
     let pov = table.with_extension("pov");
-    if table.with_extension("ini").exists() || !pov.is_file() {
+    if table_settings_read(&table.with_extension("ini")).exists() || !pov.is_file() {
         return Vec::new();
     }
     let Ok(bytes) = std::fs::read(&pov) else { return Vec::new() };
@@ -422,6 +476,26 @@ mod tests {
         // a file of its own there: the POV is read no more, and nothing's taken in
         std::fs::write(table.with_extension("ini"), "").unwrap();
         assert!(first_table_settings(&table).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tables_settings_kept_apart_are_read_from_there_once_saved() {
+        let dir = std::env::temp_dir().join(format!("vpi-apart-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tables, own) = (dir.join("Tables"), dir.join("table-settings"));
+        std::fs::create_dir_all(&tables).unwrap();
+        // the table's name with a dot of its own: only `.vpx` becomes `.ini`
+        let file = tables.join("Symphony IX 1.0.2.vpx").with_extension("ini");
+        std::fs::write(&file, "[TableOption]\nBallSave = 1\n").unwrap();
+        // kept beside the table
+        assert_eq!((read_from(&file, None), saved_to(&file, None)), (file.clone(), file.clone()));
+        // kept apart: saved in VPI's folder under the same name, the one beside the table read till then
+        let copy = own.join("Symphony IX 1.0.2.ini");
+        assert_eq!((read_from(&file, Some(&own)), saved_to(&file, Some(&own))), (file.clone(), copy.clone()));
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(&copy, "[TableOption]\nBallSave = 0\n").unwrap();
+        assert_eq!(read_from(&file, Some(&own)), copy);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

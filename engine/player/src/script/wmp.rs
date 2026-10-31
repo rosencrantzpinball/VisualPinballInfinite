@@ -165,7 +165,7 @@ unsafe extern "system" fn get_type_info(_this: *mut c_void, _index: u32, _lcid: 
     E_NOTIMPL
 }
 
-unsafe extern "system" fn get_ids_of_names(this: *mut c_void, _riid: *const GUID, names: *const *const u16, count: u32, _lcid: u32, ids: *mut i32) -> HRESULT {
+unsafe extern "system" fn get_ids_of_names(this: *mut c_void, _riid: *const GUID, names: *const *const OLECHAR, count: u32, _lcid: u32, ids: *mut i32) -> HRESULT {
     unsafe {
         let o = &*(this as *const WmpObj);
         for i in 0..count as usize {
@@ -300,7 +300,7 @@ fn find_file(table_dir: Option<&Path>, name: &str) -> Option<PathBuf> {
     if name.is_empty() {
         return None;
     }
-    let given = PathBuf::from(name.replace('/', "\\"));
+    let given = PathBuf::from(name.replace(['/', '\\'], std::path::MAIN_SEPARATOR_STR));
     let full = if given.is_absolute() { given } else { table_dir?.join(given) };
     let mut out = PathBuf::new();
     for part in full.components() {

@@ -113,7 +113,7 @@ const SMAA_BLEND: PassShader = smaa(c"smaa_blend_vs", c"smaa_blend_fs", 2);
 struct PostUniforms {
     /// VPX's `w_h_height`: 1 / the picture's size, its width (or height, for SMAA), and 1 when its depth is read.
     w_h_height: [f32; 4],
-    /// x: decoded to linear light (the window encodes sRGB itself).
+    /// x: decoded to linear light (the window encodes sRGB itself); y: the alpha VR's passthrough's.
     flags: [f32; 4],
 }
 
@@ -123,6 +123,73 @@ impl Renderer {
     pub fn set_post(&mut self, aa: PostAa, sharpen: Sharpen) {
         self.post_aa = aa;
         self.post_sharpen = sharpen;
+    }
+
+    /// VR's passthrough (alpha blend): each frame's alpha written from the scene's depth at the end, so
+    /// the headset shows the world where nothing was drawn ([`Renderer::record_environment_alpha`]).
+    pub fn set_environment_alpha(&mut self, on: bool) -> Result<(), String> {
+        if !on || !self.environment_alpha.is_null() {
+            return Ok(());
+        }
+        let vs = self.shader(POST_HLSL, c"post_vs", c"vs_5_1", SDL_GPU_SHADERSTAGE_VERTEX, 0, 0)?;
+        let fs = match self.shader(POST_HLSL, c"environment_alpha_fs", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 2, 1) {
+            Ok(fs) => fs,
+            Err(e) => {
+                unsafe { SDL_ReleaseGPUShader(self.device, vs) };
+                return Err(e);
+            }
+        };
+        unsafe {
+            let mut color: SDL_GPUColorTargetDescription = zeroed();
+            color.format = self.format;
+            color.blend_state.enable_color_write_mask = true;
+            color.blend_state.color_write_mask = SDL_GPU_COLORCOMPONENT_A;
+            let mut info: SDL_GPUGraphicsPipelineCreateInfo = zeroed();
+            info.vertex_shader = vs;
+            info.fragment_shader = fs;
+            info.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+            info.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
+            info.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_NONE;
+            info.multisample_state.sample_count = SDL_GPU_SAMPLECOUNT_1;
+            info.target_info.color_target_descriptions = &color;
+            info.target_info.num_color_targets = 1;
+            self.environment_alpha = SDL_CreateGPUGraphicsPipeline(self.device, &info);
+            SDL_ReleaseGPUShader(self.device, vs);
+            SDL_ReleaseGPUShader(self.device, fs);
+        }
+        if self.environment_alpha.is_null() {
+            return Err(format!("create the passthrough's pipeline: {}", sdl_error()));
+        }
+        // with nothing after the tonemapping, that pass writes the alpha too, the depth its fifth picture
+        if self.hdr {
+            self.tonemap_environment_alpha = self.tonemap_pipeline_with(self.format, c"tonemap_environment_alpha_fs", 5)?;
+        }
+        Ok(())
+    }
+
+    /// The frame's alpha from the scene's depth (VR's passthrough), over `target`, its colours kept.
+    pub(super) unsafe fn record_environment_alpha(&self, command: *mut SDL_GPUCommandBuffer, target: *mut SDL_GPUTexture, width: u32, height: u32) {
+        unsafe {
+            let mut info: SDL_GPUColorTargetInfo = zeroed();
+            info.texture = target;
+            info.load_op = SDL_GPU_LOADOP_LOAD;
+            info.store_op = SDL_GPU_STOREOP_STORE;
+            let pass = SDL_BeginGPURenderPass(command, &info, 1, null());
+            self.frame_part(pass, width, height);
+            SDL_BindGPUGraphicsPipeline(pass, self.environment_alpha);
+            let depth = SDL_GPUTextureSamplerBinding { texture: self.depth, sampler: self.font_sampler };
+            SDL_BindGPUFragmentSamplers(pass, 0, [depth, depth].as_ptr(), 2);
+            let uniforms = [0.0f32; 8];
+            SDL_PushGPUFragmentUniformData(command, 0, uniforms.as_ptr().cast(), 32);
+            SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
+            SDL_EndGPURenderPass(pass);
+        }
+    }
+
+    /// Whether the last pass after tonemapping writes VR's passthrough alpha, from the depth it reads
+    /// (post.hlsl's `post_alpha`): any but SMAA's blend.
+    pub(super) fn post_writes_environment_alpha(&self) -> bool {
+        !self.environment_alpha.is_null() && self.post_reads_depth() && !(self.post_aa == PostAa::Smaa && self.post_sharpen == Sharpen::Off)
     }
 
     /// Whether the frame has passes after tonemapping.
@@ -270,7 +337,9 @@ impl Renderer {
     /// the readout to go over.
     pub(super) unsafe fn record_post(&self, command: *mut SDL_GPUCommandBuffer, target: *mut SDL_GPUTexture, width: u32, height: u32) -> *mut SDL_GPURenderPass {
         let Some(p) = self.post.as_ref() else { return null_mut() };
-        let (w, h) = (width as f32, height as f32);
+        // the pictures' size as made: on a headset the eye's full size, of which the top left `width` x
+        // `height` is drawn (VR's dynamic resolution)
+        let (w, h) = (p.size.0 as f32, p.size.1 as f32);
         let srgb_target = self.format == SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM_SRGB || self.format == SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM_SRGB;
         let reads_depth = self.post_reads_depth();
         let depth = if reads_depth { self.depth } else { self.white };
@@ -278,6 +347,8 @@ impl Renderer {
         let filters = [1.0 / w, 1.0 / h, w, if reads_depth { 1.0 } else { 0.0 }];
         let metrics = [1.0 / w, 1.0 / h, w, h];
         let sharpen = self.post_sharpen != Sharpen::Off;
+        // VR's passthrough: the window's alpha from the depth (post_writes_environment_alpha)
+        let passthrough = if self.post_writes_environment_alpha() { 1.0 } else { 0.0 };
         // the passes in VPX's order: (shader, pictures read, picture written; None: the window), cleared first
         let [first, second] = p.pictures;
         let mut steps: Vec<(&CStr, [*mut SDL_GPUTexture; 3], Option<*mut SDL_GPUTexture>, bool)> = Vec::new();
@@ -325,9 +396,21 @@ impl Renderer {
                 info.clear_color = SDL_FColor { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
                 info.store_op = SDL_GPU_STOREOP_STORE;
                 let pass = SDL_BeginGPURenderPass(command, &info, 1, null());
+                if into_window {
+                    self.frame_part(pass, width, height);
+                } else {
+                    Self::picture_part(pass, (width, height), p.size);
+                }
                 SDL_BindGPUGraphicsPipeline(pass, self.pass(fs)[if into_window { 1 } else { 0 }]);
-                // linear first, point second (post_common.hlsl's samplers), whatever the pictures
-                let samplers = [self.flat_sampler, self.font_sampler, self.font_sampler];
+                let smaa = fs == SMAA_EDGE.fs || fs == SMAA_WEIGHT.fs || fs == SMAA_BLEND.fs;
+                // linear first, point second (post_common.hlsl's samplers), whatever the pictures; on
+                // Vulkan each SMAA picture is sampled through its own slot's, all linear there, the
+                // point samples read from the texels (post_common.hlsl)
+                let samplers = if smaa && cfg!(not(windows)) {
+                    [self.flat_sampler; 3]
+                } else {
+                    [self.flat_sampler, self.font_sampler, self.font_sampler]
+                };
                 let bindings: Vec<SDL_GPUTextureSamplerBinding> = pictures
                     .iter()
                     .zip(samplers)
@@ -335,11 +418,10 @@ impl Renderer {
                     .map(|(&texture, sampler)| SDL_GPUTextureSamplerBinding { texture, sampler })
                     .collect();
                 SDL_BindGPUFragmentSamplers(pass, 0, bindings.as_ptr(), bindings.len() as u32);
-                let smaa = fs == SMAA_EDGE.fs || fs == SMAA_WEIGHT.fs || fs == SMAA_BLEND.fs;
                 if smaa {
                     SDL_PushGPUVertexUniformData(command, 0, metrics.as_ptr().cast(), 16);
                 }
-                let uniforms = PostUniforms { w_h_height: if smaa { metrics } else { filters }, flags: [if into_window && srgb_target { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0] };
+                let uniforms = PostUniforms { w_h_height: if smaa { metrics } else { filters }, flags: [if into_window && srgb_target { 1.0 } else { 0.0 }, if into_window { passthrough } else { 0.0 }, 0.0, 0.0] };
                 SDL_PushGPUFragmentUniformData(command, 0, (&raw const uniforms).cast(), size_of::<PostUniforms>() as u32);
                 SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
                 if n + 1 == steps.len() {

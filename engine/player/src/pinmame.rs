@@ -26,6 +26,16 @@ pub const VERSION: &str = "03070000";
 /// The reference install's VPinMAME folder, when Windows names none.
 const REFERENCE_VPINMAME: &str = r"C:\vPinball\VisualPinball\VPinMAME";
 
+/// Elsewhere (Linux, the Steam Frame) no VPinMAME is installed: the tables' shared `pinmame` folder of
+/// VPX there (`~/Documents/VPinballX/Tables/pinmame`), when it's there.
+fn shared_pinmame() -> Option<PathBuf> {
+    if cfg!(windows) {
+        return None;
+    }
+    let folder = PathBuf::from(std::env::var_os("HOME")?).join("Documents").join("VPinballX").join("Tables").join("pinmame");
+    folder.is_dir().then_some(folder)
+}
+
 /// VPinMAME's folder on this machine — its ROMs, samples, ROM aliases, colour and sound packs —
 /// found as VPX's PinMAME plugin finds it when nothing else names one (`PinMAMEPlugin.cpp`, since
 /// d3e5425b1): the folder of the registered VPinMAME controller (any bitness) while its library is
@@ -44,6 +54,7 @@ pub(crate) fn vpinmame() -> &'static Path {
                 // the folder holding the ROM folder
                 roms.parent().map(Path::to_path_buf)
             })
+            .or_else(shared_pinmame)
             .unwrap_or_else(|| PathBuf::from(REFERENCE_VPINMAME))
     })
 }
@@ -78,6 +89,7 @@ fn vpinmame_setting(name: &str) -> Option<String> {
 }
 
 /// Reading the registry's text values (Windows' `RegGetValueW`).
+#[cfg(windows)]
 mod registry {
     use std::ffi::c_void;
 
@@ -118,6 +130,19 @@ mod registry {
     }
 }
 
+/// Elsewhere (Linux) there's no registry: nothing is found in it.
+#[cfg(not(windows))]
+mod registry {
+    pub const HKEY_CLASSES_ROOT: isize = 0;
+    pub const HKEY_CURRENT_USER: isize = 0;
+    pub const WOW64_64: u32 = 0;
+    pub const WOW64_32: u32 = 0;
+
+    pub fn string(_root: isize, _key: &str, _name: Option<&str>, _view: u32) -> Option<String> {
+        None
+    }
+}
+
 /// How long a game may take to start: PinMAME loads and checks its ROMs.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -146,7 +171,12 @@ pub fn notice() -> Option<String> {
 /// there), VPinMAME's own `roms` (VPX's PinMAME plugin applies VPinMAME's folder settings over its
 /// install folder's).
 fn rom_folder(table_dir: Option<&Path>, pinmame_path: Option<&Path>) -> Option<PathBuf> {
-    let table = table_dir.and_then(|d| crate::pup::find_case_insensitive(&d.join("pinmame").join("roms"), true));
+    // beside the table, else in the tables' folder above it, where VPX keeps the ROMs shared by tables
+    // each in its own folder (the Steam Frame's `Tables/pinmame/roms`)
+    let table = table_dir.and_then(|d| {
+        crate::pup::find_case_insensitive(&d.join("pinmame").join("roms"), true)
+            .or_else(|| d.parent().and_then(|up| crate::pup::find_case_insensitive(&up.join("pinmame").join("roms"), true)))
+    });
     let own = pinmame_path.map(|p| p.join("roms"));
     let beside = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("roms")));
     let setting = vpinmame_setting("rompath").and_then(|s| s.split(';').map(str::trim).filter(|f| !f.is_empty()).map(PathBuf::from).find(|d| d.is_dir()));
@@ -188,7 +218,7 @@ pub fn altsound_base(table_dir: Option<&Path>, rom: &str, settings: &[(String, S
 /// Where PinMAME keeps each game's NVRAM, settings and high scores: the
 /// player's own data folder, never VPinMAME's.
 fn data_folder() -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("APPDATA")?).join("Visual Pinball Infinite").join("PinMAME");
+    let dir = vpi_settings::data_folder()?.join("PinMAME");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }
@@ -197,9 +227,13 @@ fn data_folder() -> Option<PathBuf> {
 /// a name a table asks for to the set that's there (lines of
 /// `requested,actual`); a name it doesn't list stands for itself.
 pub fn resolve_alias(game: &str) -> String {
-    let file = vpinmame().join("VPMAlias.txt");
-    let Ok(text) = std::fs::read_to_string(file) else { return game.to_string() };
-    alias_in(&text, game).unwrap_or_else(|| game.to_string())
+    // VPinMAME's list, else libpinmame's own (`alias.txt`, which VPX keeps in the Steam Frame's shared
+    // `pinmame` folder)
+    ["VPMAlias.txt", "alias.txt"]
+        .into_iter()
+        .filter_map(|name| std::fs::read_to_string(vpinmame().join(name)).ok())
+        .find_map(|text| alias_in(&text, game))
+        .unwrap_or_else(|| game.to_string())
 }
 
 /// `game`'s line in an alias list, read as libpinmame reads its own: the
@@ -208,7 +242,8 @@ pub fn resolve_alias(game: &str) -> String {
 fn alias_in(text: &str, game: &str) -> Option<String> {
     text.lines().find_map(|line| {
         let line = line.split(['#', ';', '\'']).next().unwrap_or("");
-        let mut words = line.split([',', ' ', '\t']).filter(|w| !w.is_empty());
+        // (a line's carriage return too, which libpinmame itself would keep: VPX's notes ask for LF)
+        let mut words = line.split([',', ' ', '\t', '\r']).filter(|w| !w.is_empty());
         let (from, to) = (words.next()?, words.next()?);
         from.eq_ignore_ascii_case(game).then(|| to.to_string())
     })
@@ -387,7 +422,7 @@ impl Machine {
     /// Starts `vpi-pinmame` on a new link and waits until PinMAME runs the
     /// game, or says it can't.
     pub fn start(start: &Start) -> Result<Machine, String> {
-        let host = std::env::current_exe().map_err(|e| e.to_string())?.with_file_name("vpi-pinmame.exe");
+        let host = std::env::current_exe().map_err(|e| e.to_string())?.with_file_name(if cfg!(windows) { "vpi-pinmame.exe" } else { "vpi-pinmame" });
         if !host.exists() {
             return Err(format!("{} is missing", host.display()));
         }

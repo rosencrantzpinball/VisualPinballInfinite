@@ -391,6 +391,7 @@ pub mod sun {
         pub local_adjust: f64,
     }
 
+    #[cfg(windows)]
     #[repr(C)]
     #[derive(Default)]
     struct SystemTime {
@@ -404,6 +405,7 @@ pub mod sun {
         milliseconds: u16,
     }
 
+    #[cfg(windows)]
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetLocalTime(time: *mut SystemTime);
@@ -411,6 +413,7 @@ pub mod sun {
     }
 
     impl Clock {
+        #[cfg(windows)]
         pub fn now() -> Clock {
             let (mut local, mut utc) = (SystemTime::default(), SystemTime::default());
             // SAFETY: both fill the structures they're given
@@ -425,6 +428,21 @@ pub mod sun {
                 day: local.day.into(),
                 hour: local.hour.into(),
                 minute: local.minute.into(),
+                local_adjust: f64::from(if dif < -12 { dif + 24 } else { dif }),
+            }
+        }
+
+        /// The same from the C library's clock (Linux).
+        #[cfg(not(windows))]
+        pub fn now() -> Clock {
+            let (local, utc) = (crate::local_time::local(), crate::local_time::utc());
+            let dif = local.hour - utc.hour;
+            Clock {
+                year: (local.year + 1900) as u32,
+                month: (local.mon + 1) as u32,
+                day: local.mday as u32,
+                hour: local.hour as u32,
+                minute: local.min as u32,
                 local_adjust: f64::from(if dif < -12 { dif + 24 } else { dif }),
             }
         }

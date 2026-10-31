@@ -1,5 +1,6 @@
 //! libwinevbs, Wine's VBScript engine as a library, loaded as its own
-//! DLL (LGPL-2.1-or-later, so it stays a separate, replaceable file).
+//! DLL (LGPL-2.1-or-later, so it stays a separate, replaceable file);
+//! `libwinevbs.so` on Linux, built the same way (`tools/libwinevbs/setup.sh`).
 //!
 //! libwinevbs carries its own copy of COM and OLE Automation, so every string
 //! and VARIANT that passes through it is made, copied and freed with its
@@ -14,9 +15,9 @@ use std::sync::OnceLock;
 use super::com::*;
 
 type CoCreateInstanceFn = unsafe extern "system" fn(*const GUID, *mut c_void, u32, *const GUID, *mut *mut c_void) -> HRESULT;
-type SysAllocStringLenFn = unsafe extern "system" fn(*const u16, u32) -> *mut u16;
-type SysFreeStringFn = unsafe extern "system" fn(*mut u16);
-type SysStringLenFn = unsafe extern "system" fn(*mut u16) -> u32;
+type SysAllocStringLenFn = unsafe extern "system" fn(*const OLECHAR, u32) -> *mut OLECHAR;
+type SysFreeStringFn = unsafe extern "system" fn(*mut OLECHAR);
+type SysStringLenFn = unsafe extern "system" fn(*mut OLECHAR) -> u32;
 type VariantInitFn = unsafe extern "system" fn(*mut VARIANT);
 type VariantClearFn = unsafe extern "system" fn(*mut VARIANT) -> HRESULT;
 type VariantCopyFn = unsafe extern "system" fn(*mut VARIANT, *const VARIANT) -> HRESULT;
@@ -34,15 +35,15 @@ type SafeArrayUnaccessDataFn = unsafe extern "system" fn(*mut c_void) -> HRESULT
 #[repr(C)]
 pub struct Callbacks {
     pub log: unsafe extern "C" fn(level: i32, format: *const c_char, args: *mut c_void),
-    pub create_object: unsafe extern "C" fn(progid: *const u16, factory: *mut c_void, object: *mut *mut c_void) -> HRESULT,
+    pub create_object: unsafe extern "C" fn(progid: *const OLECHAR, factory: *mut c_void, object: *mut *mut c_void) -> HRESULT,
 }
 
 type InitFn = unsafe extern "C" fn(*const Callbacks);
 
 /// Asked about every path the file object touches (`libwinevbs_file_fence_t`).
-pub type FileFenceFn = unsafe extern "C" fn(path: *const u16, write: i32) -> i32;
+pub type FileFenceFn = unsafe extern "C" fn(path: *const OLECHAR, write: i32) -> i32;
 /// `libwinevbs_set_file_fence`, in our build only (`tools/libwinevbs`).
-pub type SetFileFenceFn = unsafe extern "C" fn(Option<FileFenceFn>, *const u16);
+pub type SetFileFenceFn = unsafe extern "C" fn(Option<FileFenceFn>, *const OLECHAR);
 
 /// The library's functions.
 pub struct WineVbs {
@@ -76,20 +77,77 @@ static LIBRARY: OnceLock<Result<WineVbs, String>> = OnceLock::new();
 
 #[cfg(windows)]
 mod os {
-    use std::ffi::c_void;
+    use std::ffi::{c_char, c_void};
     #[link(name = "kernel32")]
     unsafe extern "system" {
         pub fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
         pub fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
     }
     /// Finds the DLL's own dependencies next to it.
-    pub const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x8;
+    const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x8;
+
+    pub fn open(path: &std::path::Path) -> *mut c_void {
+        let wide: Vec<u16> = path.to_string_lossy().encode_utf16().chain(Some(0)).collect();
+        // SAFETY: a NUL-terminated path
+        unsafe { LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), LOAD_WITH_ALTERED_SEARCH_PATH) }
+    }
+
+    /// # Safety
+    /// `module` is a loaded library; `name` is NUL-terminated.
+    pub unsafe fn symbol(module: *mut c_void, name: &str) -> *mut c_void {
+        unsafe { GetProcAddress(module, name.as_ptr()) }
+    }
+
+    unsafe extern "C" {
+        /// The C runtime's formatter behind every `printf` (UCRT).
+        fn __stdio_common_vsprintf(options: u64, buffer: *mut c_char, count: usize, format: *const c_char, locale: *mut c_void, args: *mut c_void) -> i32;
+    }
+
+    /// # Safety
+    /// `format` and `args` are a `printf` format and its `va_list`.
+    pub unsafe fn format(buffer: &mut [c_char], format: *const c_char, args: *mut c_void) -> i32 {
+        unsafe { __stdio_common_vsprintf(2, buffer.as_mut_ptr(), buffer.len(), format, std::ptr::null_mut(), args) }
+    }
+}
+
+#[cfg(not(windows))]
+mod os {
+    use std::ffi::{CString, c_char, c_int, c_void};
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        fn dlopen(file: *const c_char, mode: c_int) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
+        fn vsnprintf(buffer: *mut c_char, count: usize, format: *const c_char, args: *mut c_void) -> c_int;
+    }
+    /// Every symbol bound at once, the library's own kept to itself.
+    const RTLD_NOW: c_int = 2;
+
+    pub fn open(path: &std::path::Path) -> *mut c_void {
+        let Ok(path) = CString::new(path.as_os_str().as_bytes()) else { return std::ptr::null_mut() };
+        // SAFETY: a NUL-terminated path
+        unsafe { dlopen(path.as_ptr(), RTLD_NOW) }
+    }
+
+    /// # Safety
+    /// `module` is a loaded library; `name` is NUL-terminated.
+    pub unsafe fn symbol(module: *mut c_void, name: &str) -> *mut c_void {
+        unsafe { dlsym(module, name.as_ptr().cast()) }
+    }
+
+    /// # Safety
+    /// `format` and `args` are a `printf` format and its `va_list`, which C passes on as a
+    /// pointer here (to a copy on arm64, where it's a structure larger than 16 bytes; the array
+    /// itself on x86-64), so it's handed on as it came.
+    pub unsafe fn format(buffer: &mut [c_char], format: *const c_char, args: *mut c_void) -> i32 {
+        unsafe { vsnprintf(buffer.as_mut_ptr(), buffer.len(), format, args) }
+    }
 }
 
 /// Where to look for `winevbs64.dll`: next to the program (how it ships),
 /// then, in the repository (development builds), our own build with our
 /// patches (`tools/libwinevbs`, built into `vpx-build/libwinevbs/build`), then
 /// the copy from VPX's automated build (`vpx-build/winevbs`).
+#[cfg(windows)]
 fn candidates() -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Ok(exe) = std::env::current_exe()
@@ -108,16 +166,31 @@ fn candidates() -> Vec<PathBuf> {
     out
 }
 
-unsafe extern "C" {
-    /// The C runtime's formatter behind every `printf` (UCRT).
-    fn __stdio_common_vsprintf(options: u64, buffer: *mut c_char, count: usize, format: *const c_char, locale: *mut c_void, args: *mut c_void) -> i32;
+/// Where to look for `libwinevbs.so` on Linux: next to the program (how a package carries it),
+/// then, in a development build, our own build (`tools/libwinevbs/setup.sh`, into
+/// `vpx-build/linux-aarch64/libwinevbs/build`).
+#[cfg(not(windows))]
+fn candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        out.push(dir.join("libwinevbs.so.0"));
+        // target/<target>/release/vpi-player -> repository root
+        if crate::DEVELOPMENT {
+            for up in dir.ancestors().take(4) {
+                out.push(up.join("vpx-build").join("linux-aarch64").join("libwinevbs").join("build").join("libwinevbs.so.0"));
+            }
+        }
+    }
+    out
 }
 
 unsafe extern "C" fn log(level: i32, format: *const c_char, args: *mut c_void) {
     // SAFETY: libwinevbs passes a printf format and its arguments
     let text = unsafe {
         let mut buf = [0 as c_char; 1024];
-        let n = __stdio_common_vsprintf(2, buf.as_mut_ptr(), buf.len(), format, std::ptr::null_mut(), args);
+        let n = os::format(&mut buf, format, args);
         if n < 0 && format.is_null() {
             return;
         }
@@ -126,7 +199,7 @@ unsafe extern "C" fn log(level: i32, format: *const c_char, args: *mut c_void) {
     super::log::engine_message(level, text.trim_end());
 }
 
-unsafe extern "C" fn create_object(progid: *const u16, factory: *mut c_void, object: *mut *mut c_void) -> HRESULT {
+unsafe extern "C" fn create_object(progid: *const OLECHAR, factory: *mut c_void, object: *mut *mut c_void) -> HRESULT {
     // SAFETY: libwinevbs passes the script's ProgID, its own factory for
     // objects it has built in (or null), and where the object goes
     unsafe {
@@ -139,16 +212,15 @@ static CALLBACKS: Callbacks = Callbacks { log, create_object };
 
 #[allow(clippy::missing_transmute_annotations)] // each pointer becomes its field's function type
 fn load_from(path: &Path) -> Result<WineVbs, String> {
-    #[cfg(windows)]
-    // SAFETY: loading a DLL and looking up its exports by name
+    // SAFETY: loading a library and looking up its exports by name
     unsafe {
-        let module = os::LoadLibraryExW(wide(&path.to_string_lossy()).as_ptr(), std::ptr::null_mut(), os::LOAD_WITH_ALTERED_SEARCH_PATH);
+        let module = os::open(path);
         if module.is_null() {
             return Err(format!("could not load {}", path.display()));
         }
         let get = |name: &str| -> Result<*mut c_void, String> {
             let c = format!("{name}\0");
-            let p = os::GetProcAddress(module, c.as_ptr());
+            let p = os::symbol(module, &c);
             if p.is_null() { Err(format!("{} has no {name}", path.display())) } else { Ok(p) }
         };
         macro_rules! f {
@@ -183,8 +255,6 @@ fn load_from(path: &Path) -> Result<WineVbs, String> {
         }
         Ok(lib)
     }
-    #[cfg(not(windows))]
-    Err(format!("loading {} is only done on Windows so far", path.display()))
 }
 
 /// The library, loaded once.
@@ -197,7 +267,7 @@ pub fn get() -> Result<&'static WineVbs, String> {
                     return load_from(path);
                 }
             }
-            Err(format!("winevbs64.dll not found (looked in {})", tried.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")))
+            Err(format!("libwinevbs not found (looked in {})", tried.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")))
         })
         .as_ref()
         .map_err(Clone::clone)
@@ -205,8 +275,8 @@ pub fn get() -> Result<&'static WineVbs, String> {
 
 impl WineVbs {
     /// A BSTR holding `s`, made by the library.
-    pub fn bstr(&self, s: &str) -> *mut u16 {
-        let w: Vec<u16> = s.encode_utf16().collect();
+    pub fn bstr(&self, s: &str) -> *mut OLECHAR {
+        let w = wide_chars(s);
         // SAFETY: the library copies `w`
         unsafe { (self.sys_alloc_string_len)(w.as_ptr(), w.len() as u32) }
     }
@@ -215,13 +285,13 @@ impl WineVbs {
     ///
     /// # Safety
     /// `b` must be null or a BSTR made by this library.
-    pub unsafe fn bstr_text(&self, b: *mut u16) -> String {
+    pub unsafe fn bstr_text(&self, b: *mut OLECHAR) -> String {
         if b.is_null() {
             return String::new();
         }
         unsafe {
             let n = (self.sys_string_len)(b) as usize;
-            String::from_utf16_lossy(std::slice::from_raw_parts(b, n))
+            wide_text(std::slice::from_raw_parts(b, n))
         }
     }
 }

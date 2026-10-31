@@ -131,9 +131,9 @@ pub struct DISPPARAMS {
 pub struct EXCEPINFO {
     pub wCode: u16,
     pub wReserved: u16,
-    pub bstrSource: *mut u16,
-    pub bstrDescription: *mut u16,
-    pub bstrHelpFile: *mut u16,
+    pub bstrSource: *mut OLECHAR,
+    pub bstrDescription: *mut OLECHAR,
+    pub bstrHelpFile: *mut OLECHAR,
     pub dwHelpContext: u32,
     pub pvReserved: *mut c_void,
     pub pfnDeferredFillIn: *mut c_void,
@@ -177,7 +177,7 @@ pub struct IDispatchVtbl {
     pub GetTypeInfoCount: unsafe extern "system" fn(this: *mut c_void, count: *mut u32) -> HRESULT,
     pub GetTypeInfo: unsafe extern "system" fn(this: *mut c_void, index: u32, lcid: u32, info: *mut *mut c_void) -> HRESULT,
     pub GetIDsOfNames:
-        unsafe extern "system" fn(this: *mut c_void, riid: *const GUID, names: *const *const u16, count: u32, lcid: u32, ids: *mut i32) -> HRESULT,
+        unsafe extern "system" fn(this: *mut c_void, riid: *const GUID, names: *const *const OLECHAR, count: u32, lcid: u32, ids: *mut i32) -> HRESULT,
     pub Invoke: unsafe extern "system" fn(
         this: *mut c_void,
         dispid: i32,
@@ -231,7 +231,7 @@ pub struct ITypeInfoVtbl {
     pub GetIDsOfNames: NotImplFn,
     pub Invoke: NotImplFn,
     pub GetDocumentation:
-        unsafe extern "system" fn(this: *mut c_void, memid: i32, name: *mut *mut u16, doc: *mut *mut u16, help_context: *mut u32, help_file: *mut *mut u16) -> HRESULT,
+        unsafe extern "system" fn(this: *mut c_void, memid: i32, name: *mut *mut OLECHAR, doc: *mut *mut OLECHAR, help_context: *mut u32, help_file: *mut *mut OLECHAR) -> HRESULT,
     pub GetDllEntry: NotImplFn,
     pub GetRefTypeInfo: NotImplFn,
     pub AddressOfMember: NotImplFn,
@@ -272,9 +272,9 @@ pub struct IActiveScriptVtbl {
     pub SetScriptState: unsafe extern "system" fn(this: *mut c_void, state: i32) -> HRESULT,
     pub GetScriptState: unsafe extern "system" fn(this: *mut c_void, state: *mut i32) -> HRESULT,
     pub Close: unsafe extern "system" fn(this: *mut c_void) -> HRESULT,
-    pub AddNamedItem: unsafe extern "system" fn(this: *mut c_void, name: *const u16, flags: u32) -> HRESULT,
+    pub AddNamedItem: unsafe extern "system" fn(this: *mut c_void, name: *const OLECHAR, flags: u32) -> HRESULT,
     pub AddTypeLib: unsafe extern "system" fn(this: *mut c_void, guid: *const GUID, major: u32, minor: u32, flags: u32) -> HRESULT,
-    pub GetScriptDispatch: unsafe extern "system" fn(this: *mut c_void, item: *const u16, out: *mut *mut IDispatch) -> HRESULT,
+    pub GetScriptDispatch: unsafe extern "system" fn(this: *mut c_void, item: *const OLECHAR, out: *mut *mut IDispatch) -> HRESULT,
     pub GetCurrentScriptThreadID: unsafe extern "system" fn(this: *mut c_void, id: *mut u32) -> HRESULT,
     pub GetScriptThreadID: unsafe extern "system" fn(this: *mut c_void, win32: u32, id: *mut u32) -> HRESULT,
     pub GetScriptThreadState: unsafe extern "system" fn(this: *mut c_void, id: u32, state: *mut i32) -> HRESULT,
@@ -289,10 +289,10 @@ pub struct IActiveScriptParse64Vtbl {
     pub AddScriptlet: *const c_void,
     pub ParseScriptText: unsafe extern "system" fn(
         this: *mut c_void,
-        code: *const u16,
-        item_name: *const u16,
+        code: *const OLECHAR,
+        item_name: *const OLECHAR,
         context: *mut c_void,
-        delimiter: *const u16,
+        delimiter: *const OLECHAR,
         source_context: u64,
         starting_line: u32,
         flags: u32,
@@ -305,8 +305,8 @@ pub struct IActiveScriptParse64Vtbl {
 pub struct IActiveScriptSiteVtbl {
     pub base: IUnknownVtbl,
     pub GetLCID: unsafe extern "system" fn(this: *mut c_void, lcid: *mut u32) -> HRESULT,
-    pub GetItemInfo: unsafe extern "system" fn(this: *mut c_void, name: *const u16, mask: u32, item: *mut *mut c_void, info: *mut *mut c_void) -> HRESULT,
-    pub GetDocVersionString: unsafe extern "system" fn(this: *mut c_void, version: *mut *mut u16) -> HRESULT,
+    pub GetItemInfo: unsafe extern "system" fn(this: *mut c_void, name: *const OLECHAR, mask: u32, item: *mut *mut c_void, info: *mut *mut c_void) -> HRESULT,
+    pub GetDocVersionString: unsafe extern "system" fn(this: *mut c_void, version: *mut *mut OLECHAR) -> HRESULT,
     pub OnScriptTerminate: unsafe extern "system" fn(this: *mut c_void, result: *const VARIANT, excep: *const EXCEPINFO) -> HRESULT,
     pub OnStateChange: unsafe extern "system" fn(this: *mut c_void, state: i32) -> HRESULT,
     pub OnScriptError: unsafe extern "system" fn(this: *mut c_void, error: *mut c_void) -> HRESULT,
@@ -319,7 +319,7 @@ pub struct IActiveScriptErrorVtbl {
     pub base: IUnknownVtbl,
     pub GetExceptionInfo: unsafe extern "system" fn(this: *mut c_void, excep: *mut EXCEPINFO) -> HRESULT,
     pub GetSourcePosition: unsafe extern "system" fn(this: *mut c_void, context: *mut u32, line: *mut u32, column: *mut i32) -> HRESULT,
-    pub GetSourceLineText: unsafe extern "system" fn(this: *mut c_void, text: *mut *mut u16) -> HRESULT,
+    pub GetSourceLineText: unsafe extern "system" fn(this: *mut c_void, text: *mut *mut OLECHAR) -> HRESULT,
 }
 
 #[repr(C)]
@@ -337,16 +337,42 @@ pub unsafe fn vtbl<'a, V>(obj: *mut c_void) -> &'a V {
     unsafe { &**(obj as *const *const V) }
 }
 
-/// A UTF-16, NUL-terminated copy of a string, for passing to COM.
-pub fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
+/// A character of COM's strings (BSTRs and the rest), libwinevbs's `WCHAR`: UTF-16 on Windows.
+#[cfg(windows)]
+pub type OLECHAR = u16;
+/// On Linux libwinevbs is built with the C library's own `wchar_t` (`WINE_UNICODE_NATIVE`), as VPX
+/// standalone uses it: 32 bits, so its strings are UTF-32.
+#[cfg(not(windows))]
+pub type OLECHAR = u32;
+
+/// A string's characters for COM, with no NUL after them.
+pub fn wide_chars(s: &str) -> Vec<OLECHAR> {
+    #[cfg(windows)]
+    return s.encode_utf16().collect();
+    #[cfg(not(windows))]
+    return s.chars().map(u32::from).collect();
 }
 
-/// A NUL-terminated UTF-16 string from COM, as Rust text.
+/// A COM string's characters as Rust text.
+pub fn wide_text(chars: &[OLECHAR]) -> String {
+    #[cfg(windows)]
+    return String::from_utf16_lossy(chars);
+    #[cfg(not(windows))]
+    return chars.iter().map(|&c| char::from_u32(c).unwrap_or(char::REPLACEMENT_CHARACTER)).collect();
+}
+
+/// A NUL-terminated copy of a string, for passing to COM.
+pub fn wide(s: &str) -> Vec<OLECHAR> {
+    let mut w = wide_chars(s);
+    w.push(0);
+    w
+}
+
+/// A NUL-terminated string from COM, as Rust text.
 ///
 /// # Safety
-/// `p` must be null or point to a NUL-terminated UTF-16 string.
-pub unsafe fn from_wide(p: *const u16) -> String {
+/// `p` must be null or point to a NUL-terminated string of [`OLECHAR`]s.
+pub unsafe fn from_wide(p: *const OLECHAR) -> String {
     if p.is_null() {
         return String::new();
     }
@@ -355,6 +381,6 @@ pub unsafe fn from_wide(p: *const u16) -> String {
         while *p.add(n) != 0 {
             n += 1;
         }
-        String::from_utf16_lossy(std::slice::from_raw_parts(p, n))
+        wide_text(std::slice::from_raw_parts(p, n))
     }
 }

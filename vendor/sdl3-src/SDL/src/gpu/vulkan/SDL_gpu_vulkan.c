@@ -616,6 +616,9 @@ struct VulkanTexture
 
     bool markedForDestroy; // so that defrag doesn't double-free
     SDL_AtomicInt referenceCount;
+
+    // Visual Pinball Infinite: altered from SDL 3.4.18 -- an image made elsewhere (SDL_PROP_GPU_TEXTURE_CREATE_VULKAN_IMAGE_NUMBER), never destroyed here
+    bool externalImage;
 };
 
 struct VulkanTextureContainer
@@ -654,7 +657,8 @@ typedef enum VulkanTextureUsageMode
     VULKAN_TEXTURE_USAGE_MODE_COMPUTE_STORAGE_READ_WRITE,
     VULKAN_TEXTURE_USAGE_MODE_COLOR_ATTACHMENT,
     VULKAN_TEXTURE_USAGE_MODE_DEPTH_STENCIL_ATTACHMENT,
-    VULKAN_TEXTURE_USAGE_MODE_PRESENT
+    VULKAN_TEXTURE_USAGE_MODE_PRESENT,
+    VULKAN_TEXTURE_USAGE_MODE_FRAGMENT_SHADING_RATE // Visual Pinball Infinite: altered from SDL 3.4.18
 } VulkanTextureUsageMode;
 
 typedef enum VulkanUniformBufferStage
@@ -922,6 +926,7 @@ typedef struct FramebufferHashTableKey
     VkImageView resolveAttachmentViews[MAX_COLOR_TARGET_BINDINGS];
     Uint32 numResolveAttachments;
     VkImageView depthStencilAttachmentView;
+    VkImageView shadingRateView; // Visual Pinball Infinite: altered from SDL 3.4.18
     Uint32 width;
     Uint32 height;
 } FramebufferHashTableKey;
@@ -941,6 +946,7 @@ typedef struct VulkanCommandBuffer
 {
     CommandBufferCommonHeader common;
     VulkanRenderer *renderer;
+    VulkanTextureContainer *shadingRateImage; // Visual Pinball Infinite: altered from SDL 3.4.18 -- SDL_SetGPUShadingRateImage's
 
     VkCommandBuffer commandBuffer;
     VulkanCommandPool *commandPool;
@@ -1130,6 +1136,15 @@ struct VulkanRenderer
     bool preferLowPower;
     bool requireHardwareAcceleration;
     SDL_PropertiesID props;
+    // Visual Pinball Infinite: altered from SDL 3.4.18 -- another API's way of making the instance and device (OpenXR's)
+    const SDL_GPUVulkanCreationHooks *creationHooks;
+    // Visual Pinball Infinite: altered from SDL 3.4.18 -- fragment shading rate images: asked for; on (every render pass takes
+    // one: the command buffer's, else shadingRateFull, 1x1 everywhere); the pixels a texel covers, across and down
+    bool shadingRateWanted;
+    bool shadingRate;
+    Uint32 shadingRateTexel;
+    PFN_vkCreateRenderPass2KHR vkCreateRenderPass2KHR;
+    VulkanTextureContainer *shadingRateFull;
     Uint32 allowedFramesInFlight;
 
     VulkanExtensions supports;
@@ -2749,6 +2764,10 @@ static void VULKAN_INTERNAL_TextureMemoryBarrier(
         srcStages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
         memoryBarrier.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
         memoryBarrier.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    } else if (sourceUsageMode == VULKAN_TEXTURE_USAGE_MODE_FRAGMENT_SHADING_RATE) { // Visual Pinball Infinite: altered from SDL 3.4.18
+        srcStages = VK_PIPELINE_STAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+        memoryBarrier.srcAccessMask = VK_ACCESS_FRAGMENT_SHADING_RATE_ATTACHMENT_READ_BIT_KHR;
+        memoryBarrier.oldLayout = VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR;
     } else {
         SDL_LogError(SDL_LOG_CATEGORY_GPU, "Unrecognized texture source barrier type!");
         return;
@@ -2790,6 +2809,10 @@ static void VULKAN_INTERNAL_TextureMemoryBarrier(
         dstStages = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
         memoryBarrier.dstAccessMask = 0;
         memoryBarrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    } else if (destinationUsageMode == VULKAN_TEXTURE_USAGE_MODE_FRAGMENT_SHADING_RATE) { // Visual Pinball Infinite: altered from SDL 3.4.18
+        dstStages = VK_PIPELINE_STAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+        memoryBarrier.dstAccessMask = VK_ACCESS_FRAGMENT_SHADING_RATE_ATTACHMENT_READ_BIT_KHR;
+        memoryBarrier.newLayout = VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR;
     } else {
         SDL_LogError(SDL_LOG_CATEGORY_GPU, "Unrecognized texture destination barrier type!");
         return;
@@ -2912,6 +2935,8 @@ static VulkanTextureUsageMode VULKAN_INTERNAL_DefaultTextureUsageMode(
         return VULKAN_TEXTURE_USAGE_MODE_COMPUTE_STORAGE_READ_WRITE;
     } else if (texture->usage & SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_SIMULTANEOUS_READ_WRITE) {
         return VULKAN_TEXTURE_USAGE_MODE_COMPUTE_STORAGE_READ_WRITE;
+    } else if (texture->usage & SDL_GPU_TEXTUREUSAGE_FRAGMENT_SHADING_RATE) { // Visual Pinball Infinite: altered from SDL 3.4.18
+        return VULKAN_TEXTURE_USAGE_MODE_FRAGMENT_SHADING_RATE;
     } else {
         SDL_LogError(SDL_LOG_CATEGORY_GPU, "Texture has no default usage mode!");
         return VULKAN_TEXTURE_USAGE_MODE_SAMPLER;
@@ -3063,6 +3088,9 @@ static bool SDLCALL CheckOneFramebufferForRemoval(void *userdata, const SDL_Hash
     if (key->depthStencilAttachmentView == view) {
         remove = true;
     }
+    if (key->shadingRateView == view) { // Visual Pinball Infinite: altered from SDL 3.4.18
+        remove = true;
+    }
 
     if (remove) {
         if (data->keysToRemoveCount == data->keysToRemoveCapacity) {
@@ -3147,6 +3175,11 @@ static void VULKAN_INTERNAL_DestroyTexture(
 
     SDL_free(texture->subresources);
 
+    // Visual Pinball Infinite: altered from SDL 3.4.18 -- a fragment shading rate image's view is a framebuffer attachment
+    if (texture->fullView && (texture->usage & SDL_GPU_TEXTUREUSAGE_FRAGMENT_SHADING_RATE)) {
+        VULKAN_INTERNAL_RemoveFramebuffersContainingView(renderer, texture->fullView);
+    }
+
     if (texture->fullView) {
         renderer->vkDestroyImageView(
             renderer->logicalDevice,
@@ -3154,7 +3187,7 @@ static void VULKAN_INTERNAL_DestroyTexture(
             NULL);
     }
 
-    if (texture->image) {
+    if (texture->image && !texture->externalImage) { // Visual Pinball Infinite: altered from SDL 3.4.18
         renderer->vkDestroyImage(
             renderer->logicalDevice,
             texture->image,
@@ -3655,6 +3688,7 @@ static Uint32 SDLCALL VULKAN_INTERNAL_FramebufferHashFunction(void *userdata, co
     }
 
     result = result * hashFactor + (Uint32)(uintptr_t)hashTableKey->depthStencilAttachmentView;
+    result = result * hashFactor + (Uint32)(uintptr_t)hashTableKey->shadingRateView; // Visual Pinball Infinite: altered from SDL 3.4.18
     result = result * hashFactor + hashTableKey->width;
     result = result * hashFactor + hashTableKey->height;
 
@@ -3687,6 +3721,10 @@ static bool SDLCALL VULKAN_INTERNAL_FramebufferHashKeyMatch(void *userdata, cons
     }
 
     if (a->depthStencilAttachmentView != b->depthStencilAttachmentView) {
+        return 0;
+    }
+
+    if (a->shadingRateView != b->shadingRateView) { // Visual Pinball Infinite: altered from SDL 3.4.18
         return 0;
     }
 
@@ -4985,6 +5023,12 @@ static void VULKAN_DestroyDevice(
     VulkanRenderer *renderer = (VulkanRenderer *)device->driverData;
     VulkanMemorySubAllocator *allocator;
 
+    // Visual Pinball Infinite: altered from SDL 3.4.18 -- the full rate image
+    if (renderer->shadingRateFull) {
+        VULKAN_ReleaseTexture((SDL_GPURenderer *)renderer, (SDL_GPUTexture *)renderer->shadingRateFull);
+        renderer->shadingRateFull = NULL;
+    }
+
     VULKAN_Wait(device->driverData);
 
     for (Sint32 i = renderer->claimedWindowCount - 1; i >= 0; i -= 1) {
@@ -5789,6 +5833,10 @@ static VulkanTexture *VULKAN_INTERNAL_CreateTexture(
                              SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_SIMULTANEOUS_READ_WRITE)) {
         vkUsageFlags |= VK_IMAGE_USAGE_STORAGE_BIT;
     }
+    // Visual Pinball Infinite: altered from SDL 3.4.18 -- a fragment shading rate image
+    if (createinfo->usage & SDL_GPU_TEXTUREUSAGE_FRAGMENT_SHADING_RATE) {
+        vkUsageFlags |= VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+    }
 
     imageCreateInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     imageCreateInfo.pNext = NULL;
@@ -5808,35 +5856,43 @@ static VulkanTexture *VULKAN_INTERNAL_CreateTexture(
     imageCreateInfo.pQueueFamilyIndices = NULL;
     imageCreateInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-    vulkanResult = renderer->vkCreateImage(
-        renderer->logicalDevice,
-        &imageCreateInfo,
-        NULL,
-        &texture->image);
-
-    if (vulkanResult != VK_SUCCESS) {
-        VULKAN_INTERNAL_DestroyTexture(renderer, texture);
-        CHECK_VULKAN_ERROR_AND_RETURN(vulkanResult, vkCreateImage, NULL);
-    }
-
-    bindResult = VULKAN_INTERNAL_BindMemoryForImage(
-        renderer,
-        texture->image,
-        &texture->usedRegion);
-
-    if (bindResult != 1) {
-        renderer->vkDestroyImage(
+    /* Visual Pinball Infinite: altered from SDL 3.4.18 -- an image made elsewhere: no image or memory of ours */
+    VkImage externalImage = (VkImage)(uintptr_t)SDL_GetNumberProperty(createinfo->props, SDL_PROP_GPU_TEXTURE_CREATE_VULKAN_IMAGE_NUMBER, 0);
+    if (externalImage != VK_NULL_HANDLE) {
+        texture->image = externalImage;
+        texture->externalImage = true;
+    } else {
+        vulkanResult = renderer->vkCreateImage(
             renderer->logicalDevice,
-            texture->image,
-            NULL);
+            &imageCreateInfo,
+            NULL,
+            &texture->image);
 
-        VULKAN_INTERNAL_DestroyTexture(renderer, texture);
-        SET_STRING_ERROR_AND_RETURN("Unable to bind memory for texture!", NULL);
+        if (vulkanResult != VK_SUCCESS) {
+            VULKAN_INTERNAL_DestroyTexture(renderer, texture);
+            CHECK_VULKAN_ERROR_AND_RETURN(vulkanResult, vkCreateImage, NULL);
+        }
+
+        bindResult = VULKAN_INTERNAL_BindMemoryForImage(
+            renderer,
+            texture->image,
+            &texture->usedRegion);
+
+        if (bindResult != 1) {
+            renderer->vkDestroyImage(
+                renderer->logicalDevice,
+                texture->image,
+                NULL);
+
+            VULKAN_INTERNAL_DestroyTexture(renderer, texture);
+            SET_STRING_ERROR_AND_RETURN("Unable to bind memory for texture!", NULL);
+        }
+
+        texture->usedRegion->vulkanTexture = texture; // lol
     }
 
-    texture->usedRegion->vulkanTexture = texture; // lol
-
-    if (createinfo->usage & (SDL_GPU_TEXTUREUSAGE_SAMPLER | SDL_GPU_TEXTUREUSAGE_GRAPHICS_STORAGE_READ | SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_READ)) {
+    // Visual Pinball Infinite: altered from SDL 3.4.18 -- a fragment shading rate image's view is what passes attach
+    if (createinfo->usage & (SDL_GPU_TEXTUREUSAGE_SAMPLER | SDL_GPU_TEXTUREUSAGE_GRAPHICS_STORAGE_READ | SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_READ | SDL_GPU_TEXTUREUSAGE_FRAGMENT_SHADING_RATE)) {
 
         imageViewCreateInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         imageViewCreateInfo.pNext = NULL;
@@ -6125,6 +6181,115 @@ static VulkanTextureSubresource *VULKAN_INTERNAL_PrepareTextureSubresourceForWri
     return textureSubresource;
 }
 
+/* Visual Pinball Infinite: altered from SDL 3.4.18 -- with fragment shading rate images on, a render pass is made as a
+   render pass 2 with one more attachment, last: the rate image, read where the pass begins (so a pipeline made for any
+   pass suits any other); else as it was */
+static VkResult VULKAN_INTERNAL_CreateRenderPassObject(
+    VulkanRenderer *renderer,
+    const VkRenderPassCreateInfo *info,
+    VkRenderPass *renderPass)
+{
+    VkAttachmentDescription2 attachments[2 * MAX_COLOR_TARGET_BINDINGS + 2];
+    VkAttachmentReference2 colors[MAX_COLOR_TARGET_BINDINGS];
+    VkAttachmentReference2 resolves[MAX_COLOR_TARGET_BINDINGS];
+    VkAttachmentReference2 depthStencil;
+    VkAttachmentReference2 rate;
+    VkFragmentShadingRateAttachmentInfoKHR rateInfo;
+    VkSubpassDescription2 subpass;
+    VkRenderPassCreateInfo2 info2;
+    const VkSubpassDescription *s = &info->pSubpasses[0]; // SDL's passes have one subpass and no dependencies
+    Uint32 i;
+
+    if (!renderer->shadingRate) {
+        return renderer->vkCreateRenderPass(renderer->logicalDevice, info, NULL, renderPass);
+    }
+
+    SDL_zeroa(attachments);
+    for (i = 0; i < info->attachmentCount; i += 1) {
+        const VkAttachmentDescription *a = &info->pAttachments[i];
+        attachments[i].sType = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2;
+        attachments[i].flags = a->flags;
+        attachments[i].format = a->format;
+        attachments[i].samples = a->samples;
+        attachments[i].loadOp = a->loadOp;
+        attachments[i].storeOp = a->storeOp;
+        attachments[i].stencilLoadOp = a->stencilLoadOp;
+        attachments[i].stencilStoreOp = a->stencilStoreOp;
+        attachments[i].initialLayout = a->initialLayout;
+        attachments[i].finalLayout = a->finalLayout;
+    }
+    attachments[i].sType = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2;
+    attachments[i].format = VK_FORMAT_R8_UINT;
+    attachments[i].samples = VK_SAMPLE_COUNT_1_BIT;
+    attachments[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    attachments[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachments[i].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachments[i].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[i].initialLayout = VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR;
+    attachments[i].finalLayout = VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR;
+
+    for (i = 0; i < s->colorAttachmentCount; i += 1) {
+        colors[i].sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2;
+        colors[i].pNext = NULL;
+        colors[i].attachment = s->pColorAttachments[i].attachment;
+        colors[i].layout = s->pColorAttachments[i].layout;
+        colors[i].aspectMask = 0;
+        if (s->pResolveAttachments) {
+            resolves[i].sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2;
+            resolves[i].pNext = NULL;
+            resolves[i].attachment = s->pResolveAttachments[i].attachment;
+            resolves[i].layout = s->pResolveAttachments[i].layout;
+            resolves[i].aspectMask = 0;
+        }
+    }
+    if (s->pDepthStencilAttachment) {
+        depthStencil.sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2;
+        depthStencil.pNext = NULL;
+        depthStencil.attachment = s->pDepthStencilAttachment->attachment;
+        depthStencil.layout = s->pDepthStencilAttachment->layout;
+        depthStencil.aspectMask = 0;
+    }
+    rate.sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2;
+    rate.pNext = NULL;
+    rate.attachment = info->attachmentCount;
+    rate.layout = VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR;
+    rate.aspectMask = 0;
+
+    rateInfo.sType = VK_STRUCTURE_TYPE_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR;
+    rateInfo.pNext = NULL;
+    rateInfo.pFragmentShadingRateAttachment = &rate;
+    rateInfo.shadingRateAttachmentTexelSize.width = renderer->shadingRateTexel;
+    rateInfo.shadingRateAttachmentTexelSize.height = renderer->shadingRateTexel;
+
+    subpass.sType = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2;
+    subpass.pNext = &rateInfo;
+    subpass.flags = s->flags;
+    subpass.pipelineBindPoint = s->pipelineBindPoint;
+    subpass.viewMask = 0;
+    subpass.inputAttachmentCount = 0;
+    subpass.pInputAttachments = NULL;
+    subpass.colorAttachmentCount = s->colorAttachmentCount;
+    subpass.pColorAttachments = colors;
+    subpass.pResolveAttachments = s->pResolveAttachments ? resolves : NULL;
+    subpass.pDepthStencilAttachment = s->pDepthStencilAttachment ? &depthStencil : NULL;
+    subpass.preserveAttachmentCount = 0;
+    subpass.pPreserveAttachments = NULL;
+
+    info2.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2;
+    info2.pNext = NULL;
+    info2.flags = info->flags;
+    info2.attachmentCount = info->attachmentCount + 1;
+    info2.pAttachments = attachments;
+    info2.subpassCount = 1;
+    info2.pSubpasses = &subpass;
+    info2.dependencyCount = 0;
+    info2.pDependencies = NULL;
+    info2.correlatedViewMaskCount = 0;
+    info2.pCorrelatedViewMasks = NULL;
+
+    return renderer->vkCreateRenderPass2KHR(renderer->logicalDevice, &info2, NULL, renderPass);
+}
+
 static VkRenderPass VULKAN_INTERNAL_CreateRenderPass(
     VulkanRenderer *renderer,
     const SDL_GPUColorTargetInfo *colorTargetInfos,
@@ -6236,11 +6401,7 @@ static VkRenderPass VULKAN_INTERNAL_CreateRenderPass(
     renderPassCreateInfo.dependencyCount = 0;
     renderPassCreateInfo.pDependencies = NULL;
 
-    vulkanResult = renderer->vkCreateRenderPass(
-        renderer->logicalDevice,
-        &renderPassCreateInfo,
-        NULL,
-        &renderPass);
+    vulkanResult = VULKAN_INTERNAL_CreateRenderPassObject(renderer, &renderPassCreateInfo, &renderPass); // Visual Pinball Infinite: altered from SDL 3.4.18
 
     CHECK_VULKAN_ERROR_AND_RETURN(vulkanResult, vkCreateRenderPass, VK_NULL_HANDLE);
 
@@ -6328,11 +6489,7 @@ static VkRenderPass VULKAN_INTERNAL_CreateTransientRenderPass(
     renderPassCreateInfo.dependencyCount = 0;
     renderPassCreateInfo.pDependencies = NULL;
 
-    result = renderer->vkCreateRenderPass(
-        renderer->logicalDevice,
-        &renderPassCreateInfo,
-        NULL,
-        &renderPass);
+    result = VULKAN_INTERNAL_CreateRenderPassObject(renderer, &renderPassCreateInfo, &renderPass); // Visual Pinball Infinite: altered from SDL 3.4.18
 
     CHECK_VULKAN_ERROR_AND_RETURN(result, vkCreateRenderPass, VK_NULL_HANDLE);
 
@@ -6622,6 +6779,18 @@ static SDL_GPUGraphicsPipeline *VULKAN_CreateGraphicsPipeline(
     vkPipelineCreateInfo.subpass = 0;
     vkPipelineCreateInfo.basePipelineHandle = VK_NULL_HANDLE;
     vkPipelineCreateInfo.basePipelineIndex = 0;
+
+    // Visual Pinball Infinite: altered from SDL 3.4.18 -- with fragment shading rate images, the image's rate in place of the pipeline's
+    VkPipelineFragmentShadingRateStateCreateInfoKHR shadingRateState;
+    if (renderer->shadingRate) {
+        shadingRateState.sType = VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR;
+        shadingRateState.pNext = NULL;
+        shadingRateState.fragmentSize.width = 1;
+        shadingRateState.fragmentSize.height = 1;
+        shadingRateState.combinerOps[0] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
+        shadingRateState.combinerOps[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR;
+        vkPipelineCreateInfo.pNext = &shadingRateState;
+    }
 
     // TODO: enable pipeline caching
     vulkanResult = renderer->vkCreateGraphicsPipelines(
@@ -6952,7 +7121,7 @@ static SDL_GPUTexture *VULKAN_CreateTexture(
         SDL_CopyProperties(createinfo->props, container->header.info.props);
     }
 
-    container->canBeCycled = true;
+    container->canBeCycled = !texture->externalImage; // Visual Pinball Infinite: altered from SDL 3.4.18
     container->activeTexture = texture;
     container->textureCapacity = 1;
     container->textureCount = 1;
@@ -6971,7 +7140,8 @@ static SDL_GPUTexture *VULKAN_CreateTexture(
     // Let's transition to the default barrier state, because for some reason Vulkan doesn't let us do that with initialLayout.
     // Only do this after "container" is set, so the texture
     // is fully initialized before any Submit that could trigger defrag.
-    {
+    // Visual Pinball Infinite: altered from SDL 3.4.18 -- not an image made elsewhere, which is in that state already
+    if (!texture->externalImage) {
         VulkanCommandBuffer *barrierCommandBuffer = (VulkanCommandBuffer *)VULKAN_AcquireCommandBuffer((SDL_GPURenderer *)renderer);
         VULKAN_INTERNAL_TextureTransitionToDefaultUsage(
             renderer,
@@ -7347,12 +7517,13 @@ static VulkanFramebuffer *VULKAN_INTERNAL_FetchFramebuffer(
     Uint32 numColorTargets,
     const SDL_GPUDepthStencilTargetInfo *depthStencilTargetInfo,
     Uint32 width,
-    Uint32 height)
+    Uint32 height,
+    VkImageView shadingRateView) // Visual Pinball Infinite: altered from SDL 3.4.18
 {
     VulkanFramebuffer *vulkanFramebuffer = NULL;
     VkFramebufferCreateInfo framebufferInfo;
     VkResult result;
-    VkImageView imageViewAttachments[2 * MAX_COLOR_TARGET_BINDINGS + 1 /* depth */];
+    VkImageView imageViewAttachments[2 * MAX_COLOR_TARGET_BINDINGS + 2 /* depth, shading rate */];
     FramebufferHashTableKey key;
     Uint32 attachmentCount = 0;
     Uint32 i;
@@ -7397,6 +7568,7 @@ static VulkanFramebuffer *VULKAN_INTERNAL_FetchFramebuffer(
 
     key.width = width;
     key.height = height;
+    key.shadingRateView = shadingRateView; // Visual Pinball Infinite: altered from SDL 3.4.18
 
     SDL_LockMutex(renderer->framebufferFetchLock);
 
@@ -7450,6 +7622,12 @@ static VulkanFramebuffer *VULKAN_INTERNAL_FetchFramebuffer(
             depthStencilTargetInfo->mip_level);
         imageViewAttachments[attachmentCount] = subresource->depthStencilView;
 
+        attachmentCount += 1;
+    }
+
+    // Visual Pinball Infinite: altered from SDL 3.4.18 -- the fragment shading rate image, last
+    if (shadingRateView != VK_NULL_HANDLE) {
+        imageViewAttachments[attachmentCount] = shadingRateView;
         attachmentCount += 1;
     }
 
@@ -7993,6 +8171,14 @@ static void VULKAN_BeginRenderPass(
         clearCount += 1;
     }
 
+    // Visual Pinball Infinite: altered from SDL 3.4.18 -- the fragment shading rate image the pass takes: the one set, else full rate
+    VkImageView shadingRateView = VK_NULL_HANDLE;
+    if (renderer->shadingRate) {
+        VulkanTextureContainer *rateContainer = vulkanCommandBuffer->shadingRateImage ? vulkanCommandBuffer->shadingRateImage : renderer->shadingRateFull;
+        shadingRateView = rateContainer->activeTexture->fullView;
+        VULKAN_INTERNAL_TrackTexture(vulkanCommandBuffer, rateContainer->activeTexture);
+    }
+
     // Fetch required render objects
 
     renderPass = VULKAN_INTERNAL_FetchRenderPass(
@@ -8012,7 +8198,8 @@ static void VULKAN_BeginRenderPass(
         numColorTargets,
         depthStencilTargetInfo,
         framebufferWidth,
-        framebufferHeight);
+        framebufferHeight,
+        shadingRateView);
 
     if (framebuffer == NULL) {
         return;
@@ -9707,6 +9894,7 @@ static SDL_GPUCommandBuffer *VULKAN_AcquireCommandBuffer(
     commandBuffer->depthStencilAttachmentSubresource = NULL;
     commandBuffer->colorAttachmentSubresourceCount = 0;
     commandBuffer->resolveAttachmentSubresourceCount = 0;
+    commandBuffer->shadingRateImage = NULL; // Visual Pinball Infinite: altered from SDL 3.4.18
 
     for (i = 0; i < MAX_UNIFORM_BUFFERS_PER_STAGE; i += 1) {
         commandBuffer->vertexUniformBuffers[i] = NULL;
@@ -12084,7 +12272,16 @@ static Uint8 VULKAN_INTERNAL_CreateInstance(VulkanRenderer *renderer, VulkanFeat
         createInfo.enabledLayerCount = 0;
     }
 
-    vulkanResult = vkCreateInstance(&createInfo, NULL, &renderer->instance);
+    /* Visual Pinball Infinite: altered from SDL 3.4.18 -- made by another API when it asks to (OpenXR adds what it needs) */
+    if (renderer->creationHooks) {
+        vulkanResult = (VkResult)renderer->creationHooks->create_instance(
+            renderer->creationHooks->userdata,
+            (void *)vkGetInstanceProcAddr,
+            &createInfo,
+            &renderer->instance);
+    } else {
+        vulkanResult = vkCreateInstance(&createInfo, NULL, &renderer->instance);
+    }
     SDL_stack_free((char *)instanceExtensionNames);
 
     if (vulkanResult != VK_SUCCESS) {
@@ -12413,6 +12610,14 @@ static Uint8 VULKAN_INTERNAL_DeterminePhysicalDevice(VulkanRenderer *renderer, V
         return 0;
     }
 
+    /* Visual Pinball Infinite: altered from SDL 3.4.18 -- the device another API names, the others left out */
+    VkPhysicalDevice requiredDevice = VK_NULL_HANDLE;
+    if (renderer->creationHooks) {
+        requiredDevice = (VkPhysicalDevice)renderer->creationHooks->physical_device(
+            renderer->creationHooks->userdata,
+            renderer->instance);
+    }
+
     // Any suitable device will do, but we'd like the best
     suitableIndex = -1;
     suitableQueueFamilyIndex = 0;
@@ -12420,6 +12625,10 @@ static Uint8 VULKAN_INTERNAL_DeterminePhysicalDevice(VulkanRenderer *renderer, V
     for (i = 0; i < physicalDeviceCount; i += 1) {
         Uint32 queueFamilyIndex;
         Uint64 deviceRank;
+
+        if (requiredDevice != VK_NULL_HANDLE && physicalDevices[i] != requiredDevice) {
+            continue;
+        }
 
         if (!VULKAN_INTERNAL_IsDeviceSuitable(
                 renderer,
@@ -12485,6 +12694,63 @@ static Uint8 VULKAN_INTERNAL_DeterminePhysicalDevice(VulkanRenderer *renderer, V
     SDL_stack_free(physicalDevices);
     SDL_stack_free(physicalDeviceExtensions);
     return 1;
+}
+
+/* Visual Pinball Infinite: altered from SDL 3.4.18 -- whether the device has fragment shading rate attachments (and render
+   pass 2), with their texel, square, the smallest it takes, in renderer->shadingRateTexel */
+static bool VULKAN_INTERNAL_ShadingRateSupported(VulkanRenderer *renderer)
+{
+    Uint32 count = 0, i, texel;
+    bool shadingRate = false, renderPass2 = false;
+    VkExtensionProperties *extensions;
+    VkPhysicalDeviceFragmentShadingRateFeaturesKHR rateFeatures;
+    VkPhysicalDeviceFeatures2 features;
+    VkPhysicalDeviceFragmentShadingRatePropertiesKHR rateProperties;
+    VkPhysicalDeviceProperties2KHR properties;
+
+    if (renderer->vkGetPhysicalDeviceFeatures2 == NULL || renderer->vkGetPhysicalDeviceProperties2KHR == NULL) {
+        return false;
+    }
+    if (renderer->vkEnumerateDeviceExtensionProperties(renderer->physicalDevice, NULL, &count, NULL) != VK_SUCCESS) {
+        return false;
+    }
+    extensions = SDL_malloc(count * sizeof(VkExtensionProperties));
+    if (extensions == NULL) {
+        return false;
+    }
+    if (renderer->vkEnumerateDeviceExtensionProperties(renderer->physicalDevice, NULL, &count, extensions) == VK_SUCCESS) {
+        for (i = 0; i < count; i += 1) {
+            shadingRate |= SDL_strcmp(extensions[i].extensionName, VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME) == 0;
+            renderPass2 |= SDL_strcmp(extensions[i].extensionName, VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME) == 0;
+        }
+    }
+    SDL_free(extensions);
+    if (!shadingRate || !renderPass2) {
+        return false;
+    }
+
+    SDL_zero(rateFeatures);
+    rateFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR;
+    SDL_zero(features);
+    features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features.pNext = &rateFeatures;
+    renderer->vkGetPhysicalDeviceFeatures2(renderer->physicalDevice, &features);
+    if (!rateFeatures.attachmentFragmentShadingRate) {
+        return false;
+    }
+
+    SDL_zero(rateProperties);
+    rateProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR;
+    SDL_zero(properties);
+    properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2_KHR;
+    properties.pNext = &rateProperties;
+    renderer->vkGetPhysicalDeviceProperties2KHR(renderer->physicalDevice, &properties);
+    texel = SDL_max(rateProperties.minFragmentShadingRateAttachmentTexelSize.width, rateProperties.minFragmentShadingRateAttachmentTexelSize.height);
+    if (texel == 0 || texel > rateProperties.maxFragmentShadingRateAttachmentTexelSize.width || texel > rateProperties.maxFragmentShadingRateAttachmentTexelSize.height) {
+        return false;
+    }
+    renderer->shadingRateTexel = texel;
+    return true;
 }
 
 static Uint8 VULKAN_INTERNAL_CreateLogicalDevice(
@@ -12564,7 +12830,7 @@ static Uint8 VULKAN_INTERNAL_CreateLogicalDevice(
 
     deviceExtensions = SDL_stack_alloc(
         const char *,
-        extensionCount + features->additionalDeviceExtensionCount);
+        extensionCount + features->additionalDeviceExtensionCount + 2); // Visual Pinball Infinite: altered from SDL 3.4.18: 2 for the shading rate
 
     CreateDeviceExtensionArray(&renderer->supports, deviceExtensions);
     for (i = 0; i < features->additionalDeviceExtensionCount; ++i) {
@@ -12635,11 +12901,36 @@ static Uint8 VULKAN_INTERNAL_CreateLogicalDevice(
         deviceCreateInfo.pEnabledFeatures = &features->desiredVulkan10DeviceFeatures;
     }
 
-    vulkanResult = renderer->vkCreateDevice(
-        renderer->physicalDevice,
-        &deviceCreateInfo,
-        NULL,
-        &renderer->logicalDevice);
+    /* Visual Pinball Infinite: altered from SDL 3.4.18 -- fragment shading rate images, when asked for and the device has
+       them: VK_KHR_fragment_shading_rate's attachments, through render pass 2 */
+    VkPhysicalDeviceFragmentShadingRateFeaturesKHR shadingRateFeatures;
+    SDL_zero(shadingRateFeatures);
+    if (renderer->shadingRateWanted && VULKAN_INTERNAL_ShadingRateSupported(renderer)) {
+        shadingRateFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR;
+        shadingRateFeatures.attachmentFragmentShadingRate = VK_TRUE;
+        shadingRateFeatures.pNext = (void *)deviceCreateInfo.pNext;
+        deviceCreateInfo.pNext = &shadingRateFeatures;
+        deviceExtensions[extensionCount++] = VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME;
+        deviceExtensions[extensionCount++] = VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME;
+        deviceCreateInfo.enabledExtensionCount = extensionCount;
+        renderer->shadingRate = true;
+    }
+
+    /* Visual Pinball Infinite: altered from SDL 3.4.18 -- made by another API when it asks to */
+    if (renderer->creationHooks) {
+        vulkanResult = (VkResult)renderer->creationHooks->create_device(
+            renderer->creationHooks->userdata,
+            (void *)vkGetInstanceProcAddr,
+            renderer->physicalDevice,
+            &deviceCreateInfo,
+            &renderer->logicalDevice);
+    } else {
+        vulkanResult = renderer->vkCreateDevice(
+            renderer->physicalDevice,
+            &deviceCreateInfo,
+            NULL,
+            &renderer->logicalDevice);
+    }
     SDL_stack_free((void *)deviceExtensions);
     CHECK_VULKAN_ERROR_AND_RETURN(vulkanResult, vkCreateDevice, 0);
 
@@ -12651,6 +12942,12 @@ static Uint8 VULKAN_INTERNAL_CreateLogicalDevice(
                              renderer->logicalDevice,   \
                              #func);
 #include "SDL_gpu_vulkan_vkfuncs.h"
+
+    /* Visual Pinball Infinite: altered from SDL 3.4.18 -- render pass 2, for the shading rate images */
+    if (renderer->shadingRate) {
+        renderer->vkCreateRenderPass2KHR = (PFN_vkCreateRenderPass2KHR)renderer->vkGetDeviceProcAddr(renderer->logicalDevice, "vkCreateRenderPass2KHR");
+        renderer->shadingRate = renderer->vkCreateRenderPass2KHR != NULL;
+    }
 
     renderer->vkGetDeviceQueue(
         renderer->logicalDevice,
@@ -12776,6 +13073,59 @@ static bool VULKAN_PrepareDriver(SDL_VideoDevice *_this, SDL_PropertiesID props)
     return result;
 }
 
+/* Visual Pinball Infinite: altered from SDL 3.4.18 -- the fragment shading rate image of full rate (code 0), for the
+   passes given none: as large as an 8192 pixels square pass */
+static bool VULKAN_INTERNAL_CreateShadingRateFull(VulkanRenderer *renderer)
+{
+    SDL_GPUTextureCreateInfo info;
+    VkClearColorValue zero;
+    VkImageSubresourceRange range;
+    VulkanCommandBuffer *commandBuffer;
+    VulkanTexture *texture;
+
+    SDL_zero(info);
+    info.type = SDL_GPU_TEXTURETYPE_2D;
+    info.format = SDL_GPU_TEXTUREFORMAT_R8_UINT;
+    info.usage = SDL_GPU_TEXTUREUSAGE_FRAGMENT_SHADING_RATE;
+    info.width = (8192 + renderer->shadingRateTexel - 1) / renderer->shadingRateTexel;
+    info.height = info.width;
+    info.layer_count_or_depth = 1;
+    info.num_levels = 1;
+    info.sample_count = SDL_GPU_SAMPLECOUNT_1;
+    renderer->shadingRateFull = (VulkanTextureContainer *)VULKAN_CreateTexture((SDL_GPURenderer *)renderer, &info);
+    if (renderer->shadingRateFull == NULL) {
+        return false;
+    }
+    commandBuffer = (VulkanCommandBuffer *)VULKAN_AcquireCommandBuffer((SDL_GPURenderer *)renderer);
+    if (commandBuffer == NULL) {
+        return false;
+    }
+    texture = renderer->shadingRateFull->activeTexture;
+    VULKAN_INTERNAL_TextureTransitionFromDefaultUsage(renderer, commandBuffer, VULKAN_TEXTURE_USAGE_MODE_COPY_DESTINATION, texture);
+    SDL_zero(zero);
+    range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    range.baseMipLevel = 0;
+    range.levelCount = 1;
+    range.baseArrayLayer = 0;
+    range.layerCount = 1;
+    renderer->vkCmdClearColorImage(commandBuffer->commandBuffer, texture->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
+    VULKAN_INTERNAL_TextureTransitionToDefaultUsage(renderer, commandBuffer, VULKAN_TEXTURE_USAGE_MODE_COPY_DESTINATION, texture);
+    VULKAN_INTERNAL_TrackTexture(commandBuffer, texture);
+    return VULKAN_Submit((SDL_GPUCommandBuffer *)commandBuffer);
+}
+
+/* Visual Pinball Infinite: altered from SDL 3.4.18 -- see SDL_gpu.h; a Vulkan device's command buffer only */
+void SDL_SetGPUShadingRateImage(SDL_GPUCommandBuffer *command_buffer, SDL_GPUTexture *texture)
+{
+    VulkanCommandBuffer *vulkanCommandBuffer = (VulkanCommandBuffer *)command_buffer;
+    if (vulkanCommandBuffer == NULL || vulkanCommandBuffer->common.device->BeginRenderPass != VULKAN_BeginRenderPass) {
+        return;
+    }
+    if (vulkanCommandBuffer->renderer->shadingRate) {
+        vulkanCommandBuffer->shadingRateImage = (VulkanTextureContainer *)texture;
+    }
+}
+
 static SDL_GPUDevice *VULKAN_CreateDevice(bool debugMode, bool preferLowPower, SDL_PropertiesID props)
 {
     VulkanRenderer *renderer;
@@ -12803,6 +13153,14 @@ static SDL_GPUDevice *VULKAN_CreateDevice(bool debugMode, bool preferLowPower, S
     renderer->debugMode = debugMode;
     renderer->preferLowPower = preferLowPower;
     renderer->allowedFramesInFlight = 2;
+    /* Visual Pinball Infinite: altered from SDL 3.4.18 -- the device's own instance and device only: PrepareDriver's probe instance, destroyed
+       again, is made the usual way (an OpenXR runtime may keep state for each instance it made) */
+    renderer->creationHooks = (const SDL_GPUVulkanCreationHooks *)SDL_GetPointerProperty(
+        props,
+        SDL_PROP_GPU_DEVICE_CREATE_VULKAN_CREATION_HOOKS_POINTER,
+        NULL);
+    /* Visual Pinball Infinite: altered from SDL 3.4.18 -- fragment shading rate images, where the device has them */
+    renderer->shadingRateWanted = SDL_GetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_VULKAN_FRAGMENT_SHADING_RATE_BOOLEAN, false);
 
     if (!VULKAN_INTERNAL_PrepareVulkan(renderer, &features, props)) {
         SET_STRING_ERROR("Failed to initialize Vulkan!");
@@ -12917,6 +13275,13 @@ static SDL_GPUDevice *VULKAN_CreateDevice(bool debugMode, bool preferLowPower, S
         SDL_Vulkan_UnloadLibrary();
         return NULL;
     }
+
+    /* Visual Pinball Infinite: altered from SDL 3.4.18 -- the handles, for another API drawing into the same device */
+    SDL_SetPointerProperty(renderer->props, SDL_PROP_GPU_DEVICE_VULKAN_INSTANCE_POINTER, (void *)renderer->instance);
+    SDL_SetPointerProperty(renderer->props, SDL_PROP_GPU_DEVICE_VULKAN_PHYSICAL_DEVICE_POINTER, (void *)renderer->physicalDevice);
+    SDL_SetPointerProperty(renderer->props, SDL_PROP_GPU_DEVICE_VULKAN_DEVICE_POINTER, (void *)renderer->logicalDevice);
+    SDL_SetNumberProperty(renderer->props, SDL_PROP_GPU_DEVICE_VULKAN_QUEUE_FAMILY_INDEX_NUMBER, renderer->queueFamilyIndex);
+    SDL_SetNumberProperty(renderer->props, SDL_PROP_GPU_DEVICE_VULKAN_QUEUE_INDEX_NUMBER, 0);
 
     // FIXME: just move this into this function
     result = (SDL_GPUDevice *)SDL_calloc(1, sizeof(SDL_GPUDevice));
@@ -13111,6 +13476,13 @@ static SDL_GPUDevice *VULKAN_CreateDevice(bool debugMode, bool preferLowPower, S
     renderer->allocationsToDefragCapacity = 4;
     renderer->allocationsToDefrag = SDL_malloc(
         renderer->allocationsToDefragCapacity * sizeof(VulkanMemoryAllocation *));
+
+    /* Visual Pinball Infinite: altered from SDL 3.4.18 -- the full rate image of the passes given none, as large as a
+       pass can be; without it, no shading rate images (no pipeline or pass made yet) */
+    if (renderer->shadingRate && !VULKAN_INTERNAL_CreateShadingRateFull(renderer)) {
+        renderer->shadingRate = false;
+    }
+    SDL_SetNumberProperty(renderer->props, SDL_PROP_GPU_DEVICE_VULKAN_SHADING_RATE_TEXEL_SIZE_NUMBER, renderer->shadingRate ? renderer->shadingRateTexel : 0);
 
     return result;
 }

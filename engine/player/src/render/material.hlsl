@@ -73,7 +73,9 @@ struct Varyings
     float3 normal : TEXCOORD1;
     float2 uv : TEXCOORD2;
     float3 to_eye : TEXCOORD3;
+#ifndef NO_CLIP
     float clip_distance : SV_ClipDistance0;
+#endif
 };
 
 #ifdef BALL
@@ -162,7 +164,8 @@ cbuffer VpxRefraction : register(b3, space3)
 {
     row_major float4x4 refraction_view_proj; // VPX's matProj, here from the table's own space
     float4 refractionTint_thickness;
-    float4 refraction_flags;                 // x: the probe has no depth (multisampled): nothing held back
+    float4 refraction_flags;                 // x: the probe has no depth (multisampled): nothing held back; yz: the share of
+                                             // the probe's picture drawn (VR's dynamic resolution draws its top left)
 };
 
 // Where the ray, bent into the part (air to plastic, 1 / 1.5) and gone its thickness, lands in the
@@ -172,7 +175,8 @@ float3 compute_refraction(float3 pos, float3 frag, float3 N, float3 V)
     float3 R = refract(V, N, 1.0 / 1.5);
     float3 refracted_pos = pos + refractionTint_thickness.w * R;
     float4 proj = mul(float4(refracted_pos, 1.0), refraction_view_proj);
-    float2 uv = float2(0.5, 0.5) + float2(proj.x, -proj.y) * (0.5 / proj.w);
+    // in the part of the probe's picture drawn (VR's dynamic resolution draws the top left of it)
+    float2 uv = (float2(0.5, 0.5) + float2(proj.x, -proj.y) * (0.5 / proj.w)) * refraction_flags.yz;
     if (refraction_flags.x == 0.0 && tex_probe_depth.SampleLevel(probe_depth_sampler, uv, 0.0) < frag.z)
         uv = frag.xy * w_h_transmission.xy;
     return refractionTint_thickness.rgb * tex_refraction.SampleLevel(refraction_sampler, uv, 0.0).rgb;
@@ -192,6 +196,45 @@ float GeometricOpacity(float NdotV, float alpha, float blending, float thickness
 float3 FresnelSchlick(float3 spec, float LdotH, float edge)
 {
     return spec + (float3(edge, edge, edge) - spec) * pow(1.0 - LdotH, 5.0);
+}
+
+// ---- VR's specular antialiasing (the owner's VPX fork's, its material.sh) ----
+//
+// A curved part's shading normal varies inside a pixel, so a highlight thinner than a pixel is hit or missed and
+// sparkles at the slightest movement, worst in a headset. After Kaplanyan et al. (Filtering Distributions of Normals
+// for Shading Antialiasing, 2016) and Tokuyoshi & Kaplanyan (Improved Geometric Specular Antialiasing, 2019), the
+// normal's variance over the pixel, from its screen-space derivatives, widens the glossy lobe (its Blinn-Phong
+// exponent taken as alpha^2 = 2 / (n + 2)), and the clearcoat's mirror lookup reads the environment's mip level of the
+// pixel's footprint. On only in VR (fenvEmissionScale_TexWidth.z): the desktop's picture stays VPX's.
+
+#define SPECULAR_AA_PIXEL_SIGMA2 0.25 // the sample's variance inside the pixel: (half a pixel)^2
+#define SPECULAR_AA_MAX_KERNEL 0.18   // the most roughness added: beyond it the normal is noise over the pixel
+
+// x: the normal's variance over the pixel; y: its squared change across one pixel, the larger way
+float2 NormalVariation(float3 N)
+{
+    float3 dNdx = ddx(N);
+    float3 dNdy = ddy(N);
+    float dx2 = dot(dNdx, dNdx);
+    float dy2 = dot(dNdy, dNdy);
+    return float2(SPECULAR_AA_PIXEL_SIGMA2 * (dx2 + dy2), max(dx2, dy2));
+}
+
+// the glossy exponent for this pixel, widened by the normal's variation when on
+float SpecularAAGlossyPower(float glossyPower, float2 normalVariation)
+{
+    if (fenvEmissionScale_TexWidth.z == 0.0)
+        return glossyPower;
+    float kernel = min(2.0 * normalVariation.x, SPECULAR_AA_MAX_KERNEL);
+    return 2.0 / (2.0 / (glossyPower + 2.0) + kernel) - 2.0;
+}
+
+// the clearcoat's mirror lookup's mip level: the reflection turns twice as fast as the normal
+float SpecularAAMirrorMip(float2 normalVariation)
+{
+    if (fenvEmissionScale_TexWidth.z == 0.0)
+        return 0.0;
+    return clamp(0.5 * log2(max(normalVariation.y, 1e-12)) + log2(fenvEmissionScale_TexWidth.y / 3.14159265), 0.0, log2(fenvEmissionScale_TexWidth.y) - 1.0);
 }
 
 float3 DoPointLight(float3 pos, float3 N, float3 V, float3 diffuse, float3 glossy, float edge, float glossyPower, int i, bool is_metal)
@@ -331,10 +374,10 @@ float3 DoEnvmapGlossy(float3 N, float3 V, float2 Ruv, float3 glossy, float gloss
     return glossy * env * fenvEmissionScale_TexWidth.x;
 }
 
-float3 DoEnvmap2ndLayer(float3 color1stLayer, float3 pos, float3 N, float3 V, float NdotV, float2 Ruv, float3 specular)
+float3 DoEnvmap2ndLayer(float3 color1stLayer, float3 pos, float3 N, float3 V, float NdotV, float2 Ruv, float3 specular, float mip)
 {
     float3 w = FresnelSchlick(specular, NdotV, Roughness_WrapL_Edge_Thickness.z);
-    float3 env = tex_env.SampleLevel(env_sampler, Ruv, 0.0).xyz;
+    float3 env = tex_env.SampleLevel(env_sampler, Ruv, mip).xyz;
     return lerp(color1stLayer, env * fenvEmissionScale_TexWidth.x, w);
 }
 
@@ -343,6 +386,10 @@ float3 DoEnvmap2ndLayer(float3 color1stLayer, float3 pos, float3 N, float3 V, fl
 float3 lightLoop(float3 pos, float3 N, float3 V, float3 diffuse, float3 glossy, float3 specular, float edge, bool is_metal)
 {
     float3 color = float3(0.0, 0.0, 0.0);
+    // VR's specular antialiasing, from the normal before it's turned for the back side (that turn would read as a
+    // jump in the normal where it starts)
+    float2 normalVariation = NormalVariation(N);
+    float glossyPower = SpecularAAGlossyPower(Roughness_WrapL_Edge_Thickness.x, normalVariation);
     float NdotV = dot(N, V);
     if (NdotV < 0.0)
     {
@@ -369,8 +416,8 @@ float3 lightLoop(float3 pos, float3 N, float3 V, float3 diffuse, float3 glossy, 
             color += 2.0 * diffuse;
         else
         {
-            color += DoPointLight(pos, N, V, diffuse, glossy, edge, Roughness_WrapL_Edge_Thickness.x, 0, is_metal);
-            color += DoPointLight(pos, N, V, diffuse, glossy, edge, Roughness_WrapL_Edge_Thickness.x, 1, is_metal);
+            color += DoPointLight(pos, N, V, diffuse, glossy, edge, glossyPower, 0, is_metal);
+            color += DoPointLight(pos, N, V, diffuse, glossy, edge, glossyPower, 1, is_metal);
         }
     }
 
@@ -381,9 +428,9 @@ float3 lightLoop(float3 pos, float3 N, float3 V, float3 diffuse, float3 glossy, 
         float3 R = (2.0 * NdotV) * N - V;
         float2 Ruv = ray_to_equirectangular_uv(R);
         if (glossyMax > 0.0)
-            color += DoEnvmapGlossy(N, V, Ruv, glossy, Roughness_WrapL_Edge_Thickness.x);
+            color += DoEnvmapGlossy(N, V, Ruv, glossy, glossyPower);
         if (specularMax > 0.0)
-            color = DoEnvmap2ndLayer(color, pos, N, V, NdotV, Ruv, specular);
+            color = DoEnvmap2ndLayer(color, pos, N, V, NdotV, Ruv, specular, SpecularAAMirrorMip(normalVariation));
     }
     return color;
 }
@@ -529,6 +576,8 @@ float4 fs_vpx_classic_light(Varyings v) : SV_Target0
 // the environment's light on the diffuse one, and its reflection added as the specular layer
 float3 ballLightLoop(float3 pos, float3 N, float3 V, float3 diffuse, float3 glossy, float3 specular, float edge, bool is_metal)
 {
+    // VR's specular antialiasing on the ball's highlights (the fork's fs_ball.sc)
+    float glossyPower = SpecularAAGlossyPower(Roughness_WrapL_Edge_Thickness.x, NormalVariation(N));
     float diffuseMax = max(diffuse.x, max(diffuse.y, diffuse.z));
     float glossyMax = max(glossy.x, max(glossy.y, glossy.z));
     float specularMax = max(specular.x, max(specular.y, specular.z));
@@ -543,7 +592,7 @@ float3 ballLightLoop(float3 pos, float3 N, float3 V, float3 diffuse, float3 glos
     [branch] if ((!is_metal && (diffuseMax > 0.0)) || (glossyMax > 0.0))
     {
         [loop] for (int i = 0; i < 10; i++)
-            color += DoPointLight(pos, N, V, diffuse, glossy, edge, Roughness_WrapL_Edge_Thickness.x, i, is_metal);
+            color += DoPointLight(pos, N, V, diffuse, glossy, edge, glossyPower, i, is_metal);
     }
     [branch] if (!is_metal && (diffuseMax > 0.0))
         color += DoEnvmapDiffuse(N, diffuse);

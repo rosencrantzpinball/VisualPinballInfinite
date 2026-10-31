@@ -61,7 +61,7 @@ unsafe extern "system" fn get_lcid(_this: *mut c_void, _lcid: *mut u32) -> HRESU
     E_NOTIMPL
 }
 
-unsafe extern "system" fn get_item_info(this: *mut c_void, name: *const u16, mask: u32, item: *mut *mut c_void, info: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn get_item_info(this: *mut c_void, name: *const OLECHAR, mask: u32, item: *mut *mut c_void, info: *mut *mut c_void) -> HRESULT {
     unsafe {
         let site = &*(this as *const Site);
         if mask & SCRIPTINFO_IUNKNOWN != 0 && !item.is_null() {
@@ -81,7 +81,7 @@ unsafe extern "system" fn get_item_info(this: *mut c_void, name: *const u16, mas
     }
 }
 
-unsafe extern "system" fn get_doc_version_string(_this: *mut c_void, _version: *mut *mut u16) -> HRESULT {
+unsafe extern "system" fn get_doc_version_string(_this: *mut c_void, _version: *mut *mut OLECHAR) -> HRESULT {
     E_NOTIMPL
 }
 
@@ -101,7 +101,7 @@ unsafe extern "system" fn on_script_error(_this: *mut c_void, error: *mut c_void
         (vt.GetExceptionInfo)(error, &mut info);
         let (mut context, mut line, mut column) = (0u32, 0u32, 0i32);
         (vt.GetSourcePosition)(error, &mut context, &mut line, &mut column);
-        let mut text: *mut u16 = std::ptr::null_mut();
+        let mut text: *mut OLECHAR = std::ptr::null_mut();
         (vt.GetSourceLineText)(error, &mut text);
         let description = if info.bstrDescription.is_null() {
             format!("error {:#x}", info.scode)

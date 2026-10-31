@@ -12,6 +12,11 @@
 //! and `C` scores), a number and a value — the event set after each batch,
 //! and a stop. Host to engine: its state.
 
+#[cfg(windows)]
+mod win;
+// the same calls with POSIX, on Linux
+#[cfg(not(windows))]
+#[path = "unix.rs"]
 mod win;
 
 use std::io;

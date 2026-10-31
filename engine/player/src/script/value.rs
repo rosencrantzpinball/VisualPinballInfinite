@@ -355,7 +355,7 @@ pub fn array_text(lib: &WineVbs, v: &VARIANT) -> Option<Vec<String>> {
         }
         let out = match kind & !VT_ARRAY {
             VT_VARIANT => (0..n).map(|i| text(lib, &*(data as *const VARIANT).add(i))).collect(),
-            VT_BSTR => (0..n).map(|i| lib.bstr_text(*(data as *const *mut u16).add(i))).collect(),
+            VT_BSTR => (0..n).map(|i| lib.bstr_text(*(data as *const *mut OLECHAR).add(i))).collect(),
             _ => Vec::new(),
         };
         (lib.safe_array_unaccess_data)(array);

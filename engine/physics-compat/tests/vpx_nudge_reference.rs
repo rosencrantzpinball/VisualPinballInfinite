@@ -177,7 +177,8 @@ fn report(file: &str, results: &[Outcome]) -> String {
 }
 
 #[test]
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg_attr(target_arch = "aarch64", ignore = "on ARM, glibc's sinf and cosf differ from Microsoft's in the last bit for about 1 % of angles, and an invalid result's NaN is positive: run with --ignored for the report")]
 fn the_cabinet_sensor_matches_exact_vpx_bit_for_bit() {
     let file = "vpx-nudge-5436-precise.txt";
     let results = compare(file);
@@ -188,7 +189,7 @@ fn the_cabinet_sensor_matches_exact_vpx_bit_for_bit() {
 }
 
 #[test]
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn shipped_vpx_drift_report() {
     let file = "vpx-nudge-5436.txt";
     let results = compare(file);

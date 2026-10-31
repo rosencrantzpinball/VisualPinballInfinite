@@ -193,13 +193,23 @@ struct Options {
     /// VPX's `-minimized` (PinUP Popper starts tables with it): as in VPX, Esc then ends play at
     /// once, no pause menu first (VPX's `m_disablePauseMenu`; `-ExtMinimized` keeps the menu).
     minimized: bool,
+    /// VR (`--vr`, Linux): the table in a headset through OpenXR, as VPX places it; and its test runs'
+    /// options (`player::vr::VrOptions`).
+    vr: bool,
+    vr_options: player::vr::VrOptions,
+    /// VR with no table (`--library`): the headset's panel alone, on the library (`library`).
+    library: bool,
 }
 
-const USAGE: &str = "usage: vpi-player <table.vpx> [--vsync | --present immediate|mailbox|vsync|paced] [--max-fps 240] [--view desktop|cabinet|fss] [--size 1600x900] [--fullscreen] [--look classic|vpx] [--msaa off|4|8] [--aa-factor 0.5-2] [--ball-move vpx|intended] [--ao off|static|dynamic] [--motion-blur on|off] [--hdr on|off] [--hdr-dmd on|off] [--post-aa off|fxaa-fast|fxaa|fxaa-quality|nfaa|dlaa|smaa|faaa] [--sharpen off|cas|bilateral-cas] [--still-parts once|every-frame] [--shapes own|export] [--no-script] [--no-readout] [--one-screen] [--dmd-window X,Y,W,H] [--backglass-window X,Y,W,H] [--topper-window X,Y,W,H] [--score-panel auto|no-dmd|off|X,Y,W,H] [--backglass-dmd off|auto|X,Y,W,H] [--show-grill] [--prefer-pup] [--volume 0-100] [--shot picture.png [--at 1000] [--keys 500:1:d,600:1:u] [--video preview.mp4 [--seconds 10] [--video-sound]] [--crop playfield]] [--quit-after ms] [--record game.vpireplay]\n       vpi-player --displays [--json]\n       vpi-player --sound-outputs [--json]\n       vpi-player --input-test";
+const USAGE: &str = "usage: vpi-player <table.vpx> [--vsync | --present immediate|mailbox|vsync|paced] [--max-fps 240] [--view desktop|cabinet|fss] [--size 1600x900] [--fullscreen] [--look classic|vpx] [--msaa off|4|8] [--aa-factor 0.5-2] [--ball-move vpx|intended] [--ao off|static|dynamic] [--motion-blur on|off] [--hdr on|off] [--hdr-dmd on|off] [--post-aa off|fxaa-fast|fxaa|fxaa-quality|nfaa|dlaa|smaa|faaa] [--sharpen off|cas|bilateral-cas] [--still-parts once|every-frame] [--shapes own|export] [--no-script] [--no-readout] [--one-screen] [--dmd-window X,Y,W,H] [--backglass-window X,Y,W,H] [--topper-window X,Y,W,H] [--score-panel auto|no-dmd|off|X,Y,W,H] [--backglass-dmd off|auto|X,Y,W,H] [--show-grill] [--prefer-pup] [--volume 0-100] [--shot picture.png [--at 1000] [--keys 500:1:d,600:1:u] [--video preview.mp4 [--seconds 10] [--video-sound]] [--crop playfield]] [--quit-after ms] [--record game.vpireplay] [--vr [--vr-opaque] [--vr-pin-eyes] [--vr-eye-size WxH] [--vr-capture folder [--vr-capture-at 5000,...]] [--vr-timings frames.csv]]\n       vpi-player --displays [--json]\n       vpi-player --sound-outputs [--json]\n       vpi-player --input-test\n       vpi-player --library [--vr-passthrough]: VR with the library on the headset's panel";
 
 /// The frame-rate limit unless `--max-fps` says otherwise: above the 60–165 Hz of cabinets' and
 /// desktops' screens.
 const DEFAULT_MAX_FPS: f64 = 240.0;
+
+/// The screen the pause menu is laid out for in the headset, whatever the window's: its picture as
+/// sharp on its panel in the room as an eye's.
+const VR_MENU_SCREEN: (u32, u32) = (1920, 1920);
 
 /// The pause menu's mouse: the row it's over, and the bar it holds while a
 /// level or an option is dragged; its news handed to the game thread (`pause_menu::point`).
@@ -343,6 +353,10 @@ fn parse_args() -> Result<Options, String> {
         bloom_off: false,
         front_end: false,
         minimized: false,
+        vr: false,
+        // opaque unless passthrough is asked for (`[PlayerVR] Passthrough`, below)
+        vr_options: player::vr::VrOptions { passthrough: false, capture_at: vec![5000], ..Default::default() },
+        library: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -382,6 +396,25 @@ fn parse_args() -> Result<Options, String> {
                 }
             }
             "--fullscreen" => (o.fullscreen, o.playfield_given) = (true, true),
+            "--vr" => o.vr = true,
+            "--vr-opaque" => o.vr_options.passthrough = false,
+            "--vr-passthrough" => o.vr_options.passthrough = true,
+            "--vr-pin-eyes" => o.vr_options.pin_eyes = true,
+            "--vr-capture" => o.vr_options.capture = Some(PathBuf::from(args.next().ok_or_else(|| USAGE.to_string())?)),
+            "--vr-capture-at" => {
+                o.vr_options.capture_at = args
+                    .next()
+                    .map(|v| v.split(',').filter_map(|t| t.parse().ok()).collect::<Vec<u64>>())
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| format!("--vr-capture-at takes ms[,ms...]\n{USAGE}"))?;
+                o.vr_options.capture_at.sort_unstable();
+            }
+            "--vr-timings" => o.vr_options.timings = Some(PathBuf::from(args.next().ok_or_else(|| USAGE.to_string())?)),
+            "--vr-eye-size" => {
+                let s = args.next().unwrap_or_default();
+                let (w, h) = s.split_once('x').ok_or_else(|| format!("--vr-eye-size takes WIDTHxHEIGHT\n{USAGE}"))?;
+                o.vr_options.eye_size = Some((w.parse().map_err(|_| USAGE.to_string())?, h.parse().map_err(|_| USAGE.to_string())?));
+            }
             "--look" => {
                 o.look = match args.next().as_deref() {
                     Some("classic") => LookMode::Classic,
@@ -528,6 +561,7 @@ fn parse_args() -> Result<Options, String> {
                 o.backglass_dmd = args.next().as_deref().and_then(Overlay::parse).ok_or_else(|| format!("--backglass-dmd takes off, auto or X,Y,WIDTH,HEIGHT\n{USAGE}"))?;
             }
             "--displays" => o.displays = true,
+            "--library" => (o.library, o.vr) = (true, true),
             "--sound-outputs" => o.sound_outputs = true,
             "--input-test" => o.input_test = true,
             "--json" => o.json = true,
@@ -546,7 +580,7 @@ fn parse_args() -> Result<Options, String> {
     if o.displays || o.sound_outputs {
         return Ok(o);
     }
-    if o.input_test {
+    if o.input_test || o.library {
         o.settings = player::settings::Settings::load();
         return Ok(o);
     }
@@ -614,6 +648,7 @@ fn apply_player_settings(o: &mut Options) {
     let samples = (!given(&["--msaa"])).then(|| vs::samples(s)).flatten();
     let aa_factor = (!given(&["--aa-factor"])).then(|| vs::aa_factor(s)).flatten();
     let post_aa = (!given(&["--post-aa"])).then(|| vs::post_aa(s)).flatten();
+    let post_aa_chosen = post_aa.is_some() || given(&["--post-aa"]);
     let sharpen = (!given(&["--sharpen"])).then(|| vs::sharpen(s)).flatten();
     let ao = (!given(&["--ao"])).then(|| vs::ambient_occlusion(s)).flatten();
     let motion_blur = (!given(&["--motion-blur"])).then(|| vs::motion_blur(s)).flatten();
@@ -658,6 +693,20 @@ fn apply_player_settings(o: &mut Options) {
         o.readout = v;
     }
     o.bloom_off = bloom_off;
+    // VR, as VPX draws it in a headset: every part each frame, for each eye (the still parts' prepass
+    // serves one view), no ambient occlusion or motion blur (both built up over frames of one view),
+    // no readout or notices over the eyes' pictures
+    if o.vr {
+        o.still_once = false;
+        o.ao = player::render::AmbientOcclusion::Off;
+        o.motion_blur = false;
+        o.readout = false;
+        // Standard FXAA, as the VPX fork's headset builds default to (`[Player]` `FXAA = 2`): the Frame
+        // draws 1:1 with its panels, no AA of its own, and FXAA is the one AA within its frame time
+        if !post_aa_chosen {
+            o.post_aa = player::render::PostAa::Fxaa;
+        }
+    }
 }
 
 /// What VPX 5436's HDR10 output is asked to do on a screen with HDR on
@@ -865,6 +914,183 @@ impl LatencyLog {
 #[cfg(windows)]
 mod crash;
 
+/// The table to play next, for the launch script: the first line of `frame-table.txt` in the player's
+/// data folder.
+fn next_table(table: &std::path::Path) -> Result<(), String> {
+    let folder = vpi_settings::data_folder().ok_or("no data folder")?;
+    std::fs::create_dir_all(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
+    let file = folder.join("frame-table.txt");
+    std::fs::write(&file, format!("{}\n", table.display())).map_err(|e| format!("{}: {e}", file.display()))?;
+    println!("next table: {}", table.display());
+    Ok(())
+}
+
+/// The exit code that asks the launch script for the library (`--library`), as 75 asks it for the table
+/// in `frame-table.txt` (tools/steam-frame/run.sh).
+const LIBRARY_EXIT: u8 = 76;
+
+/// Whether the headset's panel is there to show the library.
+fn panel_available() -> bool {
+    #[cfg(not(windows))]
+    {
+        player::panel::Panel::program().is_some()
+    }
+    #[cfg(windows)]
+    {
+        false
+    }
+}
+
+/// How the library ended.
+#[cfg(not(windows))]
+enum LibraryEnd {
+    /// A table chosen there.
+    Play(std::path::PathBuf),
+    /// The panel put away: back to the table played last.
+    Back,
+    Quit,
+}
+
+/// `--library`: the library on the headset's panel, until a table is chosen there (75, the table in
+/// `frame-table.txt`), the panel is put away (75 for the table played last, kept there, else 0) or the
+/// player quits (0).
+fn library_mode(o: &Options) -> ExitCode {
+    #[cfg(not(windows))]
+    {
+        let last = vpi_settings::data_folder()
+            .and_then(|d| std::fs::read_to_string(d.join("frame-table.txt")).ok())
+            .and_then(|t| t.lines().next().map(|l| std::path::PathBuf::from(l.trim())))
+            .filter(|t| t.is_file());
+        match library(o, last.as_deref()) {
+            Ok(LibraryEnd::Play(table)) => match next_table(&table) {
+                Ok(()) => ExitCode::from(75),
+                Err(e) => {
+                    eprintln!("vpi-player: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            Ok(LibraryEnd::Back) if last.is_some() => ExitCode::from(75),
+            Ok(_) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("vpi-player: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = o;
+        eprintln!("vpi-player: --library is VR's, on Linux");
+        ExitCode::FAILURE
+    }
+}
+
+/// VR with no table: the headset's panel alone, its controllers pointing at it, until it asks for
+/// something (or the headset ends the session, or `--quit-after` passes).
+#[cfg(not(windows))]
+fn library(o: &Options, last: Option<&std::path::Path>) -> Result<LibraryEnd, String> {
+    use player::panel::{Input, Request};
+    // SAFETY: SDL is used from this thread
+    unsafe {
+        if !SDL_Init(SDL_INIT_VIDEO) {
+            return Err(format!("start SDL: {}", sdl_error()));
+        }
+    }
+    let mut options = o.vr_options.clone();
+    if !o.given.contains("--vr-opaque") && !o.given.contains("--vr-passthrough") {
+        options.passthrough = o.settings.get("PlayerVR", "Passthrough").and_then(player::settings::vpx_bool).unwrap_or(false);
+    }
+    let mut vr = player::vr::Vr::start_alone(&o.settings, options)?;
+    let root = player::vr::library_root(last);
+    vr.open_panel(&root, last)?;
+    println!("library: the headset's panel, on {}", root.display());
+    let started = Instant::now();
+    // test runs: clicks on the panel at set times (`VPI_PANEL_CLICKS=6000:793,515;9000:400,300`, ms
+    // after the start: the panel's pixels), as `--keys` presses the table's keys
+    let mut clicks: Vec<(u64, f32, f32)> = std::env::var("VPI_PANEL_CLICKS")
+        .ok()
+        .map(|v| {
+            v.split(';')
+                .filter_map(|c| {
+                    let (at, xy) = c.split_once(':')?;
+                    let (x, y) = xy.split_once(',')?;
+                    Some((at.trim().parse().ok()?, x.trim().parse().ok()?, y.trim().parse().ok()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    clicks.sort_by_key(|c| std::cmp::Reverse(c.0));
+    // test runs: the pointer swept to and fro, as a hand hovers over the panel
+    // (`VPI_PANEL_SWEEP=8000-60000:120,150:120,520:1500`: from 8 to 60 s, between those two points,
+    // 1.5 s each way)
+    let sweep: Option<(u64, u64, (f32, f32), (f32, f32), u64)> = std::env::var("VPI_PANEL_SWEEP").ok().and_then(|v| {
+        let mut parts = v.split(':');
+        let (from, to) = parts.next()?.split_once('-')?;
+        let mut point = || -> Option<(f32, f32)> {
+            let (x, y) = parts.next()?.split_once(',')?;
+            Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+        };
+        let (a, b) = (point()?, point()?);
+        Some((from.trim().parse().ok()?, to.trim().parse().ok()?, a, b, parts.next()?.trim().parse().ok().filter(|&p: &u64| p > 0)?))
+    });
+    loop {
+        if !vr.poll() {
+            return Ok(LibraryEnd::Quit);
+        }
+        // the process asked to end (Steam ending the game: SIGTERM, which SDL turns into its quit
+        // event), as the table's loop ends on it
+        // SAFETY: event polling on the thread that started SDL
+        unsafe {
+            let mut event: SDL_Event = std::mem::zeroed();
+            while SDL_PollEvent(&mut event) {
+                if event.r#type == SDL_EVENT_QUIT.0 {
+                    println!("library: asked to end");
+                    return Ok(LibraryEnd::Quit);
+                }
+            }
+        }
+        while let Some(&(at, x, y)) = clicks.last()
+            && started.elapsed() >= Duration::from_millis(at)
+        {
+            clicks.pop();
+            println!("library: a click at {x}, {y}");
+            for input in [Input::Move { x, y }, Input::Button { button: 0, down: true, x, y }, Input::Button { button: 0, down: false, x, y }] {
+                vr.panel_input(input);
+            }
+        }
+        if let Some((from, to, a, b, period)) = sweep {
+            let ms = started.elapsed().as_millis() as u64;
+            if (from..to).contains(&ms) {
+                let t = ((ms - from) % (2 * period)) as f32 / period as f32;
+                let f = if t <= 1.0 { t } else { 2.0 - t };
+                vr.panel_input(Input::Move { x: a.0 + (b.0 - a.0) * f, y: a.1 + (b.1 - a.1) * f });
+            }
+        }
+        let Some(frame) = vr.begin_frame()? else {
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        };
+        // the controllers point at the panel: their keys play nothing here
+        vr.read_controls(&frame, |_, _| {});
+        let mut end = None;
+        for request in vr.panel_requests() {
+            println!("library: {request:?}");
+            end = Some(match request {
+                Request::Play(table) => LibraryEnd::Play(table),
+                Request::Close => LibraryEnd::Back,
+                Request::Quit => LibraryEnd::Quit,
+            });
+        }
+        vr.end_frame_alone(frame)?;
+        if let Some(end) = end {
+            return Ok(end);
+        }
+        if o.quit_after_ms.is_some_and(|ms| started.elapsed() >= Duration::from_millis(ms)) {
+            return Ok(LibraryEnd::Quit);
+        }
+    }
+}
+
 fn main() -> ExitCode {
     #[cfg(windows)]
     crash::install();
@@ -875,6 +1101,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if o.library {
+        return library_mode(&o);
+    }
     let run = if o.displays {
         list_displays(o.json)
     } else if o.sound_outputs {
@@ -886,6 +1115,24 @@ fn main() -> ExitCode {
         play(&o)
     };
     match run {
+        // another table chosen in the menu (VR): kept for the launch script, which starts the player
+        // again with it on this exit code (tools/steam-frame/run.sh)
+        Ok(()) if let Some(table) = player::pause_menu::switch_to() => match next_table(&table) {
+            Ok(()) => ExitCode::from(75),
+            Err(e) => {
+                eprintln!("vpi-player: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        // the library chosen in the menu (VR): the launch script starts the player on it on this exit
+        // code, the table playing kept for the library's "Back to the table"
+        Ok(()) if player::pause_menu::to_library() => match next_table(&o.table) {
+            Ok(()) => ExitCode::from(LIBRARY_EXIT),
+            Err(e) => {
+                eprintln!("vpi-player: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("vpi-player: {e}");
@@ -1036,8 +1283,14 @@ fn play(o: &Options) -> Result<(), String> {
     // the player's exposure, tone mapper and light level for the table, from the settings
     let light_level = player::vpx_settings::light_level(&o.settings, vpx.gamedata.global_emission_scale);
     scene.set_player_look(&vpx, player::vpx_settings::exposure(&o.settings), player::vpx_settings::tone_mapper(&o.settings), light_level);
-    // VPX draws no backdrop items in the cabinet view (m_noBackdrop)
-    scene.add_backdrop(&vpx, &backdrop_image, o.view != View::Cabinet);
+    // VPX draws no backdrop items in the cabinet view, nor any backdrop in VR (m_noBackdrop), where
+    // what's behind the table is black, or the room through the headset
+    if o.vr {
+        scene.add_backdrop(&vpx, "", false);
+        scene.backdrop.color = [0.0; 3];
+    } else {
+        scene.add_backdrop(&vpx, &backdrop_image, o.view != View::Cabinet);
+    }
     // VPX's detail level, the player's difficulty and the physics sets, from the settings
     let physics = table_physics::build(&vpx, &player::vpx_settings::physics(&o.settings));
     let legacy_bounds: Vec<Vec3> = table_physics::view_bounds::legacy_view_bounds(&vpx).iter().map(|v| Vec3::new(v.x, v.y, v.z)).collect();
@@ -1058,6 +1311,24 @@ fn play(o: &Options) -> Result<(), String> {
         scene.images.iter().map(player::scene::Image::bytes).sum::<usize>() as f64 / 1e6,
         scene.groups.len()
     );
+    // VR: the parts with the most triangles, where a table bound by its geometry spends its frame
+    if o.vr {
+        let mut by_part: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        for d in &scene.draws {
+            if let Some(p) = d.part {
+                *by_part.entry(p).or_default() += u64::from(d.index_count / 3);
+            }
+        }
+        let mut heavy: Vec<(u32, u64)> = by_part.into_iter().collect();
+        heavy.sort_by(|a, b| b.1.cmp(&a.1));
+        let total: u64 = scene.draws.iter().map(|d| u64::from(d.index_count / 3)).sum();
+        let named: Vec<String> = heavy
+            .iter()
+            .take(12)
+            .map(|&(p, n)| format!("{} {:.0} k", vpx.gameitems.get(p as usize).map_or("?", |i| i.name()), n as f64 / 1e3))
+            .collect();
+        println!("{:.2} M triangles in all; the most: {}", total as f64 / 1e6, named.join(", "));
+    }
     if o.look == LookMode::Vpx {
         let mapper = ["Reinhard", "AgX", "Filmic", "Neutral", "AgX punchy"].get(scene.tone.mapper as usize).copied().unwrap_or("Reinhard");
         let grade = if scene.tone.color_grade.is_some() { g.image_color_grade.as_str() } else { "none" };
@@ -1121,6 +1392,11 @@ fn play(o: &Options) -> Result<(), String> {
             table_file: (o.shot.is_none()).then(|| o.table.with_extension("ini")),
             picture_only: o.shot.is_some(),
             view: None,
+            // VR: the tables the menu can change to
+            tables: if o.vr && o.shot.is_none() { player::vr::tables(&o.table) } else { Vec::new() },
+            playing: Some(o.table.clone()),
+            library: o.vr && o.shot.is_none() && panel_available(),
+            headset: o.vr,
         }
     };
 
@@ -1139,7 +1415,8 @@ fn play(o: &Options) -> Result<(), String> {
     }
     // SAFETY: SDL's video is started, on this thread
     let displays = unsafe { player::settings::displays() };
-    let layout = Layout::new(o, &displays);
+    // VR: the headset alone, no window of the settings'
+    let layout = if o.vr { Layout { playfield: None, backglass: None, score: None, topper: None, embedded: [None; 3] } } else { Layout::new(o, &displays) };
     // the view, with what the settings file overrides and, in window mode, where the player
     // stands before the cabinet's screen, whose size is by default the screen's own (VPX's
     // defaults without a file; in test mode the screen's size counts for nothing, so VPX's
@@ -1198,6 +1475,7 @@ fn play(o: &Options) -> Result<(), String> {
         sounds,
         record: o.record.clone(),
         view: o.view,
+        vr: o.vr,
         stop_at_ms: o.shot.as_ref().map(|_| o.shot_at_ms + o.video.as_ref().map_or(0, |_| o.video_seconds * 1000)),
         record_from_ms: o.shot.as_ref().and(o.video.as_ref()).map(|_| o.shot_at_ms),
         backglass_window: layout.backglass.is_some() || layout.score.is_some() || layout.embedded[0].is_some() || layout.embedded[1].is_some(),
@@ -1259,6 +1537,22 @@ fn play(o: &Options) -> Result<(), String> {
 /// as the settings give them, on unless switched off; in test mode off unless
 /// the settings it reads (`VPI_SETTINGS`) switch it on, as VPX's reference
 /// pictures are drawn with its plugins off.
+/// Steam's own pad standing for a headset's controllers (Steam Input's virtual Xbox pad: Valve's vendor id
+/// 0x28de, or "Steam" or "X-Box 360 pad" in its name): in VR the controllers come through OpenXR, so it's
+/// left alone, as the VPX fork leaves it, or every press would come twice.
+fn steam_virtual_pad(id: SDL_JoystickID) -> bool {
+    // SAFETY: SDL's own description of a joystick it reported
+    unsafe {
+        let name = SDL_GetJoystickNameForID(id);
+        let name = if name.is_null() { String::new() } else { std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned() };
+        let steam = SDL_GetJoystickVendorForID(id) == 0x28de || name.contains("Steam") || name.contains("X-Box 360 pad");
+        if steam {
+            println!("VR: {name} (vendor {:04x}, product {:04x}) left alone: the controllers come through OpenXR", SDL_GetJoystickVendorForID(id), SDL_GetJoystickProductForID(id));
+        }
+        steam
+    }
+}
+
 /// Tells the game thread the table's window lost the keyboard (play pauses) or has it again (play
 /// goes on), and says so in the log with the window that took it, as VPX's log says it.
 fn tell_focus(game: &mpsc::Sender<input::InputEvent>, lost: bool) {
@@ -1325,7 +1619,9 @@ fn run_window(o: &Options, layout: &Layout, scene: &mut Scene, setup: GameSetup,
     })
     .unwrap_or_default();
     let mut flags = SDL_WINDOW_HIGH_PIXEL_DENSITY;
-    if o.shot.is_some() {
+    // VR: a window never shown, for SDL's events, never drawn into (a desktop window presented beside
+    // the headset held its frames back on the Steam Frame, as the VPX fork found)
+    if o.shot.is_some() || o.vr {
         flags |= SDL_WINDOW_HIDDEN;
     }
     let window = match &layout.playfield {
@@ -1356,6 +1652,7 @@ fn run_window(o: &Options, layout: &Layout, scene: &mut Scene, setup: GameSetup,
     let floating = layout.score.is_none()
         && layout.embedded[1].is_none()
         && o.shot.is_none()
+        && !o.vr
         && o.view != View::Cabinet
         && o.settings.get("VPI", "FloatingScore").and_then(player::settings::vpx_bool).unwrap_or(true);
     let dmd_window = if floating { floating_window(window, &o.settings) } else { extra_window(layout.score, c"Visual Pinball Infinite - score display") };
@@ -1372,9 +1669,41 @@ fn run_window(o: &Options, layout: &Layout, scene: &mut Scene, setup: GameSetup,
         }
     }
     let result = (|| {
-        // SAFETY: the window lives until after the renderer is dropped, below
+        // VR: the headset's runtime, its session and the GPU device it makes, which the renderer
+        // borrows: declared first, so dropped after the renderer
+        let mut vr = if o.vr {
+            let measures = player::vr::TableMeasures::of(&setup.vpx);
+            // passthrough only when asked (`[PlayerVR] Passthrough = 1`, or --vr-passthrough): opaque otherwise, as
+            // the fork draws, which spares SteamVR's compositor blending the cameras' picture under every frame
+            let mut options = o.vr_options.clone();
+            if !o.given.contains("--vr-opaque") && !o.given.contains("--vr-passthrough") {
+                options.passthrough = o.settings.get("PlayerVR", "Passthrough").and_then(player::settings::vpx_bool).unwrap_or(false);
+            }
+            Some(player::vr::Vr::start(&o.settings, options, measures, (scene.bounds_min, scene.bounds_max))?)
+        } else {
+            None
+        };
+        // SAFETY: the window lives until after the renderer is dropped, below; the headset's device
+        // until after it too
         // test mode's pictures go without multisampling unless asked, so they repeat exactly
-        let mut renderer = unsafe { Renderer::new(window, scene, &setup.vpx.images, o.present, o.samples, o.look, hdr_request(&o))? };
+        let mut renderer = match &vr {
+            Some(v) => unsafe { Renderer::for_headset(v.device(), v.format(), scene, &setup.vpx.images, o.look)? },
+            None => unsafe { Renderer::new(window, scene, &setup.vpx.images, o.present, o.samples, o.look, hdr_request(&o))? },
+        };
+        // VR's passthrough: the world shows where the table and its room drew nothing (the alpha written
+        // with an opaque runtime too with VPI_XR_ENVIRONMENT_ALPHA=1, for test runs' pictures)
+        let alpha_test = std::env::var_os("VPI_XR_ENVIRONMENT_ALPHA").is_some_and(|v| v == "1");
+        renderer.set_environment_alpha(vr.as_ref().is_some_and(|v| v.passthrough() || alpha_test))?;
+        // with passthrough, the cabinet alone: the table's room left out, the real one around it (the room kept with
+        // VPI_TEST_PASSTHROUGH_ROOM=1, as passthrough was drawn at first, for test runs)
+        let keep_room = std::env::var_os("VPI_TEST_PASSTHROUGH_ROOM").is_some_and(|v| v == "1");
+        if vr.as_ref().is_some_and(|v| v.passthrough()) && !keep_room {
+            let room_part = player::vr::room_parts(&setup.vpx);
+            let g = &setup.vpx.gamedata;
+            let (parts, flashers) = renderer.show_cabinet_only([g.left, g.top, g.right, g.bottom], |p| room_part.get(p as usize).copied().unwrap_or(false));
+            let names: Vec<String> = parts.iter().filter_map(|&p| setup.vpx.gameitems.get(p as usize)).map(|i| i.name().to_string()).collect();
+            println!("VR: passthrough, the cabinet alone: {} parts and {flashers} flashers of the table's room left out: {}", names.len(), names.join(", "));
+        }
         if let Some(h) = renderer.hdr10() {
             println!(
                 "screen: HDR, VPX 5436's HDR10 output: white {:.0} nits, peak {:.0}; {}, no bloom{}",
@@ -1453,7 +1782,7 @@ fn run_window(o: &Options, layout: &Layout, scene: &mut Scene, setup: GameSetup,
         // the playfield's window brought to the front with the keyboard once the table is ready,
         // as VPX's player does (Window::RaiseAndFocus, fullscreen restored after it): Windows
         // keeps its taskbar behind a fullscreen window only while that window is in front
-        if o.shot.is_none() {
+        if o.shot.is_none() && !o.vr {
             // SAFETY: the window is live, on SDL's thread
             unsafe {
                 // raised the forceful way this once (SDL's thread-input trick): the player was just
@@ -1601,7 +1930,7 @@ fn run_window(o: &Options, layout: &Layout, scene: &mut Scene, setup: GameSetup,
         // the keyboard: play holds while another program's window has it, as VPX's does — but in
         // test mode, and with keys given on the command line, which play without it; a window not
         // given the keyboard as it showed is found out a moment after
-        let follow_focus = o.shot.is_none() && o.keys.is_empty();
+        let follow_focus = o.shot.is_none() && o.keys.is_empty() && !o.vr;
         // SAFETY: the window is live
         let window_id = unsafe { SDL_GetWindowID(window) };
         let mut focus_lost = false;
@@ -1609,6 +1938,8 @@ fn run_window(o: &Options, layout: &Layout, scene: &mut Scene, setup: GameSetup,
         let mut focus_looked = false;
         let started = Instant::now();
         let mut total_frames = 0u64;
+        // the controllers' presses, numbered apart from the keyboard's and the scripted ones
+        let mut vr_key_id = 2_000_000u64;
         'frames: loop {
             // the game asked to end: the script's `QuitPlayer`, or the pause menu's Quit (but in
             // test mode, whose picture is still to be taken)
@@ -1682,7 +2013,7 @@ fn run_window(o: &Options, layout: &Layout, scene: &mut Scene, setup: GameSetup,
                     }
                     // a joystick or gamepad connected (or there at the start): opened, its buttons
                     // mapped; unplugged: whatever it held let go
-                    if kind == SDL_EVENT_JOYSTICK_ADDED.0 {
+                    if kind == SDL_EVENT_JOYSTICK_ADDED.0 && !(o.vr && steam_virtual_pad(event.jdevice.which)) {
                         sink.joystick_added(event.jdevice.which);
                         player::pause_menu::set_controls(player::pause_menu::control_lines(&table_extras, &|a| sink.names(a), esc_opens_menu));
                     } else if kind == SDL_EVENT_JOYSTICK_REMOVED.0 {
@@ -1711,11 +2042,39 @@ fn run_window(o: &Options, layout: &Layout, scene: &mut Scene, setup: GameSetup,
             // the frame-rate limit: no sooner than its period after the last frame began,
             // unless a key arrives meanwhile, which wakes the wait and gets its frame at once
             if o.shot.is_none()
+                && vr.is_none()
                 && let (Some(period), Some(last)) = (frame_period, last_frame_began)
                 && let Some(left) = (last + period).checked_duration_since(Instant::now())
             {
                 frame_waker.wait(Some(left));
             }
+            // VR: the headset's events heard, then its next frame waited for (it sets the pace);
+            // while it isn't showing yet, a short wait
+            let vr_frame = match vr.as_mut() {
+                Some(v) => {
+                    if !v.poll() {
+                        break 'frames;
+                    }
+                    match v.begin_frame()? {
+                        Some(f) => {
+                            // the controllers, pressed as the keyboard's keys are
+                            v.read_controls(&f, |dik, down| {
+                                vr_key_id += 1;
+                                // SAFETY: SDL's clock
+                                let time_ns = unsafe { SDL_GetTicksNS() };
+                                let _ = scripted.send(input::InputEvent { id: vr_key_id, time_ns, dik, down });
+                                shared.waker.wake();
+                            });
+                            Some(f)
+                        }
+                        None => {
+                            std::thread::sleep(Duration::from_millis(10));
+                            continue 'frames;
+                        }
+                    }
+                }
+                None => None,
+            };
             let frame_began = Instant::now();
 
             // paced: sleep until just before the coming refresh, then take the newest state
@@ -1836,27 +2195,34 @@ fn run_window(o: &Options, layout: &Layout, scene: &mut Scene, setup: GameSetup,
                 let width = notice.chars().count() as f32 * 8.0 * scale;
                 text.push(Text { x: ((ui.0 as f32 - width) / 2.0).max(0.0), y: ui.1 as f32 * 0.8, scale, color: [1.0, 1.0, 1.0, 1.0], text: notice });
             }
-            // the pause menu's picture, made again when what it shows or the window's size changes
+            // the pause menu's picture, made again when what it shows or the window's size changes; in the
+            // headset, laid out for a screen of its own, sharp on its panel in the room
+            let menu_ui = if vr.is_some() { VR_MENU_SCREEN } else { ui };
             let menu_same = match (&menu_shown, &s.menu) {
-                (Some((was, size)), Some(now)) => **now == *was && *size == ui,
+                (Some((was, size)), Some(now)) => **now == *was && *size == menu_ui,
                 (None, None) => true,
                 _ => false,
             };
             let mut menu_made = None;
             if !menu_same {
                 match (&menu_maker, s.menu.as_deref()) {
-                    (Some(maker), Some(v)) => maker.make(v.clone(), ui),
+                    (Some(maker), Some(v)) => maker.make(v.clone(), menu_ui),
                     (Some(maker), None) => {
                         maker.cancel();
                         menu_made = Some(None);
                     }
-                    (None, v) => menu_made = Some(v.and_then(|v| player::pause_menu::picture(v, ui))),
+                    (None, v) => menu_made = Some(v.and_then(|v| player::pause_menu::picture(v, menu_ui))),
                 }
-                menu_shown = s.menu.as_deref().map(|v| (v.clone(), ui));
+                menu_shown = s.menu.as_deref().map(|v| (v.clone(), menu_ui));
             }
             // a picture made since: shown from this frame, the mouse finding its rows
             if let Some(made) = menu_made.or_else(|| menu_maker.as_ref().and_then(player::pause_menu::Maker::take)) {
-                if let Err(e) = renderer.set_menu(made.as_ref().map(|(p, _)| p)) {
+                let set = match vr.as_mut() {
+                    // in the headset, a panel in the room of its own, pointed at with the controllers
+                    Some(v) => v.set_menu(made.as_ref(), menu_ui),
+                    None => renderer.set_menu(made.as_ref().map(|(p, _)| p)),
+                };
+                if let Err(e) = set {
                     eprintln!("vpi-player: the pause menu: {e}");
                 }
                 menu_layout = made.map(|(_, layout)| layout);
@@ -1916,6 +2282,32 @@ fn run_window(o: &Options, layout: &Layout, scene: &mut Scene, setup: GameSetup,
                 backglass: s.backglass.as_ref(),
                 pup: s.pup.as_ref(),
             };
+            // VR: each eye's view of the table, drawn into the headset's images and handed over, in
+            // place of the window's frame
+            if let (Some(v), Some(frame)) = (vr.as_mut(), vr_frame) {
+                let eye_input = |e: &player::vr::EyeView| FrameInput {
+                    view_proj: e.view * e.projection,
+                    view_rotation: 0.0,
+                    unshaken: e.view * e.projection,
+                    view: e.view,
+                    projection: e.projection,
+                    shake: Mat4::IDENTITY,
+                    eye: e.eye,
+                    screen_offset: [0.0; 2],
+                    text: &[],
+                    ..input
+                };
+                let inputs = v.eyes(&frame).map(|[l, r]| [eye_input(&l), eye_input(&r)]);
+                v.end_frame(frame, &mut renderer, inputs.as_ref().map(|[l, r]| [l, r]))?;
+                frames += 1;
+                total_frames += 1;
+                let elapsed = fps_start.elapsed().as_secs_f64();
+                if elapsed >= 0.5 {
+                    fps = f64::from(frames) / elapsed;
+                    (frames, fps_start) = (0, Instant::now());
+                }
+                continue 'frames;
+            }
             if let Some(path) = &o.shot {
                 // the frame before the picture, drawn off screen, as VPX draws frames before its own
                 // pictures: a moving ball's motion blur and its mirror of the frame before come from it

@@ -36,8 +36,36 @@
 //! `--altsound` plays the game's AltSound pack, in `<folder>\altsound\<rom>`,
 //! in place of its own sound.
 
+#[cfg(windows)]
 mod altsound;
+#[cfg(windows)]
 mod crash;
+
+/// Elsewhere (Linux): AltSound doesn't play yet (its bridge loads the Windows library), and a crash
+/// is reported as the system reports it.
+#[cfg(not(windows))]
+mod altsound {
+    use std::path::Path;
+
+    pub type AudioCallback = unsafe extern "C" fn(*const f32, usize, u32, u32, *mut std::ffi::c_void);
+
+    pub struct AltSound;
+
+    impl AltSound {
+        pub fn start(_library: &Path, _base: &Path, game: &str, _hardware_gen: u64, _rate: u32, _log_dir: &Path, _on_audio: AudioCallback) -> Result<AltSound, String> {
+            Err(format!("AltSound plays on Windows only so far ({game}'s own sound plays)"))
+        }
+
+        pub fn command(&self, _board: u32, _cmd: u32) {}
+    }
+}
+
+#[cfg(not(windows))]
+mod crash {
+    pub fn install() {}
+
+    pub fn note_switch(_number: i32, _closed: bool) {}
+}
 mod libpinmame;
 
 use std::ffi::{CString, c_char, c_void};
@@ -128,13 +156,19 @@ fn options() -> Result<Options, String> {
 /// alone.
 const DEVELOPMENT: bool = option_env!("VPI_RELEASE_BUILD").is_none();
 
+/// libpinmame's file: Windows' DLL, else the shared library PinMAME's CMake build makes.
+#[cfg(windows)]
+const LIBRARY: &str = "pinmame64.dll";
+#[cfg(not(windows))]
+const LIBRARY: &str = "libpinmame.so";
+
 /// Where libpinmame is: beside this program (how it ships), else, in the
 /// repository, our build or the copy from VPX's library bundle (development
 /// builds).
 fn find_library() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    let beside = dir.join("pinmame64.dll");
+    let beside = dir.join(LIBRARY);
     if beside.exists() {
         return Some(beside);
     }
@@ -142,8 +176,14 @@ fn find_library() -> Option<PathBuf> {
         return None;
     }
     // our build of VPX 5436's PinMAME, which also gives the DMDs' identify frames
-    let ours = dir.ancestors().take(4).map(|up| up.join(r"vpx-build\pinmame-5436\build\Release\pinmame64.dll")).find(|p| p.exists());
-    ours.or_else(|| dir.ancestors().take(4).map(|up| up.join(r"vpx-build\downloads\5436-third-party-windows-x64-Release\runtime-libs\windows-x64\pinmame64.dll")).find(|p| p.exists()))
+    #[cfg(windows)]
+    {
+        let ours = dir.ancestors().take(4).map(|up| up.join(r"vpx-build\pinmame-5436\build\Release\pinmame64.dll")).find(|p| p.exists());
+        ours.or_else(|| dir.ancestors().take(4).map(|up| up.join(r"vpx-build\downloads\5436-third-party-windows-x64-Release\runtime-libs\windows-x64\pinmame64.dll")).find(|p| p.exists()))
+    }
+    // Linux: tools/pinmame/setup.sh's
+    #[cfg(not(windows))]
+    dir.ancestors().take(4).map(|up| up.join("vpx-build/linux-aarch64/pinmame-5436/build").join(LIBRARY)).find(|p| p.exists())
 }
 
 /// The link, for PinMAME's callbacks. Never dropped: PinMAME's thread may
@@ -346,14 +386,26 @@ unsafe extern "system" fn on_mech_updated(_mech: i32, _info: *mut c_void, _user:
 /// An event PinMAME's thread sets when it reports a solenoid change through
 /// its callback, so the loop below hands the change on at once rather than
 /// at its next look (modulated coils aren't reported this way).
+#[cfg(windows)]
 static SOLENOID_CHANGED: OnceLock<usize> = OnceLock::new();
 
 unsafe extern "system" fn on_solenoid_updated(_state: *mut NumberState, _user: *mut c_void) {
+    #[cfg(windows)]
     if let Some(&event) = SOLENOID_CHANGED.get() {
         // SAFETY: an event handle that lives as long as the program
         unsafe { SetEvent(event as *mut c_void) };
     }
+    // elsewhere: the link's own wake-up, marked as a solenoid's
+    #[cfg(not(windows))]
+    if let Some(link) = LINK.get() {
+        SOLENOID_WOKE.store(true, Ordering::Release);
+        link.wake_host();
+    }
 }
+
+/// Linux: a solenoid change woke the loop (it shares the link's wake-up).
+#[cfg(not(windows))]
+static SOLENOID_WOKE: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "system" fn on_console_data_updated(_data: *mut c_void, _size: i32, _user: *mut c_void) {}
 
@@ -371,9 +423,17 @@ unsafe extern "system" fn on_sound_command(board: i32, command: i32, _user: *mut
     }
 }
 
+#[cfg(windows)]
 unsafe extern "C" {
     /// The C runtime's formatter behind every `printf` (UCRT).
     fn __stdio_common_vsprintf(options: u64, buffer: *mut c_char, count: usize, format: *const c_char, locale: *mut c_void, args: *mut c_void) -> i32;
+}
+
+#[cfg(not(windows))]
+unsafe extern "C" {
+    /// glibc's: the `va_list` as the callback got it (arm64's, a struct passed by reference; x86-64's,
+    /// an array passed as its pointer).
+    fn vsnprintf(buffer: *mut c_char, count: usize, format: *const c_char, args: *mut c_void) -> i32;
 }
 
 unsafe extern "system" fn on_log_message(level: i32, format: *const c_char, args: *mut c_void, _user: *mut c_void) {
@@ -384,7 +444,10 @@ unsafe extern "system" fn on_log_message(level: i32, format: *const c_char, args
     // SAFETY: PinMAME hands a printf format and its arguments; the buffer
     // is null-terminated whatever the result
     let text = unsafe {
+        #[cfg(windows)]
         __stdio_common_vsprintf(2, buffer.as_mut_ptr(), buffer.len(), format, std::ptr::null_mut(), args);
+        #[cfg(not(windows))]
+        vsnprintf(buffer.as_mut_ptr(), buffer.len(), format, args);
         std::ffi::CStr::from_ptr(buffer.as_ptr()).to_string_lossy().into_owned()
     };
     let tag = if level >= libpinmame::LOG_LEVEL_ERROR { "error" } else { "info" };
@@ -401,6 +464,7 @@ fn time_it(timing: &mut Option<std::io::BufWriter<std::fs::File>>, kind: char, n
 // Windows waiting: a high-resolution timer for the millisecond beat, an
 // event for solenoid changes, and the player's process, so the host ends if
 // the player does.
+#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn CreateEventW(attributes: *const c_void, manual_reset: i32, initial_state: i32, name: *const u16) -> *mut c_void;
@@ -410,11 +474,112 @@ unsafe extern "system" {
     fn WaitForMultipleObjects(count: u32, handles: *const *mut c_void, wait_all: i32, milliseconds: u32) -> u32;
     fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
 }
+#[cfg(windows)]
 const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION: u32 = 0x2;
+#[cfg(windows)]
 const TIMER_ALL_ACCESS: u32 = 0x001F_0003;
+#[cfg(windows)]
 const SYNCHRONIZE: u32 = 0x0010_0000;
+#[cfg(windows)]
 const WAIT_OBJECT_0: u32 = 0;
+#[cfg(windows)]
 const INFINITE: u32 = 0xFFFF_FFFF;
+
+/// What woke the game's loop.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Woke {
+    /// The millisecond's beat.
+    Beat,
+    /// The player's command, or its time fence moved.
+    Engine,
+    /// PinMAME reported a solenoid change.
+    Solenoid,
+    /// The player is gone.
+    PlayerGone,
+}
+
+/// The loop's waiting (Windows): the beat's high-resolution timer, the link's event, the solenoid
+/// event and the player's process, together.
+#[cfg(windows)]
+struct Waiter {
+    handles: Vec<*mut c_void>,
+    timer: *mut c_void,
+    solenoid: bool,
+    parent: bool,
+}
+
+#[cfg(windows)]
+impl Waiter {
+    fn new(link: &Link, solenoid_event: *mut c_void, parent: Option<u32>) -> Waiter {
+        // SAFETY: Windows objects this loop waits on; a null parent means none
+        let timer = unsafe {
+            let t = CreateWaitableTimerExW(std::ptr::null(), std::ptr::null(), CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+            if t.is_null() { CreateWaitableTimerExW(std::ptr::null(), std::ptr::null(), 0, TIMER_ALL_ACCESS) } else { t }
+        };
+        let parent = parent.map(|pid| unsafe { OpenProcess(SYNCHRONIZE, 0, pid) }).filter(|h| !h.is_null());
+        let mut handles = vec![link.to_host_event(), timer];
+        let solenoid = !solenoid_event.is_null();
+        if solenoid {
+            handles.push(solenoid_event);
+        }
+        if let Some(p) = parent {
+            handles.push(p);
+        }
+        Waiter { handles, timer, solenoid, parent: parent.is_some() }
+    }
+
+    fn wait(&mut self, _link: &Link) -> Woke {
+        // SAFETY: re-arms the 1 ms beat, then waits for it, the player's command, a solenoid
+        // change, or the player's end
+        let woke = unsafe {
+            let due: i64 = -10_000; // 1 ms, in 100 ns steps, relative
+            SetWaitableTimer(self.timer, &due, 0, std::ptr::null(), std::ptr::null(), 0);
+            WaitForMultipleObjects(self.handles.len() as u32, self.handles.as_ptr(), 0, INFINITE)
+        };
+        match woke.wrapping_sub(WAIT_OBJECT_0) {
+            0 => Woke::Engine,
+            2 if self.solenoid => Woke::Solenoid,
+            n if self.parent && n as usize == self.handles.len() - 1 => Woke::PlayerGone,
+            _ => Woke::Beat,
+        }
+    }
+}
+
+/// The loop's waiting (Linux): the link's wake-up for a millisecond at most (a solenoid change posts
+/// it too), the player's process looked for every 100 waits.
+#[cfg(not(windows))]
+struct Waiter {
+    parent: Option<u32>,
+    waits: u32,
+}
+
+#[cfg(not(windows))]
+unsafe extern "C" {
+    fn kill(pid: i32, signal: i32) -> i32;
+}
+
+#[cfg(not(windows))]
+impl Waiter {
+    fn new(_link: &Link, _solenoid_event: *mut c_void, parent: Option<u32>) -> Waiter {
+        Waiter { parent, waits: 0 }
+    }
+
+    fn wait(&mut self, link: &Link) -> Woke {
+        self.waits = self.waits.wrapping_add(1);
+        if self.waits % 100 == 0
+            && let Some(pid) = self.parent
+            // SAFETY: signal 0 only asks whether the process is there
+            && unsafe { kill(pid as i32, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(3)
+        {
+            return Woke::PlayerGone;
+        }
+        if !link.wait_for_engine(1) {
+            return Woke::Beat;
+        }
+        if SOLENOID_WOKE.swap(false, Ordering::AcqRel) { Woke::Solenoid } else { Woke::Engine }
+    }
+}
 
 /// `vpi-pinmame --rom-files <set> [--library <pinmame64.dll>]`: the set's ROM files as PinMAME
 /// expects them — each file's name, size and CRC, and whether it's optional, never dumped, a bad
@@ -797,10 +962,15 @@ fn run(options: &Options, link: &Link, lib: &Library) -> Result<(), (String, i32
     }
 
     // SAFETY: an auto-reset event, initially unset, kept for the program's life
+    #[cfg(windows)]
     let solenoid_event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+    #[cfg(windows)]
     if !solenoid_event.is_null() {
         let _ = SOLENOID_CHANGED.set(solenoid_event as usize);
     }
+    // (elsewhere the link's own wake-up serves)
+    #[cfg(not(windows))]
+    let solenoid_event: *mut c_void = std::ptr::null_mut();
 
     let game = CString::new(options.game.as_str()).map_err(|_| ("the game's name has a null in it".to_string(), -1))?;
     // SAFETY: a null-terminated name; PinMAME starts its own thread
@@ -841,20 +1011,7 @@ fn run(options: &Options, link: &Link, lib: &Library) -> Result<(), (String, i32
         start_altsound(options, base, hardware, shared);
     }
 
-    // SAFETY: Windows objects this loop waits on; a null parent means none
-    let timer = unsafe {
-        let t = CreateWaitableTimerExW(std::ptr::null(), std::ptr::null(), CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-        if t.is_null() { CreateWaitableTimerExW(std::ptr::null(), std::ptr::null(), 0, TIMER_ALL_ACCESS) } else { t }
-    };
-    let parent = options.parent.map(|pid| unsafe { OpenProcess(SYNCHRONIZE, 0, pid) }).filter(|h| !h.is_null());
-    let mut handles = vec![link.to_host_event(), timer];
-    if !solenoid_event.is_null() {
-        handles.push(solenoid_event);
-    }
-    let parent_woke = parent.map(|p| {
-        handles.push(p);
-        WAIT_OBJECT_0 + handles.len() as u32 - 1
-    });
+    let mut waiter = Waiter::new(link, solenoid_event, options.parent);
     let mut changed = vec![NumberState::default(); (lamps.max(solenoids).max(gis).max(0) as usize) + 64];
     // sized as VPX's controller sizes it: PinMAME reports fewer digits than that
     // SAFETY: libpinmame's query on a running game
@@ -876,19 +1033,13 @@ fn run(options: &Options, link: &Link, lib: &Library) -> Result<(), (String, i32
         std::fs::File::create(path).ok().map(|f| std::io::BufWriter::with_capacity(1 << 22, f))
     });
     while !stop {
-        // SAFETY: re-arms the 1 ms beat, then waits for it, the player's
-        // command, a solenoid change, or the player's end
-        let woke = unsafe {
-            let due: i64 = -10_000; // 1 ms, in 100 ns steps, relative
-            SetWaitableTimer(timer, &due, 0, std::ptr::null(), std::ptr::null(), 0);
-            WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, INFINITE)
-        };
-        if Some(woke) == parent_woke {
+        let woke = waiter.wait(link);
+        if woke == Woke::PlayerGone {
             eprintln!("vpi-pinmame: the player is gone; stopping");
             break;
         }
         wakes += 1;
-        solenoid_wakes += u64::from(!solenoid_event.is_null() && woke == WAIT_OBJECT_0 + 2);
+        solenoid_wakes += u64::from(woke == Woke::Solenoid);
         // the game's NVRAM when the engine asks for it (VPX's PinMAME plugin's `GetNVRAM`: each
         // byte's current value, none while the game can't give it)
         if let Some(request) = shared.nvram_requested() {

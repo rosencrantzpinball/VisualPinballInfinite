@@ -13,6 +13,13 @@ cbuffer PostVertex : register(b0, space1)
 Texture2D<float4> smaa_first : register(t0, space2);
 Texture2D<float4> smaa_second : register(t1, space2);
 Texture2D<float4> smaa_third : register(t2, space2);
+#ifdef __spirv__
+// each picture's own sampler on Vulkan (post_common.hlsl): the common samplers sit at the first two slots
+SamplerState post_third_sampler : register(s2, space2);
+#define smaa_first_sampler post_linear_sampler
+#define smaa_second_sampler post_point_sampler
+#define smaa_third_sampler post_third_sampler
+#endif
 
 struct SmaaEdgeVaryings
 {
@@ -66,7 +73,7 @@ float4 smaa_edge_fs(SmaaEdgeVaryings v) : SV_Target
 {
     smaa_metrics = w_h_height;
     float4 offset[3] = { v.offset0, v.offset1, v.offset2 };
-    float2 rg = SMAAColorEdgeDetectionPS(v.uv, offset, smaa_first);
+    float2 rg = SMAAColorEdgeDetectionPS(v.uv, offset, SMAATexturePass2D(smaa_first));
     return float4(rg.r, rg.g, 0.0, 0.0);
 }
 
@@ -90,7 +97,7 @@ float4 smaa_weight_fs(SmaaWeightVaryings v) : SV_Target
 {
     smaa_metrics = w_h_height;
     float4 offset[3] = { v.offset0, v.offset1, v.offset2 };
-    return SMAABlendingWeightCalculationPS(v.uv, v.pixcoord, offset, smaa_first, smaa_second, smaa_third, float4(0.0, 0.0, 0.0, 0.0));
+    return SMAABlendingWeightCalculationPS(v.uv, v.pixcoord, offset, SMAATexturePass2D(smaa_first), SMAATexturePass2D(smaa_second), SMAATexturePass2D(smaa_third), float4(0.0, 0.0, 0.0, 0.0));
 }
 
 SmaaBlendVaryings smaa_blend_vs(uint id : SV_VertexID)
@@ -106,5 +113,5 @@ SmaaBlendVaryings smaa_blend_vs(uint id : SV_VertexID)
 float4 smaa_blend_fs(SmaaBlendVaryings v) : SV_Target
 {
     smaa_metrics = w_h_height;
-    return post_out(SMAANeighborhoodBlendingPS(v.uv, v.offset, smaa_first, smaa_second).rgb);
+    return post_result(SMAANeighborhoodBlendingPS(v.uv, v.offset, SMAATexturePass2D(smaa_first), SMAATexturePass2D(smaa_second)).rgb, 1.0);
 }

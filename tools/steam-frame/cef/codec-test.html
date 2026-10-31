@@ -1,0 +1,92 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>CEF codec test</title>
+<body>
+<script>
+// What this CEF decodes where it runs, and with what (frame-codecs.sh): each codec's support as Chromium reports it,
+// in hardware (WebCodecs' prefer-hardware: only a platform decoder, V4L2's here, says yes) and in software (FFmpeg,
+// libvpx, dav1d), then a few seconds of each clip beside this page, played muted. Each result is a console line
+// starting VPI-CODEC, which Chromium prints to its log (--enable-logging=stderr).
+const log = (...parts) => console.log(['VPI-CODEC', ...parts].join(' '));
+
+const videoCodecs = [
+  ['h264', 'video/mp4', 'avc1.640028'],
+  ['hevc', 'video/mp4', 'hvc1.1.6.L120.90'],
+  ['hevc-main10', 'video/mp4', 'hvc1.2.4.L120.90'],
+  ['vp9', 'video/webm', 'vp09.00.40.08'],
+  ['av1', 'video/mp4', 'av01.0.08M.08'],
+];
+const clips = [['h264+aac', 'h264.mp4'], ['hevc', 'hevc.mp4'], ['aac', 'aac.m4a']];
+
+// the GPU Chromium draws with (SwiftShader when it fell back to software, which leaves video to software too)
+function gpu() {
+  const gl = document.createElement('canvas').getContext('webgl');
+  if (!gl) return 'none (no WebGL)';
+  const info = gl.getExtension('WEBGL_debug_renderer_info');
+  return gl.getParameter(info ? info.UNMASKED_RENDERER_WEBGL : gl.RENDERER);
+}
+
+async function webCodecs(Decoder, config) {
+  const result = {};
+  for (const hardwareAcceleration of ['prefer-hardware', 'prefer-software']) {
+    try {
+      result[hardwareAcceleration] = (await Decoder.isConfigSupported({...config, hardwareAcceleration})).supported;
+    } catch (e) {
+      result[hardwareAcceleration] = e.name;
+    }
+  }
+  return `hardware=${result['prefer-hardware']} software=${result['prefer-software']}`;
+}
+
+async function videoSupport(name, container, codec) {
+  const type = `${container}; codecs="${codec}"`;
+  const info = await navigator.mediaCapabilities.decodingInfo({
+    type: 'file',
+    video: {contentType: type, width: 1920, height: 1080, bitrate: 8000000, framerate: 30},
+  });
+  log('support', name, `canPlayType=${document.createElement('video').canPlayType(type) || 'no'}`,
+      `mse=${MediaSource.isTypeSupported(type)}`, `supported=${info.supported}`, `smooth=${info.smooth}`,
+      `powerEfficient=${info.powerEfficient}`,
+      await webCodecs(VideoDecoder, {codec, codedWidth: 1920, codedHeight: 1080}));
+}
+
+async function audioSupport() {
+  const type = 'audio/mp4; codecs="mp4a.40.2"';
+  log('support', 'aac', `canPlayType=${document.createElement('audio').canPlayType(type) || 'no'}`,
+      `mse=${MediaSource.isTypeSupported(type)}`,
+      await webCodecs(AudioDecoder, {codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 2}));
+}
+
+async function play(name, file) {
+  const media = document.createElement(file.endsWith('.m4a') ? 'audio' : 'video');
+  media.muted = true;
+  media.src = file;
+  document.body.append(media);
+  const error = () => media.error ? `${media.error.code} ${media.error.message}` : 'none';
+  try {
+    await media.play();
+  } catch (e) {
+    log('play', name, `failed=${e.name}`, `error=${error()}`);
+    media.remove();
+    return;
+  }
+  await new Promise(resolve => setTimeout(resolve, 4000));
+  const quality = media.getVideoPlaybackQuality?.();
+  log('play', name, `time=${media.currentTime.toFixed(2)}`,
+      ...(quality ? [`frames=${quality.totalVideoFrames}`, `dropped=${quality.droppedVideoFrames}`,
+                     `size=${media.videoWidth}x${media.videoHeight}`] : []),
+      `error=${error()}`);
+  media.pause();
+  media.remove();
+}
+
+(async () => {
+  log('start', navigator.userAgent);
+  log('gpu', gpu());
+  for (const codec of videoCodecs) await videoSupport(...codec);
+  await audioSupport();
+  for (const clip of clips) await play(...clip);
+  log('done');
+  window.close();
+})().catch(e => log('error', e.stack || e));
+</script>

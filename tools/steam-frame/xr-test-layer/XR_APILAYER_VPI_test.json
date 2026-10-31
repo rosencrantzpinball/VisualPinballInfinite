@@ -1,0 +1,10 @@
+{
+    "file_format_version": "1.0.0",
+    "api_layer": {
+        "name": "XR_APILAYER_VPI_test",
+        "library_path": "./libxr_test_layer.so",
+        "api_version": "1.0",
+        "implementation_version": "1",
+        "description": "Test runs on the Steam Frame: draws with the headset unworn, the eyes pinned, each frame timed"
+    }
+}

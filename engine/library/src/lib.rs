@@ -21,6 +21,11 @@ pub mod popper;
 pub mod processes;
 pub mod pup_pack;
 pub mod remove;
+#[cfg(windows)]
+pub mod rar;
+/// RAR archives where Windows' libarchive isn't: not read.
+#[cfg(not(windows))]
+#[path = "rar_none.rs"]
 pub mod rar;
 pub mod ratings;
 pub mod rename;

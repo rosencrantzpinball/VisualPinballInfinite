@@ -1,0 +1,88 @@
+From eb6d2b75039f6a3ff810eab335635eae6d663b9d Mon Sep 17 00:00:00 2001
+From: VPinInfinite <340424849+VPinInfinite@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 06:18:49 -0500
+Subject: [PATCH] Visual Pinball Infinite: the file fence takes POSIX paths
+ elsewhere
+
+The fence made every path a drive path (C:\...), from a base folder that was one too; on Linux a script's paths are /home/..., and its base folder too, so every file the file object reached was refused before the host was asked: no script could read or write a file there.
+
+Elsewhere than Windows a path is now absolute, or taken from the base folder, itself absolute, and made \-separated from the root with its . and .. parts resolved, as on Windows; the shims turn it back to /. GetFullPathNameW hands it back with /, as the system writes it. Windows is unchanged.
+---
+ src/wine.c | 39 ++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 36 insertions(+), 3 deletions(-)
+
+diff --git a/src/wine.c b/src/wine.c
+index 082ab49..f675412 100644
+--- a/src/wine.c
++++ b/src/wine.c
+@@ -1206,6 +1206,7 @@ static BOOL fence_normalize(const WCHAR *path, WCHAR *out, size_t size)
+       return FALSE;
+    if (fence_is_sep(path[0]) && fence_is_sep(path[1]))
+       return FALSE;
++#ifdef _WIN32
+    if (fence_is_letter(path[0]) && path[1] == ':') {
+       if (!fence_is_sep(path[2]))
+          return FALSE;
+@@ -1219,9 +1220,24 @@ static BOOL fence_normalize(const WCHAR *path, WCHAR *out, size_t size)
+       if (!fence_is_sep(path[0]) && j < ARRAY_SIZE(joined) - 1)
+          joined[j++] = '\\';
+    }
++#else
++   /* Visual Pinball Infinite: elsewhere (Linux) a path is a POSIX one: absolute, or taken from the base
++      folder, itself absolute; a drive means nothing there */
++   if (fence_is_letter(path[0]) && path[1] == ':')
++      return FALSE;
++   if (!fence_is_sep(path[0])) {
++      if (!fence_is_sep(g_fence_base[0]))
++         return FALSE;
++      for (size_t i = 0; g_fence_base[i] && j < ARRAY_SIZE(joined) - 1; i++)
++         joined[j++] = g_fence_base[i];
++      if (j < ARRAY_SIZE(joined) - 1)
++         joined[j++] = '\\';
++   }
++#endif
+    for (const WCHAR *p = path; *p && j < ARRAY_SIZE(joined) - 1; p++)
+       joined[j++] = *p;
+    joined[j] = 0;
++#ifdef _WIN32
+    if (wcschr(joined + 2, ':'))
+       return FALSE;
+ 
+@@ -1231,6 +1247,16 @@ static BOOL fence_normalize(const WCHAR *path, WCHAR *out, size_t size)
+    out[n++] = ':';
+    const size_t root = n;
+    const WCHAR *p = joined + 2;
++#else
++   /* (a stream's colon, as on Windows) */
++   if (wcschr(joined, ':'))
++      return FALSE;
++   /* each part from the root, '\\'-separated as on Windows (the shims turn it to '/'); ".." never climbs
++      above the root */
++   size_t n = 0;
++   const size_t root = 0;
++   const WCHAR *p = joined;
++#endif
+    while (*p) {
+       while (fence_is_sep(*p))
+          p++;
+@@ -1664,10 +1690,17 @@ DWORD WINAPI GetFullPathNameW(LPCWSTR lpFileName, DWORD nBufferLength, LPWSTR lp
+       if (!lpBuffer || nBufferLength <= len)
+          return len + 1;
+       wcscpy(lpBuffer, full);
+-      if (lpFilePart) {
+-         WCHAR *last = wcsrchr(lpBuffer, L'\\');
++#ifndef _WIN32
++      /* Visual Pinball Infinite: elsewhere (Linux), the path as the system writes it */
++      for (WCHAR *c = lpBuffer; *c; c++)
++         if (*c == '\\')
++            *c = '/';
++      WCHAR *last = wcsrchr(lpBuffer, L'/');
++#else
++      WCHAR *last = wcsrchr(lpBuffer, L'\\');
++#endif
++      if (lpFilePart)
+          *lpFilePart = (last && last[1]) ? last + 1 : NULL;
+-      }
+       return len;
+    }
+    if (wcscmp(lpFileName, L".") == 0) {

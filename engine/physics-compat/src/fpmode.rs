@@ -3,7 +3,9 @@
 //! VPX's player switches on flush-to-zero and denormals-are-zero (MXCSR bits
 //! `0x8040`) on the thread that runs physics (`Player::Player`): numbers too
 //! small for a float's normal range act as zero. The port must run in the same
-//! mode, or rare tiny values play out differently.
+//! mode, or rare tiny values play out differently. On ARM (the Steam Frame)
+//! the same mode is FPCR's flush-to-zero bit, which treats tiny inputs and
+//! results alike, as the two x86 bits together do.
 
 /// MXCSR flush-to-zero (`0x8000`) and denormals-are-zero (`0x0040`).
 pub const FTZ_DAZ: u32 = 0x8040;
@@ -47,7 +49,51 @@ fn write_mxcsr(v: u32) {
     unsafe { std::arch::asm!("ldmxcsr [{}]", in(reg) &v, options(nostack, preserves_flags)) };
 }
 
-#[cfg(all(test, target_arch = "x86_64"))]
+/// FPCR's flush-to-zero bit (FZ): tiny inputs and results of single and double
+/// precision act as zero, as MXCSR's two bits together make them on x86.
+#[cfg(target_arch = "aarch64")]
+const FPCR_FZ: u64 = 1 << 24;
+
+/// Switches flush-to-zero on for the current thread while it lives, and
+/// restores the previous mode when dropped.
+#[cfg(target_arch = "aarch64")]
+#[must_use = "the mode is restored when this is dropped"]
+pub struct VpxFloatMode {
+    old: u64,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl VpxFloatMode {
+    pub fn enter() -> Self {
+        let old = read_fpcr();
+        write_fpcr(old | FPCR_FZ);
+        Self { old }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Drop for VpxFloatMode {
+    fn drop(&mut self) {
+        write_fpcr(self.old);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn read_fpcr() -> u64 {
+    let v: u64;
+    // SAFETY: reads the current thread's floating-point control register.
+    unsafe { std::arch::asm!("mrs {}, fpcr", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    v
+}
+
+#[cfg(target_arch = "aarch64")]
+fn write_fpcr(v: u64) {
+    // SAFETY: writes the current thread's floating-point control register; only the
+    // flush-to-zero bit this module manages differs from its previous value.
+    unsafe { std::arch::asm!("msr fpcr, {}", in(reg) v, options(nomem, nostack, preserves_flags)) };
+}
+
+#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod tests {
     use super::*;
 

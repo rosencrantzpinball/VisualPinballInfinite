@@ -138,7 +138,7 @@ impl AssetManager {
         if a.is_empty() {
             return b.to_string();
         }
-        if a.ends_with('\\') || a.ends_with('/') { format!("{a}{b}") } else { format!("{a}\\{b}") }
+        if a.ends_with('\\') || a.ends_with('/') { format!("{a}{b}") } else { format!("{a}{}{b}", std::path::MAIN_SEPARATOR) }
     }
 
     /// A path FlexDMD would open, made absolute from the table's folder, as
@@ -147,7 +147,10 @@ impl AssetManager {
     /// — and that isn't there is looked for beside the table: so
     /// `GetAbsolutePathName(".") & "\x.UltraDMD"` finds the table's pictures.
     pub fn file_path(&self, path: &str) -> PathBuf {
+        #[cfg(windows)]
         let p = PathBuf::from(path.replace('/', "\\"));
+        #[cfg(not(windows))]
+        let p = PathBuf::from(path.replace('\\', "/"));
         let p = if p.is_absolute() { p } else { self.table_dir.clone().unwrap_or_default().join(p) };
         // `..` and `.` taken out, as Windows does when it opens the file
         let mut out = PathBuf::new();
@@ -160,6 +163,8 @@ impl AssetManager {
                 c => out.push(c),
             }
         }
+        // the file's own name where its case differs (Linux)
+        let out = crate::script::files::native(&out.to_string_lossy());
         if !out.exists()
             && let (Some(data), Some(table)) = (crate::script::api::user_directory(), self.table_dir.as_ref())
             && let Ok(rest) = out.strip_prefix(&data)
@@ -530,7 +535,9 @@ mod tests {
         assert_eq!(m.resolve("clip.mp4", None).unwrap().kind, AssetType::Video);
         assert!(m.resolve("a.png|b.png", None).is_err());
         let f = m.resolve("fonts/x.fnt", None).unwrap();
-        assert_eq!(m.resolve("x.png", Some(&f)).unwrap().path, r"./fonts/x.fnt\..\x.png");
+        // (joined with this system's separator)
+        let joined = if cfg!(windows) { r"./fonts/x.fnt\..\x.png" } else { "./fonts/x.fnt/../x.png" };
+        assert_eq!(m.resolve("x.png", Some(&f)).unwrap().path, joined);
     }
 
     #[test]

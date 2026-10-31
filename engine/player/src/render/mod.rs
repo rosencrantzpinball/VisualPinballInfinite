@@ -1,11 +1,12 @@
-//! Draws the table with SDL3 GPU on Direct3D 12: the scene from
+//! Draws the table with SDL3 GPU on Direct3D 12 (on Linux, Vulkan): the scene from
 //! `vpin`'s meshes, the balls, and the on-screen readouts. Shaders are HLSL,
-//! compiled at startup by FXC. Drawing never waits for the graphics card: when
-//! no swapchain image is free, the frame is skipped.
+//! compiled at startup by FXC (on Linux, to SPIR-V by DXC when the player is built). Drawing
+//! never waits for the graphics card: when no swapchain image is free, the frame is skipped.
 
 mod backglass;
 mod effects;
 mod embed;
+#[cfg(windows)]
 mod fxc;
 mod hdr10;
 mod menu;
@@ -13,6 +14,8 @@ mod mips;
 mod post;
 mod pup;
 mod segments;
+#[cfg(not(windows))]
+mod spirv;
 mod still;
 
 pub use effects::AmbientOcclusion;
@@ -245,15 +248,23 @@ fn non_null<T>(pointer: *mut T, what: &str) -> Result<*mut T, String> {
 
 /// The GPU device, on Direct3D 12: the graphics card Windows ranks for high performance, or with
 /// `VPI_GPU_LOW_POWER` set the one it ranks for low power (a laptop's or a processor's own, where
-/// there's a second). Which card it is goes in the log.
+/// there's a second). Which card it is goes in the log. On Linux, Vulkan, the shaders as SPIR-V.
 ///
 /// # Safety
 /// On the thread that draws.
 unsafe fn create_device() -> *mut SDL_GPUDevice {
     unsafe {
         let props = SDL_CreateProperties();
-        SDL_SetStringProperty(props, SDL_PROP_GPU_DEVICE_CREATE_NAME_STRING, c"direct3d12".as_ptr());
-        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_DXBC_BOOLEAN, true);
+        #[cfg(windows)]
+        {
+            SDL_SetStringProperty(props, SDL_PROP_GPU_DEVICE_CREATE_NAME_STRING, c"direct3d12".as_ptr());
+            SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_DXBC_BOOLEAN, true);
+        }
+        #[cfg(not(windows))]
+        {
+            SDL_SetStringProperty(props, SDL_PROP_GPU_DEVICE_CREATE_NAME_STRING, c"vulkan".as_ptr());
+            SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_SPIRV_BOOLEAN, true);
+        }
         SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_DEBUGMODE_BOOLEAN, false);
         let low_power = std::env::var_os("VPI_GPU_LOW_POWER").is_some_and(|v| !v.is_empty() && v != "0");
         SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_PREFERLOWPOWER_BOOLEAN, low_power);
@@ -356,7 +367,7 @@ struct ClassicLightUniforms {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct VpxSceneUniforms {
-    /// x: the environment's emission scale; y: its picture's height.
+    /// x: the environment's emission scale; y: its picture's height; z: VR's specular antialiasing on.
     env_emission_height: [f32; 4],
     /// VPX 5436 leaves the basic shader's ambient colour and light range at
     /// zero (it sets them for the ball only).
@@ -515,7 +526,8 @@ fn refraction_blur(roughness: u32) -> Option<f32> {
 struct RefractionUniforms {
     view_proj: [[f32; 4]; 4],
     tint_thickness: [f32; 4],
-    /// x: 1 when the probe has no depth (multisampled), so nothing is held back.
+    /// x: 1 when the probe has no depth (multisampled), so nothing is held back; y, z: the share of the
+    /// probe's picture drawn across and down (VR's dynamic resolution draws its top left).
     flags: [f32; 4],
 }
 
@@ -790,10 +802,195 @@ pub enum FrameResult {
     Skipped,
 }
 
+/// VR's foveation this frame: each eye's full rate disc, its centre in the eye's picture (0 to 1 across
+/// and down) and radius, and the 2x2 disc's around it, as fractions of half the picture's width; 4x4
+/// beyond (`xr::fovea`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Fovea {
+    pub centres: [[f32; 2]; 2],
+    pub full: f32,
+    pub half: f32,
+}
+
+/// The SDL addition's usage of a shading rate image (`SDL_GPU_TEXTUREUSAGE_FRAGMENT_SHADING_RATE`).
+const SDL_GPU_TEXTUREUSAGE_FRAGMENT_SHADING_RATE: SDL_GPUTextureUsageFlags = SDL_GPUTextureUsageFlags(1 << 16);
+
+/// The six planes of a view-projection's frustum (the renderer's row vectors, depth 0 to 1), each
+/// (a, b, c, d) normalised: a point is inside where a x + b y + c z + d >= 0 for all.
+fn frustum_planes(vp: &Mat4) -> [[f32; 4]; 6] {
+    frustum_planes_within(vp, [-1.0, -1.0, 1.0, 1.0])
+}
+
+/// The same narrowed to the part of the screen `b` (x, y from -1 to 1, the least then the most): what a pass
+/// drawn with that scissor can show.
+fn frustum_planes_within(vp: &Mat4, b: [f32; 4]) -> [[f32; 4]; 6] {
+    let m = &vp.m;
+    let col = |k: usize| [m[0][k], m[1][k], m[2][k], m[3][k]];
+    let (x, y, z, w) = (col(0), col(1), col(2), col(3));
+    // s a + t c, each component
+    let mix = |s: f32, a: [f32; 4], t: f32, c: [f32; 4]| [0, 1, 2, 3].map(|i| s * a[i] + t * c[i]);
+    [mix(1.0, x, -b[0], w), mix(b[2], w, -1.0, x), mix(1.0, y, -b[1], w), mix(b[3], w, -1.0, y), z, mix(1.0, w, -1.0, z)].map(|p| {
+        let n = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt().max(f32::MIN_POSITIVE);
+        p.map(|v| v / n)
+    })
+}
+
+/// `projection` (row vectors, depth 0 to 1) with its near plane turned onto `plane` (in the view's space,
+/// what's on its positive side kept) and its far plane through the frustum's far corner: Lengyel's oblique
+/// near plane ("Oblique View Frustum Depth Projection and Clipping", 2005). A mirror's pass cuts away what's
+/// below the mirror this way, with the clipping every triangle gets, rather than with a clip distance, which
+/// costs Turnip about a third of its geometry throughput. None when the eye isn't behind the plane.
+fn oblique_near(projection: &Mat4, plane: [f32; 4]) -> Option<Mat4> {
+    // the eye, the view's origin, must be on the side cut away
+    if plane[3] >= 0.0 {
+        return None;
+    }
+    let inv = projection.inverse();
+    // the plane in clip space, then the frustum's far corner on its side, back in the view's space
+    let in_clip = |j: usize| (0..4).map(|i| inv.m[j][i] * plane[i]).sum::<f32>();
+    let corner = [in_clip(0).signum(), in_clip(1).signum(), 1.0, 1.0];
+    let far: [f32; 4] = std::array::from_fn(|j| (0..4).map(|i| corner[i] * inv.m[i][j]).sum());
+    let along = (0..4).map(|i| plane[i] * far[i]).sum::<f32>();
+    if along <= 0.0 {
+        return None;
+    }
+    let mut m = *projection;
+    for (i, c) in plane.iter().enumerate() {
+        m.m[i][2] = c / along;
+    }
+    Some(m)
+}
+
+/// Where `vp` puts a point of the table's space on screen (x and y, -1 to 1, y up); None behind the eye.
+fn on_screen(vp: &Mat4, p: Vec3) -> Option<[f32; 2]> {
+    let m = &vp.m;
+    let c = |k: usize| p.x * m[0][k] + p.y * m[1][k] + p.z * m[2][k] + m[3][k];
+    let w = c(3);
+    (w > 1e-4).then(|| [c(0) / w, c(1) / w])
+}
+
+/// Each draw's bounding sphere in its own space (centre, radius), for VR's culling; none for those whose
+/// shape changes as they play (VPX's animated primitives, ramps a script reshapes) or have no triangles.
+fn draw_bounds(boxes: &[Option<([f32; 3], [f32; 3])>]) -> Vec<Option<(Vec3, f32)>> {
+    boxes
+        .iter()
+        .map(|b| {
+            b.map(|(lo, hi)| {
+                let c = Vec3::new((lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5);
+                (c, ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt() * 0.5)
+            })
+        })
+        .collect()
+}
+
+/// Each draw's box in its own space (its least and most corners), for VR: its bounding sphere, and which
+/// parts are the room's; none for those whose shape changes as they play or have no triangles (as above).
+fn draw_boxes(scene: &Scene) -> Vec<Option<([f32; 3], [f32; 3])>> {
+    let reshaped: std::collections::HashSet<u32> = scene.animations.iter().map(|a| a.part).chain(scene.ramps.iter().map(|r| r.part)).collect();
+    scene
+        .draws
+        .iter()
+        .map(|d| {
+            if d.index_count == 0 || d.part.is_some_and(|p| reshaped.contains(&p)) {
+                return None;
+            }
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            let first = d.first_index as usize;
+            for &i in scene.indices.get(first..first + d.index_count as usize)? {
+                let p = scene.vertices.get((d.base_vertex as i64 + i as i64) as usize)?.position;
+                for a in 0..3 {
+                    lo[a] = lo[a].min(p[a]);
+                    hi[a] = hi[a].max(p[a]);
+                }
+            }
+            Some((lo, hi))
+        })
+        .collect()
+}
+
+/// An eye's shading rate image, `texels` of `texel` pixels square over pictures `size` drawn: each
+/// texel's rate (Vulkan's codes: 0 full, 5 2x2, 10 4x4) by its middle's distance from the eye's disc.
+fn rate_map(f: &Fovea, eye: usize, texels: (u32, u32), texel: u32, size: (u32, u32), out: &mut [u8]) {
+    let (cx, cy) = (f.centres[eye][0] * size.0 as f32, f.centres[eye][1] * size.1 as f32);
+    let half_width = size.0 as f32 * 0.5;
+    let (full, half) = ((f.full * half_width).powi(2), (f.half * half_width).powi(2));
+    for ty in 0..texels.1 {
+        for tx in 0..texels.0 {
+            let (dx, dy) = ((tx as f32 + 0.5) * texel as f32 - cx, (ty as f32 + 0.5) * texel as f32 - cy);
+            let d = dx * dx + dy * dy;
+            out[(ty * texels.0 + tx) as usize] = if d <= full {
+                0
+            } else if d <= half {
+                5
+            } else {
+                10
+            };
+        }
+    }
+}
+
+// The vendored SDL's fragment shading rate images (`SDL_gpu.h`, ours): the image the render passes
+// begun next on `command_buffer` take, null for full rate.
+#[cfg(not(windows))]
+unsafe extern "C" {
+    fn SDL_SetGPUShadingRateImage(command_buffer: *mut SDL_GPUCommandBuffer, texture: *mut SDL_GPUTexture);
+}
+
+/// Sets the shading rate image of the render passes begun next (VR's foveation; nothing elsewhere).
+unsafe fn set_shading_rate(command: *mut SDL_GPUCommandBuffer, texture: *mut SDL_GPUTexture) {
+    #[cfg(not(windows))]
+    // SAFETY: a command buffer of ours, outside a render pass
+    unsafe {
+        SDL_SetGPUShadingRateImage(command, texture)
+    };
+    #[cfg(windows)]
+    let _ = (command, texture);
+}
+
 pub struct Renderer {
     device: *mut SDL_GPUDevice,
     window: *mut SDL_Window,
     claimed: bool,
+    /// The device is the renderer's own, destroyed with it; a headset's belongs to the VR session.
+    owns_device: bool,
+    /// VR's passthrough: the pipeline writing each frame's alpha from the scene's depth (null: off).
+    environment_alpha: *mut SDL_GPUGraphicsPipeline,
+    /// The same with nothing after the tonemapping: the tonemapping pass writing that alpha too.
+    tonemap_environment_alpha: *mut SDL_GPUGraphicsPipeline,
+    /// VR's foveation: the pixels each texel of a shading rate image covers (the device's; 0: none),
+    /// each eye's image, its size in texels, the buffer they're uploaded through, the discs they hold and
+    /// the part of the pictures they were placed in, and the image the scene passes being recorded take
+    /// (null: full rate).
+    rate_texel: u32,
+    rate_images: [*mut SDL_GPUTexture; 2],
+    rate_size: (u32, u32),
+    rate_upload: *mut SDL_GPUTransferBuffer,
+    rate_drawn: Option<Fovea>,
+    rate_part: (u32, u32),
+    rate_now: std::cell::Cell<*mut SDL_GPUTexture>,
+    /// Drawing for a headset (no window): each eye with its own pictures ([`Renderer::draw_eyes`]).
+    headset: bool,
+    /// A headset's culling: each draw's bounding sphere (`draw_bounds`), the parts out of an eye's
+    /// sight left out of its passes.
+    draw_bounds: Vec<Option<(Vec3, f32)>>,
+    /// Each draw's box in its own space (`draw_boxes`), VR's too.
+    draw_boxes: Vec<Option<([f32; 3], [f32; 3])>>,
+    /// VR's culling on (test runs compare without: `VPI_XR_NO_CULL=1`).
+    cull: bool,
+    /// VR with passthrough: the draws and flashers of the table's room, left out so the real room shows
+    /// around the cabinet (`show_cabinet_only`); empty otherwise.
+    room: Vec<bool>,
+    room_flashers: Vec<bool>,
+    /// VR's specular antialiasing (material.hlsl; off for comparisons with VPI_XR_NO_SPECULAR_AA=1).
+    specular_aa: bool,
+    /// The last eye's triangles: those of its shown parts, those its culling left out, and those drawn into
+    /// its mirrors.
+    pub triangles: std::cell::Cell<(u64, u64, u64)>,
+    /// A headset's eyes as last drawn (their size, the part drawn: [`Renderer::window_size`]).
+    eye_drawn: std::cell::Cell<(u32, u32)>,
+    /// A headset's eye at full size, which its pictures are made at: dynamic resolution draws the top left
+    /// `eye_drawn` of them, as the fork draws them, so that a change of size makes nothing again.
+    eye_made: std::cell::Cell<(u32, u32)>,
     format: SDL_GPUTextureFormat,
     pub present_mode: &'static str,
     opaque: *mut SDL_GPUGraphicsPipeline,
@@ -831,6 +1028,11 @@ pub struct Renderer {
     dmd_id: Option<u64>,
     /// Frames drawn, for the dots' jitter (VPX's `m_overall_frames`).
     frames_drawn: std::cell::Cell<u32>,
+    /// Test runs: the main pass's order of solid parts printed once, after 200 frames (`VPI_DEBUG_DRAW_ORDER=1`;
+    /// 1 armed, 2 done).
+    debug_order: std::cell::Cell<u8>,
+    /// Test runs compare VR's mirrors drawn whole (`VPI_XR_NO_MIRROR_AREA=1`) with their area of interest.
+    no_mirror_area: bool,
     /// The score display's own window, when it has one.
     display: Option<DisplayWindow>,
     /// The backglass's own window, when it has one.
@@ -899,6 +1101,27 @@ pub struct Renderer {
     /// Each pipeline for parts' meshes, which draws both faces, with its two twins that drop
     /// faces as VPX's cull modes do: `CULL_CCW` (VPX's default) and `CULL_CW`.
     culled: std::collections::HashMap<*mut SDL_GPUGraphicsPipeline, [*mut SDL_GPUGraphicsPipeline; 2]>,
+    /// The parts' pipelines draw without the hardware clip distance, which costs Turnip about a third of its
+    /// geometry throughput (STAR FOX: 29.8 ms a frame with it, 20.1 without); each has a twin keeping it for
+    /// the mirrors' passes, which cut away what's below their plane (VPX's CLIP variant): the twin of each
+    /// part shader (built with it) while the pipelines are made, then of each pipeline.
+    shader_twin: std::collections::HashMap<*mut SDL_GPUShader, *mut SDL_GPUShader>,
+    clip_twin: std::collections::HashMap<*mut SDL_GPUGraphicsPipeline, *mut SDL_GPUGraphicsPipeline>,
+    /// A mirror's pass being recorded whose projection can't cut what's below it (`oblique_near`): the
+    /// parts bound through their clipping twins. Test runs compare the twins in every mirror's pass
+    /// (`VPI_TEST_NO_OBLIQUE=1`) and everywhere (`VPI_TEST_CLIP_EVERYWHERE=1`).
+    mirroring: std::cell::Cell<bool>,
+    no_oblique: bool,
+    clip_everywhere: bool,
+    /// Test runs only (`VPI_TEST_OFFSCREEN=1`): every part's points put outside the view, so the vertex work is
+    /// done and nothing drawn, weighing the one against the rest (`push_frame`).
+    offscreen: bool,
+    /// Test runs only (`VPI_TEST_NO_MIRROR_CULL=1`): a mirror's pass culls by its whole view alone, not by its plane
+    /// nor its area of interest.
+    no_mirror_cull: bool,
+    /// Test runs only (`VPI_TEST_ONE_TRIANGLE=1`): each draw of a part draws its first triangle alone (`test_count`),
+    /// leaving each draw's own cost.
+    one_triangle: bool,
     vertex_buffer: *mut SDL_GPUBuffer,
     index_buffer: *mut SDL_GPUBuffer,
     overlay_buffer: *mut SDL_GPUBuffer,
@@ -1014,6 +1237,12 @@ pub struct Renderer {
     ball_anti_stretch: bool,
     prev_hdr: *mut SDL_GPUTexture,
     prev_valid: std::cell::Cell<bool>,
+    /// A headset's right eye's picture and its frame before (`hdr_target` and `prev_hdr` are the left
+    /// eye's, the right's swapped in while it's drawn): each eye's two are swapped once it's drawn, as
+    /// VPX swaps its back buffers, so nothing is copied and each eye's balls mirror its own view.
+    right_eye_hdr: [*mut SDL_GPUTexture; 2],
+    /// Whether each eye has its frame before.
+    eye_prev_valid: [bool; 2],
     /// VPX's look: each mirror's picture (VPX's reflection probes), for the
     /// mirrors some part shows, and the pass adding a mirror over a
     /// see-through part.
@@ -1089,10 +1318,66 @@ impl Renderer {
         hdr: Option<HdrRequest>,
     ) -> Result<Renderer, String> {
         let device = non_null(unsafe { create_device() }, "create GPU device")?;
+        unsafe { Self::with_device(device, window, SDL_GPU_TEXTUREFORMAT_INVALID, scene, sources, presentation, samples, look, hdr) }
+    }
+
+    /// A renderer for the headset (VR): on the GPU device the OpenXR runtime made, with no window
+    /// of its own; each frame draws both eyes into the runtime's images ([`Renderer::draw_eyes`]),
+    /// which are of `format`. No multisampling, and the ordinary colours (no HDR10).
+    ///
+    /// # Safety
+    /// `device` must be a live GPU device, used on this thread, that outlives the renderer (the VR
+    /// session's, which destroys it after the session ends).
+    pub unsafe fn for_headset(
+        device: *mut SDL_GPUDevice,
+        format: SDL_GPUTextureFormat,
+        scene: &Scene,
+        sources: &[vpin::vpx::image::ImageData],
+        look: LookMode,
+    ) -> Result<Renderer, String> {
+        unsafe { Self::with_device(device, null_mut(), format, scene, sources, Presentation::Immediate, 1, look, None) }
+    }
+
+    /// The renderer on `device`, drawing into `window`'s swapchain, or (no window) into pictures of
+    /// `format` it's handed.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn with_device(
+        device: *mut SDL_GPUDevice,
+        window: *mut SDL_Window,
+        format: SDL_GPUTextureFormat,
+        scene: &Scene,
+        sources: &[vpin::vpx::image::ImageData],
+        presentation: Presentation,
+        samples: u32,
+        look: LookMode,
+        hdr: Option<HdrRequest>,
+    ) -> Result<Renderer, String> {
+        // a headset's draws' boxes and spheres: its culling, the room left out with passthrough
+        let boxes = if window.is_null() { draw_boxes(scene) } else { Vec::new() };
         let mut r = Renderer {
             device,
             window,
             claimed: false,
+            owns_device: !window.is_null(),
+            environment_alpha: null_mut(),
+            tonemap_environment_alpha: null_mut(),
+            rate_texel: 0,
+            rate_images: [null_mut(); 2],
+            rate_size: (0, 0),
+            rate_upload: null_mut(),
+            rate_drawn: None,
+            rate_part: (0, 0),
+            rate_now: std::cell::Cell::new(null_mut()),
+            draw_bounds: draw_bounds(&boxes),
+            draw_boxes: boxes,
+            cull: std::env::var_os("VPI_XR_NO_CULL").is_none(),
+            room: Vec::new(),
+            room_flashers: Vec::new(),
+            triangles: std::cell::Cell::new((0, 0, 0)),
+            eye_drawn: std::cell::Cell::new((0, 0)),
+            eye_made: std::cell::Cell::new((0, 0)),
+            specular_aa: window.is_null() && std::env::var_os("VPI_XR_NO_SPECULAR_AA").is_none(),
+            headset: window.is_null(),
             format: SDL_GPU_TEXTUREFORMAT_INVALID,
             present_mode: "vsync",
             opaque: null_mut(),
@@ -1120,6 +1405,8 @@ impl Renderer {
             dmd_size: (0, 0),
             dmd_id: None,
             frames_drawn: std::cell::Cell::new(0),
+            debug_order: std::cell::Cell::new(u8::from(std::env::var_os("VPI_DEBUG_DRAW_ORDER").is_some_and(|v| v == "1"))),
+            no_mirror_area: std::env::var_os("VPI_XR_NO_MIRROR_AREA").is_some_and(|v| v == "1"),
             display: None,
             backglass: None,
             topper: None,
@@ -1153,6 +1440,14 @@ impl Renderer {
             missing_images: Default::default(),
             halo_raised: std::cell::RefCell::new(vec![false; scene.light_parts.len()]),
             culled: std::collections::HashMap::new(),
+            shader_twin: std::collections::HashMap::new(),
+            clip_twin: std::collections::HashMap::new(),
+            mirroring: std::cell::Cell::new(false),
+            no_oblique: std::env::var_os("VPI_TEST_NO_OBLIQUE").is_some_and(|v| v == "1"),
+            clip_everywhere: std::env::var_os("VPI_TEST_CLIP_EVERYWHERE").is_some_and(|v| v == "1"),
+            offscreen: std::env::var_os("VPI_TEST_OFFSCREEN").is_some_and(|v| v == "1"),
+            no_mirror_cull: std::env::var_os("VPI_TEST_NO_MIRROR_CULL").is_some_and(|v| v == "1"),
+            one_triangle: std::env::var_os("VPI_TEST_ONE_TRIANGLE").is_some_and(|v| v == "1"),
             vertex_buffer: null_mut(),
             index_buffer: null_mut(),
             overlay_buffer: null_mut(),
@@ -1222,6 +1517,8 @@ impl Renderer {
             ball_anti_stretch: false,
             prev_hdr: null_mut(),
             prev_valid: std::cell::Cell::new(false),
+            right_eye_hdr: [null_mut(); 2],
+            eye_prev_valid: [false; 2],
             mirror_textures: Vec::new(),
             vpx_mirror_add: null_mut(),
             normal_textures: Vec::new(),
@@ -1256,55 +1553,61 @@ impl Renderer {
             },
         };
         unsafe {
-            check(SDL_ClaimWindowForGPUDevice(device, window), "claim the window")?;
-            r.claimed = true;
-            // the lowest-latency mode the window supports; vsync is always there
-            let mut mode = SDL_GPU_PRESENTMODE_VSYNC;
-            let candidates: &[(SDL_GPUPresentMode, &'static str)] = match presentation {
-                Presentation::Immediate => &[(SDL_GPU_PRESENTMODE_IMMEDIATE, "immediate"), (SDL_GPU_PRESENTMODE_MAILBOX, "mailbox")],
-                Presentation::TearFree => &[(SDL_GPU_PRESENTMODE_MAILBOX, "mailbox")],
-                Presentation::Queued | Presentation::Paced => &[],
-            };
-            for &(m, name) in candidates {
-                if SDL_WindowSupportsGPUPresentMode(device, window, m) {
-                    mode = m;
-                    r.present_mode = name;
-                    break;
-                }
-            }
-            if presentation == Presentation::Paced {
-                r.present_mode = "paced";
-            }
-            // VPX's look on a screen in HDR: VPX 5436's HDR10 output, its white and peak the
-            // screen's as SDL reports them (VPX's Window); else linear output, encoded to sRGB by
-            // the swapchain
-            let props = SDL_GetWindowProperties(window);
-            if r.hdr
-                && let Some(request) = hdr
-                && SDL_GetBooleanProperty(props, SDL_PROP_WINDOW_HDR_ENABLED_BOOLEAN, false)
-                && SDL_WindowSupportsGPUSwapchainComposition(device, window, SDL_GPU_SWAPCHAINCOMPOSITION_HDR10_ST2084)
-            {
-                r.hdr10 = Some(Hdr10::new(
-                    SDL_GetFloatProperty(props, SDL_PROP_WINDOW_SDR_WHITE_LEVEL_FLOAT, 1.0),
-                    SDL_GetFloatProperty(props, SDL_PROP_WINDOW_HDR_HEADROOM_FLOAT, 1.0),
-                    request,
-                ));
-            }
-            let composition = if r.hdr10.is_some() {
-                SDL_GPU_SWAPCHAINCOMPOSITION_HDR10_ST2084
-            } else if SDL_WindowSupportsGPUSwapchainComposition(device, window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR_LINEAR) {
-                SDL_GPU_SWAPCHAINCOMPOSITION_SDR_LINEAR
+            if window.is_null() {
+                // the headset's: the images handed to each frame are the swapchain
+                r.format = format;
+                r.present_mode = "headset";
             } else {
-                SDL_GPU_SWAPCHAINCOMPOSITION_SDR
-            };
-            check(SDL_SetGPUSwapchainParameters(device, window, composition, mode), "set the present mode")?;
-            // one frame queued at most: the lowest latency, VPX's default too (`[Player]`
-            // `MaxPrerenderedFrames`, 1 to 3, which the settings may raise). SDL3 sizes the swap
-            // chain by the frames in flight, and mailbox needs three buffers (one shown, one
-            // waiting, one being drawn); with two it waits for the display like vsync
-            let in_flight = FRAMES_IN_FLIGHT.load(std::sync::atomic::Ordering::Relaxed).clamp(1, 3);
-            SDL_SetGPUAllowedFramesInFlight(device, if mode == SDL_GPU_PRESENTMODE_MAILBOX { 3 } else { in_flight });
-            r.format = SDL_GetGPUSwapchainTextureFormat(device, window);
+                check(SDL_ClaimWindowForGPUDevice(device, window), "claim the window")?;
+                r.claimed = true;
+                // the lowest-latency mode the window supports; vsync is always there
+                let mut mode = SDL_GPU_PRESENTMODE_VSYNC;
+                let candidates: &[(SDL_GPUPresentMode, &'static str)] = match presentation {
+                    Presentation::Immediate => &[(SDL_GPU_PRESENTMODE_IMMEDIATE, "immediate"), (SDL_GPU_PRESENTMODE_MAILBOX, "mailbox")],
+                    Presentation::TearFree => &[(SDL_GPU_PRESENTMODE_MAILBOX, "mailbox")],
+                    Presentation::Queued | Presentation::Paced => &[],
+                };
+                for &(m, name) in candidates {
+                    if SDL_WindowSupportsGPUPresentMode(device, window, m) {
+                        mode = m;
+                        r.present_mode = name;
+                        break;
+                    }
+                }
+                if presentation == Presentation::Paced {
+                    r.present_mode = "paced";
+                }
+                // VPX's look on a screen in HDR: VPX 5436's HDR10 output, its white and peak the
+                // screen's as SDL reports them (VPX's Window); else linear output, encoded to sRGB by
+                // the swapchain
+                let props = SDL_GetWindowProperties(window);
+                if r.hdr
+                    && let Some(request) = hdr
+                    && SDL_GetBooleanProperty(props, SDL_PROP_WINDOW_HDR_ENABLED_BOOLEAN, false)
+                    && SDL_WindowSupportsGPUSwapchainComposition(device, window, SDL_GPU_SWAPCHAINCOMPOSITION_HDR10_ST2084)
+                {
+                    r.hdr10 = Some(Hdr10::new(
+                        SDL_GetFloatProperty(props, SDL_PROP_WINDOW_SDR_WHITE_LEVEL_FLOAT, 1.0),
+                        SDL_GetFloatProperty(props, SDL_PROP_WINDOW_HDR_HEADROOM_FLOAT, 1.0),
+                        request,
+                    ));
+                }
+                let composition = if r.hdr10.is_some() {
+                    SDL_GPU_SWAPCHAINCOMPOSITION_HDR10_ST2084
+                } else if SDL_WindowSupportsGPUSwapchainComposition(device, window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR_LINEAR) {
+                    SDL_GPU_SWAPCHAINCOMPOSITION_SDR_LINEAR
+            } else {
+                    SDL_GPU_SWAPCHAINCOMPOSITION_SDR
+                };
+                check(SDL_SetGPUSwapchainParameters(device, window, composition, mode), "set the present mode")?;
+                // one frame queued at most: the lowest latency, VPX's default too (`[Player]`
+                // `MaxPrerenderedFrames`, 1 to 3, which the settings may raise). SDL3 sizes the swap
+                // chain by the frames in flight, and mailbox needs three buffers (one shown, one
+                // waiting, one being drawn); with two it waits for the display like vsync
+                let in_flight = FRAMES_IN_FLIGHT.load(std::sync::atomic::Ordering::Relaxed).clamp(1, 3);
+                SDL_SetGPUAllowedFramesInFlight(device, if mode == SDL_GPU_PRESENTMODE_MAILBOX { 3 } else { in_flight });
+                r.format = SDL_GetGPUSwapchainTextureFormat(device, window);
+            }
             r.scene_format = if r.hdr { HDR_FORMAT } else { r.format };
             // as many samples as asked, or the most the graphics card has below that
             while r.samples != SDL_GPU_SAMPLECOUNT_1
@@ -1334,6 +1637,10 @@ impl Renderer {
                     r.normal_textures[i] = r.unorm_picture(image.width, image.height, &image.rgba8(), true, "upload a normal map")?;
                 }
             }
+        }
+        // VR's foveation: the device's shading rate images (the vendored SDL's), when it has them
+        if r.headset {
+            r.rate_texel = unsafe { SDL_GetNumberProperty(SDL_GetGPUDeviceProperties(device), c"SDL.gpu.device.vulkan.shading_rate_texel_size".as_ptr(), 0) }.max(0) as u32;
         }
         Ok(r)
     }
@@ -1419,13 +1726,19 @@ impl Renderer {
     }
 
     fn shader(&self, source: &str, entry: &CStr, target: &CStr, stage: SDL_GPUShaderStage, samplers: u32, uniforms: u32) -> Result<*mut SDL_GPUShader, String> {
-        let code = fxc::compile(source, entry, target)?;
+        #[cfg(windows)]
+        let (code, format) = (fxc::compile(source, entry, target)?, SDL_GPU_SHADERFORMAT_DXBC);
+        #[cfg(not(windows))]
+        let (code, format) = {
+            let _ = target; // DXC's shader models are chosen when the player is built
+            (spirv::compiled(source, entry)?, SDL_GPU_SHADERFORMAT_SPIRV)
+        };
         unsafe {
             let mut info: SDL_GPUShaderCreateInfo = zeroed();
             info.code_size = code.len();
             info.code = code.as_ptr();
             info.entrypoint = entry.as_ptr();
-            info.format = SDL_GPU_SHADERFORMAT_DXBC;
+            info.format = format;
             info.stage = stage;
             info.num_samplers = samplers;
             info.num_uniform_buffers = uniforms;
@@ -1438,13 +1751,13 @@ impl Renderer {
     /// VPX's winding, so VPX's counter-clockwise faces are SDL's front ones
     unsafe fn part_pipeline(&mut self, info: &SDL_GPUGraphicsPipelineCreateInfo) -> *mut SDL_GPUGraphicsPipeline {
         unsafe {
-            let both = SDL_CreateGPUGraphicsPipeline(self.device, info);
+            let both = self.twinned(info);
             if !both.is_null() {
                 let mut twin = *info;
                 twin.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_FRONT;
-                let ccw = SDL_CreateGPUGraphicsPipeline(self.device, &twin);
+                let ccw = self.twinned(&twin);
                 twin.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_BACK;
-                let cw = SDL_CreateGPUGraphicsPipeline(self.device, &twin);
+                let cw = self.twinned(&twin);
                 if !ccw.is_null() && !cw.is_null() {
                     self.culled.insert(both, [ccw, cw]);
                 }
@@ -1453,12 +1766,86 @@ impl Renderer {
         }
     }
 
+    /// One of the parts' shaders (`source`, VPX's or the first look's) as the pipelines use it, without the
+    /// hardware clip distance (`NO_CLIP`), its twin with it kept for the mirrors' pipelines (`shader_twin`).
+    fn part_shader(&mut self, source: &str, entry: &CStr, profile: &CStr, stage: SDL_GPUShaderStage, samplers: u32, uniforms: u32) -> Result<*mut SDL_GPUShader, String> {
+        let shader = self.shader(&format!("#define NO_CLIP\n{source}"), entry, profile, stage, samplers, uniforms)?;
+        match self.shader(source, entry, profile, stage, samplers, uniforms) {
+            Ok(twin) => {
+                self.shader_twin.insert(shader, twin);
+                Ok(shader)
+            }
+            Err(e) => {
+                unsafe { SDL_ReleaseGPUShader(self.device, shader) };
+                Err(e)
+            }
+        }
+    }
+
+    /// Releases a shader, and its twin if it's one of the parts' (`part_shader`).
+    unsafe fn release_shader(&mut self, shader: *mut SDL_GPUShader) {
+        unsafe {
+            if let Some(twin) = self.shader_twin.remove(&shader) {
+                SDL_ReleaseGPUShader(self.device, twin);
+            }
+            SDL_ReleaseGPUShader(self.device, shader);
+        }
+    }
+
+    /// A pipeline; one of the parts' (its vertex shader a part shader) with its clipping twin for the
+    /// mirrors' passes, the same with the shaders' twins (`clip_twin`).
+    unsafe fn twinned(&mut self, info: &SDL_GPUGraphicsPipelineCreateInfo) -> *mut SDL_GPUGraphicsPipeline {
+        unsafe {
+            let pipeline = SDL_CreateGPUGraphicsPipeline(self.device, info);
+            if let (false, Some(&vs)) = (pipeline.is_null(), self.shader_twin.get(&info.vertex_shader)) {
+                let mut twin = *info;
+                twin.vertex_shader = vs;
+                twin.fragment_shader = self.shader_twin.get(&info.fragment_shader).copied().unwrap_or(info.fragment_shader);
+                let clipping = SDL_CreateGPUGraphicsPipeline(self.device, &twin);
+                if !clipping.is_null() {
+                    self.clip_twin.insert(pipeline, clipping);
+                }
+            }
+            pipeline
+        }
+    }
+
+    /// Hands the parts' vertex shaders the frame's uniforms (slot 0). With `offscreen` (test runs) every point
+    /// lands at clip (2, 0, 0.5, 1), right of the view: each triangle is thrown away whole after its vertex work.
+    unsafe fn push_frame(&self, command: *mut SDL_GPUCommandBuffer, frame: &FrameUniforms) {
+        let mut f = *frame;
+        if self.offscreen {
+            f.rot_view_proj = [[0.0; 4], [0.0; 4], [0.0; 4], [2.0, 0.0, 0.5, 1.0]];
+        }
+        unsafe { SDL_PushGPUVertexUniformData(command, 0, (&raw const f).cast(), size_of::<FrameUniforms>() as u32) };
+    }
+
+    /// The indices a part's draw takes: all of them, or with `one_triangle` (test runs) its first triangle's.
+    fn test_count(&self, indices: u32) -> u32 {
+        if self.one_triangle { indices.min(3) } else { indices }
+    }
+
+    /// Binds a pipeline for what's recorded next: in a mirror's pass, a part's clipping twin.
+    unsafe fn bind_pipeline(&self, pass: *mut SDL_GPURenderPass, pipeline: *mut SDL_GPUGraphicsPipeline) {
+        let pipeline = if self.mirroring.get() || self.clip_everywhere { self.clip_twin.get(&pipeline).copied().unwrap_or(pipeline) } else { pipeline };
+        unsafe { SDL_BindGPUGraphicsPipeline(pass, pipeline) };
+    }
+
     fn create_pipelines(&mut self) -> Result<(), String> {
-        let vs = self.shader(SCENE_HLSL, c"vs_main", c"vs_5_1", SDL_GPU_SHADERSTAGE_VERTEX, 0, 2)?;
-        let fs = self.shader(SCENE_HLSL, c"fs_main", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1)?;
-        let light_fs = self.shader(SCENE_HLSL, c"fs_light", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1)?;
+        // test runs can have the parts' vertices neither read nor shaded (`vs_null`)
+        let test_vs = |name: &str| std::env::var_os(name).is_some_and(|v| v == "1");
+        let main_vs = if test_vs("VPI_TEST_NULL_VS") {
+            c"vs_null"
+        } else if test_vs("VPI_TEST_POSITION_VS") {
+            c"vs_position"
+        } else {
+            c"vs_main"
+        };
+        let vs = self.part_shader(SCENE_HLSL, main_vs, c"vs_5_1", SDL_GPU_SHADERSTAGE_VERTEX, 0, 2)?;
+        let fs = self.part_shader(SCENE_HLSL, c"fs_main", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1)?;
+        let light_fs = self.part_shader(SCENE_HLSL, c"fs_light", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1)?;
         // the bulbs, flashers and added parts read VPX's ball shadows from the third slot
-        let bulb_fs = self.shader(SCENE_HLSL, c"fs_bulb", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 3)?;
+        let bulb_fs = self.part_shader(SCENE_HLSL, c"fs_bulb", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 3)?;
         let ovs = self.shader(OVERLAY_HLSL, c"overlay_vs", c"vs_5_1", SDL_GPU_SHADERSTAGE_VERTEX, 0, 1)?;
         let ofs = self.shader(OVERLAY_HLSL, c"overlay_fs", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 0)?;
         // over VPX's HDR10 output, the readout encoded as the picture is
@@ -1472,9 +1859,9 @@ impl Renderer {
         let sfs = self.shader(OVERLAY_HLSL, c"sprite_fs", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 0)?;
         let blfs = self.shader(OVERLAY_HLSL, c"backdrop_light_fs", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1)?;
         let bbfs = self.shader(OVERLAY_HLSL, c"backdrop_bulb_fs", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1)?;
-        let flasher_fs = self.shader(SCENE_HLSL, c"fs_flasher", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 2, 3)?;
-        let unshaded_fs = self.shader(SCENE_HLSL, c"fs_unshaded", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 3)?;
-        let dmd_flasher_fs = self.shader(&format!("#define DMD_SCENE\n{SCENE_HLSL}\n{DMD_HLSL}"), c"fs_dmd_flasher", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1)?;
+        let flasher_fs = self.part_shader(SCENE_HLSL, c"fs_flasher", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 2, 3)?;
+        let unshaded_fs = self.part_shader(SCENE_HLSL, c"fs_unshaded", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 3)?;
+        let dmd_flasher_fs = self.part_shader(&format!("#define DMD_SCENE\n{SCENE_HLSL}\n{DMD_HLSL}"), c"fs_dmd_flasher", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1)?;
         let dmd_backdrop_fs = self.shader(&format!("#define DMD_OVERLAY\n{OVERLAY_HLSL}\n{DMD_HLSL}"), c"dmd_backdrop_fs", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1)?;
         unsafe {
             let mut buffer: SDL_GPUVertexBufferDescription = zeroed();
@@ -1570,7 +1957,7 @@ impl Renderer {
             self.blended_depth = self.part_pipeline(&depth);
             if hdr {
                 // VPX's look: the same, with VPX's basic material
-                let vpx_fs = self.shader(MATERIAL_HLSL, c"fs_vpx", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 6, 3)?;
+                let vpx_fs = self.part_shader(MATERIAL_HLSL, c"fs_vpx", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 6, 3)?;
                 let mut vpx = info;
                 vpx.fragment_shader = vpx_fs;
                 self.vpx_blended = self.part_pipeline(&vpx);
@@ -1598,25 +1985,25 @@ impl Renderer {
                 self.vpx_opaque_no_depth = self.part_pipeline(&no_depth);
                 // a kicker's plate: VPX's material over whatever is there, at the depth of a point 30
                 // below (Kicker::Render's Z_ALWAYS, vs_basic.sc's KICKER)
-                let kicker_vs = self.shader(SCENE_HLSL, c"vs_kicker", c"vs_5_1", SDL_GPU_SHADERSTAGE_VERTEX, 0, 2)?;
+                let kicker_vs = self.part_shader(SCENE_HLSL, c"vs_kicker", c"vs_5_1", SDL_GPU_SHADERSTAGE_VERTEX, 0, 2)?;
                 let mut plate = vpx;
                 plate.vertex_shader = kicker_vs;
                 plate.depth_stencil_state.compare_op = SDL_GPU_COMPAREOP_ALWAYS;
                 self.vpx_kicker_plate = self.part_pipeline(&plate);
-                SDL_ReleaseGPUShader(self.device, kicker_vs);
-                SDL_ReleaseGPUShader(self.device, vpx_fs);
+                self.release_shader(kicker_vs);
+                self.release_shader(vpx_fs);
                 // a part drawn bent (VPX's refraction): unblended, what's behind it mixed in by
                 // its own opacity, writing depth or not as the part says
-                let refract_fs = self.shader(&format!("#define REFRACTION\n{MATERIAL_HLSL}"), c"fs_vpx", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 8, 4)?;
+                let refract_fs = self.part_shader(&format!("#define REFRACTION\n{MATERIAL_HLSL}"), c"fs_vpx", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 8, 4)?;
                 let mut refract = vpx;
                 refract.fragment_shader = refract_fs;
                 self.vpx_refract_depth = self.part_pipeline(&refract);
                 refract.depth_stencil_state.enable_depth_write = false;
                 self.vpx_refract = self.part_pipeline(&refract);
-                SDL_ReleaseGPUShader(self.device, refract_fs);
+                self.release_shader(refract_fs);
                 // a see-through part's mirror, added over it, no depth written (VPX's
                 // reflection-only pass: source alpha, one)
-                let reflection_fs = self.shader(MATERIAL_HLSL, c"fs_vpx_reflection", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 6, 2)?;
+                let reflection_fs = self.part_shader(MATERIAL_HLSL, c"fs_vpx_reflection", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 6, 2)?;
                 let mut over = color;
                 over.blend_state.enable_blend = true;
                 over.blend_state.src_color_blendfactor = SDL_GPU_BLENDFACTOR_SRC_ALPHA;
@@ -1630,12 +2017,12 @@ impl Renderer {
                 mirror_add.target_info.color_target_descriptions = &over;
                 mirror_add.depth_stencil_state.enable_depth_write = false;
                 self.vpx_mirror_add = self.part_pipeline(&mirror_add);
-                SDL_ReleaseGPUShader(self.device, reflection_fs);
+                self.release_shader(reflection_fs);
                 // the ball: solid, VPX's ball shader
-                let ball_fs = self.shader(&format!("#define BALL\n{MATERIAL_HLSL}"), c"fs_vpx_ball", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 5, 2)?;
+                let ball_fs = self.part_shader(&format!("#define BALL\n{MATERIAL_HLSL}"), c"fs_vpx_ball", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 5, 2)?;
                 vpx.fragment_shader = ball_fs;
-                self.vpx_ball = SDL_CreateGPUGraphicsPipeline(self.device, &vpx);
-                SDL_ReleaseGPUShader(self.device, ball_fs);
+                self.vpx_ball = self.twinned(&vpx);
+                self.release_shader(ball_fs);
             }
 
             let mut add = color;
@@ -1648,17 +2035,17 @@ impl Renderer {
             add.blend_state.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
             info.target_info.color_target_descriptions = &add;
             info.fragment_shader = light_fs;
-            self.glow = SDL_CreateGPUGraphicsPipeline(self.device, &info);
+            self.glow = self.twinned(&info);
             if hdr {
                 // VPX's look: a classic light with a picture of its own, added the same way, its
                 // picture lit by VPX's material (fs_classic_light.sc)
                 let classic_fs =
-                    self.shader(&format!("#define CLASSIC_LIGHT
+                    self.part_shader(&format!("#define CLASSIC_LIGHT
 {MATERIAL_HLSL}"), c"fs_vpx_classic_light", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 3, 4)?;
                 let mut classic = info;
                 classic.fragment_shader = classic_fs;
-                self.vpx_classic_light = SDL_CreateGPUGraphicsPipeline(self.device, &classic);
-                SDL_ReleaseGPUShader(self.device, classic_fs);
+                self.vpx_classic_light = self.twinned(&classic);
+                self.release_shader(classic_fs);
             }
             // bulb halos: what's below times (1 + m L), then plus (1 - m) L
             info.fragment_shader = bulb_fs;
@@ -1671,12 +2058,12 @@ impl Renderer {
             multiply.blend_state.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
             multiply.blend_state.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
             info.target_info.color_target_descriptions = &multiply;
-            self.bulb_modulate_3d = SDL_CreateGPUGraphicsPipeline(self.device, &info);
+            self.bulb_modulate_3d = self.twinned(&info);
             info.target_info.color_target_descriptions = &add;
-            self.bulb_add_3d = SDL_CreateGPUGraphicsPipeline(self.device, &info);
+            self.bulb_add_3d = self.twinned(&info);
             if hdr {
                 info.target_info.color_target_descriptions = &vpx_light;
-                self.bulb_vpx_3d = SDL_CreateGPUGraphicsPipeline(self.device, &info);
+                self.bulb_vpx_3d = self.twinned(&info);
                 // the bulb light buffer: the same, into a small picture with no depth
                 let mut light_buffer = info;
                 let mut target = vpx_light;
@@ -1687,19 +2074,19 @@ impl Renderer {
                 light_buffer.depth_stencil_state.enable_depth_test = false;
                 light_buffer.depth_stencil_state.enable_depth_write = false;
                 light_buffer.multisample_state.sample_count = SDL_GPU_SAMPLECOUNT_1;
-                self.light_buffer = SDL_CreateGPUGraphicsPipeline(self.device, &light_buffer);
+                self.light_buffer = self.twinned(&light_buffer);
             }
             // flashers: no depth written, both faces (VPX's Flasher::Render)
             info.fragment_shader = flasher_fs;
             info.target_info.color_target_descriptions = &blend;
-            self.flasher_blend = SDL_CreateGPUGraphicsPipeline(self.device, &info);
+            self.flasher_blend = self.twinned(&info);
             info.target_info.color_target_descriptions = &multiply;
-            self.flasher_modulate = SDL_CreateGPUGraphicsPipeline(self.device, &info);
+            self.flasher_modulate = self.twinned(&info);
             info.target_info.color_target_descriptions = &add;
-            self.flasher_add = SDL_CreateGPUGraphicsPipeline(self.device, &info);
+            self.flasher_add = self.twinned(&info);
             if hdr {
                 info.target_info.color_target_descriptions = &vpx_light;
-                self.flasher_vpx = SDL_CreateGPUGraphicsPipeline(self.device, &info);
+                self.flasher_vpx = self.twinned(&info);
             }
             // primitives set to add their light: unlit, no depth written (VPX's
             // Primitive::Render with m_addBlend: source alpha, one)
@@ -1713,16 +2100,16 @@ impl Renderer {
             added.blend_state.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
             info.fragment_shader = unshaded_fs;
             info.target_info.color_target_descriptions = &added;
-            self.unshaded_add = SDL_CreateGPUGraphicsPipeline(self.device, &info);
+            self.unshaded_add = self.twinned(&info);
             // flashers showing the score display: no depth written; drawn over what's below,
             // blended, or added (VPX's Flasher::Render, DMD mode: EnableAlphaBlend)
             info.fragment_shader = dmd_flasher_fs;
             info.target_info.color_target_descriptions = &flat;
-            self.dmd_opaque = SDL_CreateGPUGraphicsPipeline(self.device, &info);
+            self.dmd_opaque = self.twinned(&info);
             info.target_info.color_target_descriptions = &blend;
-            self.dmd_blend = SDL_CreateGPUGraphicsPipeline(self.device, &info);
+            self.dmd_blend = self.twinned(&info);
             info.target_info.color_target_descriptions = &added;
-            self.dmd_add = SDL_CreateGPUGraphicsPipeline(self.device, &info);
+            self.dmd_add = self.twinned(&info);
             info.target_info.color_target_descriptions = &blend;
 
             let mut obuffer: SDL_GPUVertexBufferDescription = zeroed();
@@ -1747,7 +2134,7 @@ impl Renderer {
             info.vertex_input_state.vertex_attributes = oattributes.as_ptr();
             info.depth_stencil_state.enable_depth_test = false;
             info.depth_stencil_state.enable_depth_write = false;
-            self.overlay = SDL_CreateGPUGraphicsPipeline(self.device, &info);
+            self.overlay = self.twinned(&info);
             if hdr {
                 // the readout, drawn over the tonemapped picture in the window's own colours
                 let mut post = info;
@@ -1758,18 +2145,18 @@ impl Renderer {
                 post.target_info.has_depth_stencil_target = false;
                 post.target_info.depth_stencil_format = SDL_GPU_TEXTUREFORMAT_INVALID;
                 post.multisample_state.sample_count = SDL_GPU_SAMPLECOUNT_1;
-                self.overlay_post = SDL_CreateGPUGraphicsPipeline(self.device, &post);
+                self.overlay_post = self.twinned(&post);
             }
             // pictures over the window replace what is below (no blending)
             info.fragment_shader = sfs;
             info.target_info.color_target_descriptions = &flat;
-            self.sprite = SDL_CreateGPUGraphicsPipeline(self.device, &info);
+            self.sprite = self.twinned(&info);
             // a text box showing the score display, likewise (VPX: no blending)
             info.fragment_shader = dmd_backdrop_fs;
-            self.dmd_backdrop = SDL_CreateGPUGraphicsPipeline(self.device, &info);
+            self.dmd_backdrop = self.twinned(&info);
             // classic lights on the backdrop, drawn opaque (VPX: no blending)
             info.fragment_shader = blfs;
-            self.backdrop_light = SDL_CreateGPUGraphicsPipeline(self.device, &info);
+            self.backdrop_light = self.twinned(&info);
             // bulb lights on the backdrop: what's below times (1 + m L), then plus (1 - m) L
             info.fragment_shader = bbfs;
             let mut modulate = color;
@@ -1781,19 +2168,19 @@ impl Renderer {
             modulate.blend_state.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
             modulate.blend_state.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
             info.target_info.color_target_descriptions = &modulate;
-            self.bulb_modulate = SDL_CreateGPUGraphicsPipeline(self.device, &info);
+            self.bulb_modulate = self.twinned(&info);
             info.target_info.color_target_descriptions = &add;
-            self.bulb_add = SDL_CreateGPUGraphicsPipeline(self.device, &info);
+            self.bulb_add = self.twinned(&info);
             if hdr {
                 info.target_info.color_target_descriptions = &vpx_light;
-                self.bulb_vpx = SDL_CreateGPUGraphicsPipeline(self.device, &info);
+                self.bulb_vpx = self.twinned(&info);
             }
 
             for s in [vs, fs, light_fs, bulb_fs, ovs, ofs, sfs, blfs, bbfs, flasher_fs, unshaded_fs, dmd_flasher_fs, dmd_backdrop_fs] {
-                SDL_ReleaseGPUShader(self.device, s);
+                self.release_shader(s);
             }
             if !pq_fs.is_null() {
-                SDL_ReleaseGPUShader(self.device, pq_fs);
+                self.release_shader(pq_fs);
             }
         }
         non_null(self.opaque, "create the scene pipeline")?;
@@ -1850,8 +2237,13 @@ impl Renderer {
 
     /// The tonemapping pass into a picture of `format`.
     fn tonemap_pipeline_for(&self, format: SDL_GPUTextureFormat) -> Result<*mut SDL_GPUGraphicsPipeline, String> {
+        self.tonemap_pipeline_with(format, c"tonemap_fs", 4)
+    }
+
+    /// The tonemapping pass into a picture of `format` by the fragment shader `fs`, which reads `samplers` pictures.
+    fn tonemap_pipeline_with(&self, format: SDL_GPUTextureFormat, fs: &CStr, samplers: u32) -> Result<*mut SDL_GPUGraphicsPipeline, String> {
         let vs = self.shader(TONEMAP_HLSL, c"tonemap_vs", c"vs_5_1", SDL_GPU_SHADERSTAGE_VERTEX, 0, 0)?;
-        let fs = match self.shader(TONEMAP_HLSL, c"tonemap_fs", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 4, 1) {
+        let fs = match self.shader(TONEMAP_HLSL, fs, c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, samplers, 1) {
             Ok(fs) => fs,
             Err(e) => {
                 unsafe { SDL_ReleaseGPUShader(self.device, vs) };
@@ -2401,7 +2793,7 @@ impl Renderer {
         self.hdr_target = null_mut();
         self.bloom = [null_mut(); 2];
         unsafe {
-            for t in self.mirror_textures.drain(..).chain([self.prev_hdr, self.mirror_blur, self.refraction_blur]) {
+            for t in self.mirror_textures.drain(..).chain([self.prev_hdr, self.mirror_blur, self.refraction_blur]).chain(self.right_eye_hdr) {
                 if !t.is_null() {
                     SDL_ReleaseGPUTexture(self.device, t);
                 }
@@ -2415,11 +2807,13 @@ impl Renderer {
         self.refraction_blur = null_mut();
         self.prev_hdr = null_mut();
         self.prev_valid.set(false);
+        self.right_eye_hdr = [null_mut(); 2];
+        self.eye_prev_valid = [false; 2];
         self.msaa = self.texture(self.scene_format, SDL_GPU_TEXTUREUSAGE_COLOR_TARGET, width, height, 1, self.samples)?;
         // a refraction's copy reads the depth (only without multisampling: SDL can't read a multisampled one)
         let single = self.samples == SDL_GPU_SAMPLECOUNT_1;
         // and the post-processing passes read it, to leave what isn't the table untouched
-        let read_depth = if single && (refracted.iter().any(|&r| r) || self.post_reads_depth() || self.ao_mode() == 2 || self.motion_blur_on()) {
+        let read_depth = if single && (refracted.iter().any(|&r| r) || self.post_reads_depth() || self.ao_mode() == 2 || self.motion_blur_on() || !self.environment_alpha.is_null()) {
             SDL_GPU_TEXTUREUSAGE_SAMPLER
         } else {
             SDL_GPUTextureUsageFlags(0)
@@ -2430,6 +2824,11 @@ impl Renderer {
             self.hdr_target = self.texture(HDR_FORMAT, usage, width, height, 1, SDL_GPU_SAMPLECOUNT_1)?;
             // the previous frame's picture, for the ball's mirror of the playfield (VPX swaps two)
             self.prev_hdr = self.texture(HDR_FORMAT, usage, width, height, 1, SDL_GPU_SAMPLECOUNT_1)?;
+            if self.headset {
+                for k in 0..2 {
+                    self.right_eye_hdr[k] = self.texture(HDR_FORMAT, usage, width, height, 1, SDL_GPU_SAMPLECOUNT_1)?;
+                }
+            }
             // VPX's bloom pictures, a quarter of the window across and down, which also hold
             // the bulb light buffer while the table is drawn
             let (bw, bh) = ((out_width / 4).max(1), (out_height / 4).max(1));
@@ -2570,6 +2969,11 @@ impl Renderer {
 
     /// The window's size in pixels, as the swapchain will be.
     pub fn window_size(&self) -> (u32, u32) {
+        // a headset's: the part of each eye drawn last (the pause menu is laid out for it)
+        if self.headset {
+            let (w, h) = self.eye_drawn.get();
+            return (w.max(1), h.max(1));
+        }
         let (mut w, mut h) = (0, 0);
         unsafe { SDL_GetWindowSizeInPixels(self.window, &mut w, &mut h) };
         (w.max(1) as u32, h.max(1) as u32)
@@ -3076,7 +3480,7 @@ impl Renderer {
     /// Copies the table as drawn so far, its picture and depth, into a
     /// refraction probe's (VPX's `BlitRenderTarget` of both), by one triangle
     /// as the still parts' are drawn back.
-    unsafe fn copy_for_refraction(&self, command: *mut SDL_GPUCommandBuffer, color: *mut SDL_GPUTexture, depth: *mut SDL_GPUTexture, r: usize) {
+    unsafe fn copy_for_refraction(&self, command: *mut SDL_GPUCommandBuffer, color: *mut SDL_GPUTexture, depth: *mut SDL_GPUTexture, r: usize, part: (u32, u32)) {
         unsafe {
             let mut target: SDL_GPUColorTargetInfo = zeroed();
             target.texture = self.refraction_textures[r];
@@ -3089,6 +3493,7 @@ impl Renderer {
             depth_target.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
             depth_target.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
             let pass = SDL_BeginGPURenderPass(command, &target, 1, &depth_target);
+            Self::picture_part(pass, part, self.target_size);
             SDL_BindGPUGraphicsPipeline(pass, self.refraction_copy);
             let bindings = [
                 SDL_GPUTextureSamplerBinding { texture: color, sampler: self.font_sampler },
@@ -3446,6 +3851,12 @@ impl Renderer {
             let (rw, rh) = self.render_size(width, height);
             let (w, h) = (rw as f32, rh as f32);
             let (out_w, out_h) = (width as f32, height as f32);
+            // the size the pictures are made at: a headset's eye at full size, of which the top left `rw` x `rh`
+            // is drawn (VR's dynamic resolution); texels are read through it
+            let made = self.target_size;
+            let (mw, mh) = (made.0 as f32, made.1 as f32);
+            let made_out = if self.headset { self.eye_made.get() } else { (width, height) };
+            let bloom_part = ((width / 4).clamp(1, self.bloom_size.0.max(1)), (height / 4).clamp(1, self.bloom_size.1.max(1)));
             // the nudge shake moves the flat pictures with the table; with the still parts drawn
             // once, the whole picture moves at the end instead, as VPX moves it
             let offset = if stage == Stage::Full { input.screen_offset } else { [0.0; 2] };
@@ -3662,9 +4073,48 @@ impl Renderer {
                     .or_else(|| draw.part.and_then(|p| input.part_render.get(p as usize)).and_then(|r| r.transform))
                     .unwrap_or(Mat4::IDENTITY)
             };
+            // VR: the parts out of this eye's sight left out of its passes (each pass by its own view,
+            // the mirrors' mirrored), by their bounding spheres moved as they're drawn; VPX has no such
+            // culling, but its parts out of sight draw nothing either
+            let main_planes = (self.headset && self.cull && !self.draw_bounds.is_empty()).then(|| frustum_planes(&view_proj));
+            let in_view = |draw: &crate::scene::Draw, planes: Option<&[[f32; 4]]>| -> bool {
+                let Some(planes) = planes else { return true };
+                // (`draw` is one of the scene's draws)
+                let k = (draw as *const crate::scene::Draw).offset_from(self.scene.draws.as_ptr());
+                let Some(&Some((c, r))) = usize::try_from(k).ok().and_then(|k| self.draw_bounds.get(k)) else { return true };
+                let m = model_of(draw);
+                let scale = (0..3).map(|i| (m.m[i][0] * m.m[i][0] + m.m[i][1] * m.m[i][1] + m.m[i][2] * m.m[i][2]).sqrt()).fold(0.0f32, f32::max);
+                let at = m.transform_no_perspective(c);
+                planes.iter().all(|p| p[0] * at.x + p[1] * at.y + p[2] * at.z + p[3] >= -r * scale)
+            };
+            let seen = |draw: &crate::scene::Draw| in_view(draw, main_planes.as_ref().map(|p| p.as_slice()));
+            // a part's bounding box on screen (x, y from -1 to 1, the least then the most); None when it
+            // has no bounds (VR's alone have them; moving parts none) or reaches behind the eye
+            let screen_box = |draw: &crate::scene::Draw| -> Option<[f32; 4]> {
+                let k = (draw as *const crate::scene::Draw).offset_from(self.scene.draws.as_ptr());
+                let &Some((c, r)) = usize::try_from(k).ok().and_then(|k| self.draw_bounds.get(k))? else { return None };
+                let m = model_of(draw);
+                let r = r * (0..3).map(|i| (m.m[i][0] * m.m[i][0] + m.m[i][1] * m.m[i][1] + m.m[i][2] * m.m[i][2]).sqrt()).fold(0.0f32, f32::max);
+                let at = m.transform_no_perspective(c);
+                let mut b = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+                for corner in 0..8 {
+                    let side = |bit: u32| if corner & bit != 0 { r } else { -r };
+                    let [x, y] = on_screen(&view_proj, Vec3::new(at.x + side(1), at.y + side(2), at.z + side(4)))?;
+                    b = [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)];
+                }
+                Some(b)
+            };
+
             // a wall's sides keep the table's setting (or the script's SideVisible); everything
             // else follows the part's Visible
             let shown = |draw: &crate::scene::Draw| {
+                // VR with passthrough: the table's room left out, the real one around the cabinet
+                if !self.room.is_empty() {
+                    let k = (draw as *const crate::scene::Draw).offset_from(self.scene.draws.as_ptr());
+                    if usize::try_from(k).ok().and_then(|k| self.room.get(k)).is_some_and(|&room| room) {
+                        return false;
+                    }
+                }
                 let render = draw.part.and_then(|p| input.part_render.get(p as usize));
                 // a light's bulb and socket, while its ShowBulbMesh is off
                 if draw.bulb_piece.is_some() && render.and_then(|r| r.light_live).is_some_and(|l| !l.bulb_mesh) {
@@ -3780,8 +4230,8 @@ impl Renderer {
                         area = Some(area.map_or([x0, y0, x1, y1], |a| [a[0].min(x0), a[1].min(y0), a[2].max(x1), a[3].max(y1)]));
                     }
                 }
-                // the area as a scissor on the light buffer, pixels from the top; None when it's empty
-                let (bw, bh) = self.bloom_size;
+                // the area as a scissor on the light buffer's part drawn, pixels from the top; None when it's empty
+                let (bw, bh) = bloom_part;
                 let scissor = |a: [f32; 4]| {
                     let at = |v: f32, size: u32| (((0.5 + v * 0.5) * size as f32) as i32).clamp(0, size as i32);
                     let (left, bottom, right, top) = (at(a[0], bw), at(a[1], bh), at(a[2], bw), at(a[3], bh));
@@ -3792,16 +4242,17 @@ impl Renderer {
                 target.load_op = SDL_GPU_LOADOP_CLEAR;
                 target.store_op = SDL_GPU_STOREOP_STORE;
                 let below = SDL_BeginGPURenderPass(command, &target, 1, null());
+                Self::picture_part(below, bloom_part, self.bloom_size);
                 // (VPX skips a pass whose area is empty)
                 let drawn = area.is_none_or(|a| scissor(a).is_some());
                 if let Some(rect) = area.and_then(scissor) {
                     SDL_SetGPUScissor(below, &rect);
                 }
                 if !lit.is_empty() && drawn {
-                    SDL_BindGPUGraphicsPipeline(below, self.light_buffer);
+                    self.bind_pipeline(below, self.light_buffer);
                     SDL_BindGPUVertexBuffers(below, 0, &vb, 1);
                     SDL_BindGPUIndexBuffer(below, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
-                    SDL_PushGPUVertexUniformData(command, 0, (&raw const frame).cast(), size_of::<FrameUniforms>() as u32);
+                    self.push_frame(command, &frame);
                     let binding = SDL_GPUTextureSamplerBinding { texture: self.white, sampler: self.sampler };
                     SDL_BindGPUFragmentSamplers(below, 0, &binding, 1);
                     for &(draw, l) in &lit {
@@ -3821,7 +4272,7 @@ impl Renderer {
                             static_color_alpha: [1.0; 4],
                         };
                         SDL_PushGPUFragmentUniformData(command, 0, (&raw const uniforms).cast(), size_of::<MaterialUniforms>() as u32);
-                        SDL_DrawGPUIndexedPrimitives(below, draw.index_count, 1, draw.first_index, draw.base_vertex, 0);
+                        SDL_DrawGPUIndexedPrimitives(below, self.test_count(draw.index_count), 1, draw.first_index, draw.base_vertex, 0);
                     }
                 }
                 SDL_EndGPURenderPass(below);
@@ -3833,7 +4284,7 @@ impl Renderer {
                     }
                 }
                 if !lit.is_empty() {
-                    let small = [1.0 / bw as f32, 1.0 / bh as f32, 1.0, 0.0];
+                    let small = [1.0 / self.bloom_size.0 as f32, 1.0 / self.bloom_size.1 as f32, 1.0, 0.0];
                     let blur_rect = area.map(|a| scissor([a[0] - 0.05, a[1] - 0.05, a[2] + 0.05, a[3] + 0.05]));
                     for (pipeline, source, dest) in [(self.blur19_h, self.bloom[0], self.bloom[1]), (self.blur19_v, self.bloom[1], self.bloom[0])] {
                         // (VPX skips a pass whose area is empty)
@@ -3845,10 +4296,11 @@ impl Renderer {
                         target.load_op = if blur_rect.is_some() { SDL_GPU_LOADOP_LOAD } else { SDL_GPU_LOADOP_DONT_CARE };
                         target.store_op = SDL_GPU_STOREOP_STORE;
                         let blur = SDL_BeginGPURenderPass(command, &target, 1, null());
+                        Self::picture_part(blur, bloom_part, self.bloom_size);
                         if let Some(Some(rect)) = blur_rect {
                             SDL_SetGPUScissor(blur, &rect);
                         }
-                        SDL_BindGPUGraphicsPipeline(blur, pipeline);
+                        self.bind_pipeline(blur, pipeline);
                         let binding = SDL_GPUTextureSamplerBinding { texture: source, sampler: self.flat_sampler };
                         SDL_BindGPUFragmentSamplers(blur, 0, &binding, 1);
                         SDL_PushGPUFragmentUniformData(command, 0, small.as_ptr().cast(), 16);
@@ -3863,6 +4315,17 @@ impl Renderer {
             let lights = ([l0.x, l0.y, l0.z, 1.0], [l1.x, l1.y, l1.z, 1.0]);
             // VPX's look: solid parts mark their pixels for tonemapping
             let solid = if self.hdr { 1.0 } else { 0.0 };
+            if self.headset {
+                // for the log: the eye's triangles, and those left out
+                let (mut all, mut out) = (0u64, 0u64);
+                for d in self.scene.draws.iter().filter(|d| shown(d)) {
+                    all += u64::from(d.index_count / 3);
+                    if !seen(d) {
+                        out += u64::from(d.index_count / 3);
+                    }
+                }
+                self.triangles.set((all, out, 0));
+            }
             let mesh_look = |draw: &crate::scene::Draw| self.mesh_look(draw, input);
             // VPX's look: the mirrors drawn this frame (VPX draws a reflection probe when a part
             // showing it is drawn): those a shown part shows, mirroring something
@@ -3971,7 +4434,7 @@ impl Renderer {
                     let binding = SDL_GPUTextureSamplerBinding { texture: look.texture, sampler: part_sampler };
                     SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
                 }
-                SDL_DrawGPUIndexedPrimitives(pass, draw.index_count, 1, draw.first_index, draw.base_vertex, 0);
+                SDL_DrawGPUIndexedPrimitives(pass, self.test_count(draw.index_count), 1, draw.first_index, draw.base_vertex, 0);
             };
             // VPX's look: the table's light for its material, once a frame, with or without the
             // bulb light buffer's light from below
@@ -3980,13 +4443,13 @@ impl Renderer {
                     let [l0, l1] = self.scene.lights;
                     let e = self.tone.light_emission;
                     let light = VpxSceneUniforms {
-                        env_emission_height: [self.tone.env_emission, self.env_height, 0.0, 0.0],
+                        env_emission_height: [self.tone.env_emission, self.env_height, if self.specular_aa { 1.0 } else { 0.0 }, 0.0],
                         // VPX 5436 sets these for its ball shader only: the basic shader's stay zero, so
                         // the point lights add nothing to parts (measured: VPX's pictures match this)
                         ambient_range: [0.0; 4],
                         light_pos: [[l0.x, l0.y, l0.z, 1.0], [l1.x, l1.y, l1.z, 1.0]],
                         light_emission: [[e[0], e[1], e[2], 1.0]; 2],
-                        w_h_transmission: [1.0 / w, 1.0 / h, if transmission && lit_below { 1.0 } else { 0.0 }, 0.0],
+                        w_h_transmission: [1.0 / mw, 1.0 / mh, if transmission && lit_below { 1.0 } else { 0.0 }, 0.0],
                         view_rows: [0, 1, 2].map(|i| [view.m[i][0], view.m[i][1], view.m[i][2], 0.0]),
                     };
                     SDL_PushGPUFragmentUniformData(command, 1, (&raw const light).cast(), size_of::<VpxSceneUniforms>() as u32);
@@ -4007,7 +4470,7 @@ impl Renderer {
                 if balls.is_empty() {
                     return;
                 }
-                SDL_BindGPUGraphicsPipeline(pass, self.vpx_ball);
+                self.bind_pipeline(pass, self.vpx_ball);
                 SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
                 SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
                 let prev = self.prev_valid.get();
@@ -4083,7 +4546,7 @@ impl Renderer {
                     };
                     SDL_PushGPUVertexUniformData(command, 1, (&raw const model.m).cast(), 64);
                     SDL_PushGPUFragmentUniformData(command, 0, (&raw const uniforms).cast(), size_of::<VpxBallUniforms>() as u32);
-                    SDL_DrawGPUIndexedPrimitives(pass, ball_count, 1, ball_first, ball_base, 0);
+                    SDL_DrawGPUIndexedPrimitives(pass, self.test_count(ball_count), 1, ball_first, ball_base, 0);
                 }
             };
             // see-through parts and flashers in VPX's order; in the main picture, a see-through
@@ -4095,7 +4558,7 @@ impl Renderer {
             let split_for = |pass: *mut SDL_GPURenderPass, r: usize| -> *mut SDL_GPURenderPass {
                 SDL_EndGPURenderPass(pass);
                 if self.samples == SDL_GPU_SAMPLECOUNT_1 {
-                    self.copy_for_refraction(command, color.texture, main_depth.texture, r);
+                    self.copy_for_refraction(command, color.texture, main_depth.texture, r, (rw, rh));
                 } else {
                     // multisampled: the picture as resolved when the pass stopped (its depth can't be read)
                     let copy = SDL_BeginGPUCopyPass(command);
@@ -4108,14 +4571,15 @@ impl Renderer {
                 }
                 if let (Some(size), false) = (refraction_blur(self.scene.refractions[r].roughness), self.refraction_blur.is_null()) {
                     let kernel = KernelUniforms::vpx(size);
-                    let texel = [1.0 / w, 1.0 / h, 0.0, 0.0];
+                    let texel = [1.0 / mw, 1.0 / mh, 0.0, 0.0];
                     for (pipeline, source, dest) in [(self.blur_kernel_h, self.refraction_textures[r], self.refraction_blur), (self.blur_kernel_v, self.refraction_blur, self.refraction_textures[r])] {
                         let mut target: SDL_GPUColorTargetInfo = zeroed();
                         target.texture = dest;
                         target.load_op = SDL_GPU_LOADOP_DONT_CARE;
                         target.store_op = SDL_GPU_STOREOP_STORE;
                         let blur = SDL_BeginGPURenderPass(command, &target, 1, null());
-                        SDL_BindGPUGraphicsPipeline(blur, pipeline);
+                        Self::picture_part(blur, (rw, rh), made);
+                        self.bind_pipeline(blur, pipeline);
                         let binding = SDL_GPUTextureSamplerBinding { texture: source, sampler: self.flat_sampler };
                         SDL_BindGPUFragmentSamplers(blur, 0, &binding, 1);
                         SDL_PushGPUFragmentUniformData(command, 0, texel.as_ptr().cast(), 16);
@@ -4131,6 +4595,7 @@ impl Renderer {
                 again_depth.load_op = SDL_GPU_LOADOP_LOAD;
                 again_depth.cycle = false;
                 let pass = SDL_BeginGPURenderPass(command, &again, 1, &again_depth);
+                Self::picture_part(pass, (rw, rh), made);
                 // the table's light for VPX's material, pushed again for the passes after
                 scene_light(true, &input.view);
                 pass
@@ -4142,7 +4607,7 @@ impl Renderer {
                 let uniforms = RefractionUniforms {
                     view_proj: view_proj.m,
                     tint_thickness: [t[0], t[1], t[2], draw.refraction_thickness],
-                    flags: [if self.refraction_depths[r].is_null() { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+                    flags: [if self.refraction_depths[r].is_null() { 1.0 } else { 0.0 }, rw as f32 / mw, rh as f32 / mh, 0.0],
                 };
                 SDL_PushGPUFragmentUniformData(command, 3, (&raw const uniforms).cast(), size_of::<RefractionUniforms>() as u32);
                 let depth = if self.refraction_depths[r].is_null() { self.white } else { self.refraction_depths[r] };
@@ -4223,13 +4688,30 @@ impl Renderer {
             // pass of its own
             let draw_solid = |pass: *mut SDL_GPURenderPass, solids: &mut Vec<(i32, f32, &crate::scene::Draw, MeshLook)>, main: bool| {
                 solids.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.total_cmp(&b.1)).then(a.2.part.unwrap_or(u32::MAX).cmp(&b.2.part.unwrap_or(u32::MAX))));
+                if main && self.debug_order.get() == 1 && self.frames_drawn.get() >= 200 {
+                    self.debug_order.set(2);
+                    for (i, (t, key, draw, look)) in solids.iter().enumerate() {
+                        println!(
+                            "draw order {i}: technique {t} key {key:.1} part {:?} material {} image {:?} blend {} added {} depth_mask {} textured {} cutoff {:.2} opacity_active {:?}",
+                            draw.part,
+                            draw.material,
+                            self.scene.materials[draw.material].image,
+                            look.blend,
+                            look.added,
+                            draw.depth_mask,
+                            look.textured,
+                            look.alpha_cutoff,
+                            look.opacity_active
+                        );
+                    }
+                }
                 let mut bound: *mut SDL_GPUGraphicsPipeline = null_mut();
                 for (_, _, draw, look) in solids.iter() {
                     let (modes, passes) = culls(draw, look, !main);
                     for &mode in &modes[..passes] {
                         let pipeline = culled(pipeline_of(draw, look), mode);
                         if bound != pipeline {
-                            SDL_BindGPUGraphicsPipeline(pass, pipeline);
+                            self.bind_pipeline(pass, pipeline);
                             SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
                             SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
                             bound = pipeline;
@@ -4242,7 +4724,7 @@ impl Renderer {
                                 && let Some(mirror) = mirror
                             {
                                 let add = culled(self.vpx_mirror_add, mode);
-                                SDL_BindGPUGraphicsPipeline(pass, add);
+                                self.bind_pipeline(pass, add);
                                 bound = add;
                                 draw_one(pass, draw, look, &model, Some(mirror));
                             }
@@ -4274,7 +4756,7 @@ impl Renderer {
                 SDL_PushGPUFragmentUniformData(command, 0, (&raw const uniforms).cast(), size_of::<MaterialUniforms>() as u32);
                 let binding = SDL_GPUTextureSamplerBinding { texture: self.white, sampler: self.sampler };
                 SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
-                SDL_DrawGPUIndexedPrimitives(pass, draw.index_count, 1, draw.first_index, draw.base_vertex, 0);
+                SDL_DrawGPUIndexedPrimitives(pass, self.test_count(draw.index_count), 1, draw.first_index, draw.base_vertex, 0);
             };
             // VPX's look: a classic light with a picture of its own (light.cpp's light_with_texture,
             // fs_classic_light.sc): the picture lit as what the light sits on is, its glow added and
@@ -4317,7 +4799,7 @@ impl Renderer {
                     SDL_GPUTextureSamplerBinding { texture: self.irradiance, sampler: self.env_sampler },
                 ];
                 SDL_BindGPUFragmentSamplers(pass, 0, bindings.as_ptr(), 3);
-                SDL_DrawGPUIndexedPrimitives(pass, draw.index_count, 1, draw.first_index, draw.base_vertex, 0);
+                SDL_DrawGPUIndexedPrimitives(pass, self.test_count(draw.index_count), 1, draw.first_index, draw.base_vertex, 0);
             };
             // VPX leaves out a classic light with a picture of its own only when its picture is what it
             // sits on, it isn't in image mode, and it gives no light (`Light::Render`'s early out)
@@ -4332,7 +4814,7 @@ impl Renderer {
                 let bind = |pipeline: *mut SDL_GPUGraphicsPipeline| {
                     if bound.get() != pipeline {
                         let pass = pass_now.get();
-                        SDL_BindGPUGraphicsPipeline(pass, pipeline);
+                        self.bind_pipeline(pass, pipeline);
                         SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
                         SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
                         bound.set(pipeline);
@@ -4416,7 +4898,7 @@ impl Renderer {
                                 };
                                 SDL_PushGPUFragmentUniformData(command, 0, (&raw const uniforms).cast(), size_of::<MaterialUniforms>() as u32);
                                 SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
-                                SDL_DrawGPUIndexedPrimitives(pass, draw.index_count, 1, draw.first_index, draw.base_vertex, 0);
+                                SDL_DrawGPUIndexedPrimitives(pass, self.test_count(draw.index_count), 1, draw.first_index, draw.base_vertex, 0);
                             }
                         }
                         Transparent::MirrorOnly(draw, look, mirror) => {
@@ -4469,7 +4951,7 @@ impl Renderer {
                             SDL_PushGPUFragmentUniformData(command, 0, (&raw const uniforms).cast(), size_of::<MaterialUniforms>() as u32);
                             let binding = SDL_GPUTextureSamplerBinding { texture: self.white, sampler: self.sampler };
                             SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
-                            SDL_DrawGPUIndexedPrimitives(pass, draw.index_count, 1, draw.first_index, draw.base_vertex, 0);
+                            SDL_DrawGPUIndexedPrimitives(pass, self.test_count(draw.index_count), 1, draw.first_index, draw.base_vertex, 0);
                         }
                         Transparent::Flasher(f, now) => {
                             shadow(f.lightmap);
@@ -4487,7 +4969,7 @@ impl Renderer {
                                 let u = FlasherUniforms { term: [term, 0.0, 0.0, 0.0], ..uniforms };
                                 SDL_PushGPUFragmentUniformData(command, 0, (&raw const u).cast(), size_of::<FlasherUniforms>() as u32);
                                 SDL_BindGPUFragmentSamplers(pass, 0, bindings.as_ptr(), 2);
-                                SDL_DrawGPUIndexedPrimitives(pass, f.index_count, 1, f.first_index, f.base_vertex, 0);
+                                SDL_DrawGPUIndexedPrimitives(pass, self.test_count(f.index_count), 1, f.first_index, f.base_vertex, 0);
                             }
                         }
                         Transparent::DmdFlasher(f, now) => {
@@ -4509,21 +4991,45 @@ impl Renderer {
                             SDL_PushGPUFragmentUniformData(command, 0, (&raw const uniforms).cast(), size_of::<DmdUniforms>() as u32);
                             let binding = SDL_GPUTextureSamplerBinding { texture: self.dmd_texture, sampler: self.font_sampler };
                             SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
-                            SDL_DrawGPUIndexedPrimitives(pass, f.index_count, 1, f.first_index, f.base_vertex, 0);
+                            SDL_DrawGPUIndexedPrimitives(pass, self.test_count(f.index_count), 1, f.first_index, f.base_vertex, 0);
                         }
                     }
                 }
                 pass_now.get()
             };
 
+            // VR's foveation: the scene's passes at the eye's size take its shading rate image, from
+            // the first mirror to the end of the main picture (none of another size between)
+            set_shading_rate(command, self.rate_now.get());
             // VPX's look: the mirrors, first (RenderProbe::RenderReflectionProbe): the table drawn
             // again from the camera mirrored through each mirror's plane, keeping what's above it,
             // into the mirror's picture; lit as the table is, so the mirrored camera only changes
             // where it's seen from. The main picture's multisampled buffers serve, cleared after
+            let mut mirrored_triangles = 0u64;
             for (k, mirror) in self.scene.mirrors.iter().enumerate() {
                 if !rendered[k] {
                     continue;
                 }
+                // VPX's area of interest (RenderProbe::ApplyAreaOfInterest): in VR, the mirror drawn only
+                // over the screen's bounds of the parts in sight that show it, each part's bounding box;
+                // all of it when one of them has none (a moving part) or reaches behind the eye
+                let area = if self.headset && stage == Stage::Full && !self.no_mirror_area {
+                    let showing = self.scene.draws.iter().filter(|d| shown(d) && seen(d) && mirror_of(d).is_some_and(|(m, _)| m == k));
+                    showing.map(screen_box).try_fold(None, |acc: Option<[f32; 4]>, b| {
+                        let b = b?;
+                        Some(Some(acc.map_or(b, |a| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])])))
+                    })
+                    .flatten()
+                } else {
+                    None
+                };
+                // as a scissor on the part of the pictures drawn, pixels from the top (one pixel at least)
+                let area_rect = area.map(|a| {
+                    let at = |v: f32, size: u32| (((0.5 + v * 0.5) * size as f32) as i32).clamp(0, size as i32);
+                    let (left, right) = (at(a[0], rw), (at(a[2], rw) + 1).min(rw as i32));
+                    let (top, bottom) = (rh as i32 - (at(a[3], rh) + 1).min(rh as i32), rh as i32 - at(a[1], rh));
+                    SDL_Rect { x: left, y: top, w: (right - left).max(1), h: (bottom - top).max(1) }
+                });
                 let [x, y, z, d] = mirror.plane;
                 let len = (x * x + y * y + z * z).sqrt();
                 if len == 0.0 {
@@ -4532,7 +5038,27 @@ impl Renderer {
                 let n = Vec3::new(x / len, y / len, z / len);
                 let reflect = Mat4::plane_reflection(n, d);
                 let eye = reflect.transform_no_perspective(input.eye);
-                let mirrored = frame_for(reflect * input.view, eye, [n.x, n.y, n.z, d]);
+                // what's below the mirror cut away by the projection's near plane laid on it (oblique_near),
+                // else (the eye on the mirror's far side) by the parts' clipping twins
+                let mirror_view = reflect * input.view;
+                let mirrored = {
+                    let rotation = mirror_view.rotation_part();
+                    let camera = mirror_view.inverse().position();
+                    // the plane less the camera's place, then in the view's space (the points' turn undone)
+                    let relative = [n.x, n.y, n.z, n.x * camera.x + n.y * camera.y + n.z * camera.z + d];
+                    let undo = rotation.inverse();
+                    let in_view: [f32; 4] = std::array::from_fn(|j| (0..4).map(|i| undo.m[j][i] * relative[i]).sum());
+                    match oblique_near(&(input.projection * post), in_view).filter(|_| !self.no_oblique) {
+                        Some(projection) => {
+                            self.mirroring.set(false);
+                            FrameUniforms { rot_view_proj: (rotation * projection).m, camera: [camera.x, camera.y, camera.z, 0.0], eye: [eye.x, eye.y, eye.z, 1.0], clip: [0.0, 0.0, 0.0, 1.0] }
+                        }
+                        None => {
+                            self.mirroring.set(true);
+                            frame_for(mirror_view, eye, [n.x, n.y, n.z, d])
+                        }
+                    }
+                };
                 // what VPX's reflection mode mirrors: balls, parts that never move, every part; with the
                 // still parts drawn once, the still ones in their passes and the rest each frame
                 let mode = self.reflection_mode(k);
@@ -4564,10 +5090,14 @@ impl Renderer {
                     mirror_depth.load_op = SDL_GPU_LOADOP_LOAD;
                 }
                 let mpass = SDL_BeginGPURenderPass(command, &target, 1, &mirror_depth);
+                Self::picture_part(mpass, (rw, rh), made);
+                if let Some(rect) = area_rect {
+                    SDL_SetGPUScissor(mpass, &rect);
+                }
                 if let (Stage::Moving, 5, Some(s)) = (stage, mode, still) {
                     self.restore_still(mpass, s.mirror_color[k], s.mirror_depth[k]);
                 }
-                SDL_PushGPUVertexUniformData(command, 0, (&raw const mirrored).cast(), size_of::<FrameUniforms>() as u32);
+                self.push_frame(command, &mirrored);
                 // no light from below in a mirror: VPX's playfield mirror leaves lights out (PinTable's
                 // load sets it so), so its own bulb light buffer pass draws none and binds its black
                 // null picture (Light::Render with DISABLE_LIGHTMAPS, DrawBulbLightBuffer); a mirror
@@ -4578,8 +5108,20 @@ impl Renderer {
                 let mut see_through: Vec<(f32, Transparent)> = Vec::new();
                 // the parts drawn into mirrors: not a part showing this mirror (VPX: no self
                 // reflection), nor lights' glows (light maps, which the playfield's leaves out)
+                // and what lies wholly behind the mirror (under the playfield: the cabinet, its legs, the room's
+                // floor), which its plane would only cut away after each vertex had been shaded
+                // (within the mirror's area of interest, when it has one: its scissor shows nothing else)
+                let mirror_planes = main_planes.map(|_| {
+                    let within = area.filter(|_| !self.no_mirror_cull).unwrap_or([-1.0, -1.0, 1.0, 1.0]);
+                    let mut planes = frustum_planes_within(&(reflect * view_proj), within).to_vec();
+                    if !self.no_mirror_cull {
+                        planes.push([n.x, n.y, n.z, d]);
+                    }
+                    planes
+                });
                 let reflected = |d: &&crate::scene::Draw| {
                     parts
+                        && in_view(d, mirror_planes.as_deref())
                         && self.reflected_now(d, input)
                         && shown(d)
                         && drawn_now(d)
@@ -4592,6 +5134,7 @@ impl Renderer {
                     if look.skip {
                         continue;
                     }
+                    mirrored_triangles += u64::from(draw.index_count / 3);
                     // VPX's DrawMesh, in a reflection pass: by the depth bias plus the height
                     let at = model_of(draw).transform_no_perspective(draw.sort_point);
                     let key = self.depth_bias_now(draw, input) + at.z;
@@ -4616,14 +5159,18 @@ impl Renderer {
                 if let (Some((size, half)), false, false) = (mirror_blur(mirror.roughness), self.mirror_blur.is_null(), prerender) {
                     let kernel = KernelUniforms::vpx(size);
                     let reach = if half { 2.0 } else { 1.0 };
-                    let texel = [reach / w, reach / h, 0.0, 0.0];
+                    let texel = [reach / mw, reach / mh, 0.0, 0.0];
                     for (pipeline, source, dest) in [(self.blur_kernel_h, self.mirror_textures[k], self.mirror_blur), (self.blur_kernel_v, self.mirror_blur, self.mirror_textures[k])] {
                         let mut target: SDL_GPUColorTargetInfo = zeroed();
                         target.texture = dest;
                         target.load_op = SDL_GPU_LOADOP_DONT_CARE;
                         target.store_op = SDL_GPU_STOREOP_STORE;
                         let blur = SDL_BeginGPURenderPass(command, &target, 1, null());
-                        SDL_BindGPUGraphicsPipeline(blur, pipeline);
+                        Self::picture_part(blur, (rw, rh), made);
+                        if let Some(rect) = area_rect {
+                            SDL_SetGPUScissor(blur, &rect);
+                        }
+                        self.bind_pipeline(blur, pipeline);
                         let binding = SDL_GPUTextureSamplerBinding { texture: source, sampler: self.flat_sampler };
                         SDL_BindGPUFragmentSamplers(blur, 0, &binding, 1);
                         SDL_PushGPUFragmentUniformData(command, 0, texel.as_ptr().cast(), 16);
@@ -4634,11 +5181,17 @@ impl Renderer {
                 }
             }
 
+            self.mirroring.set(false);
+            if self.headset {
+                let (all, out, _) = self.triangles.get();
+                self.triangles.set((all, out, mirrored_triangles));
+            }
             // multisampled, the still parts' depth copied over first (the pass loads it)
             if let (Stage::Moving, Some(s), false) = (stage, still, self.samples == SDL_GPU_SAMPLECOUNT_1) {
                 self.copy_still_depth(command, s.depth, rw, rh);
             }
             let mut pass = SDL_BeginGPURenderPass(command, &color, 1, &main_depth);
+            Self::picture_part(pass, (rw, rh), made);
             if let (Stage::Moving, Some(s)) = (stage, still) {
                 self.restore_still(pass, s.color, s.depth);
             }
@@ -4652,14 +5205,14 @@ impl Renderer {
                 && first + 6 <= overlay_count as u32
                 && stage != Stage::Moving
             {
-                SDL_BindGPUGraphicsPipeline(pass, self.sprite);
+                self.bind_pipeline(pass, self.sprite);
                 SDL_BindGPUVertexBuffers(pass, 0, &ob, 1);
                 SDL_PushGPUVertexUniformData(command, 0, (&raw const screen).cast(), 16);
                 let binding = SDL_GPUTextureSamplerBinding { texture, sampler: backdrop_sampler };
                 SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
                 SDL_DrawGPUPrimitives(pass, 6, 1, first, 0);
             }
-            SDL_PushGPUVertexUniformData(command, 0, (&raw const frame).cast(), size_of::<FrameUniforms>() as u32);
+            self.push_frame(command, &frame);
             let mut transparent: Vec<(f32, Transparent)> = Vec::new();
 
             // the playfield before everything else, blended or not, as VPX draws it (its depth bias
@@ -4667,7 +5220,7 @@ impl Renderer {
             // parts until 10.8.0", PinTable's load; RenderPass::SortCommands); a blended one gets
             // its mirror in a pass of its own
             scene_light(true, &input.view);
-            for draw in self.scene.draws.iter().filter(|d| d.playfield && shown(d) && (drawn_now(d) || stage == Stage::Moving)) {
+            for draw in self.scene.draws.iter().filter(|d| d.playfield && shown(d) && seen(d) && (drawn_now(d) || stage == Stage::Moving)) {
                 let look = mesh_look(draw);
                 if look.skip {
                     continue;
@@ -4678,7 +5231,7 @@ impl Renderer {
                 }
                 let (modes, passes) = culls(draw, &look, false);
                 for &mode in &modes[..passes] {
-                    SDL_BindGPUGraphicsPipeline(pass, culled(pipeline_of(draw, &look), mode));
+                    self.bind_pipeline(pass, culled(pipeline_of(draw, &look), mode));
                     SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
                     SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
                     let model = model_of(draw);
@@ -4687,7 +5240,7 @@ impl Renderer {
                         if self.hdr
                             && let Some(mirror) = mirror_of(draw)
                         {
-                            SDL_BindGPUGraphicsPipeline(pass, culled(self.vpx_mirror_add, mode));
+                            self.bind_pipeline(pass, culled(self.vpx_mirror_add, mode));
                             draw_one(pass, draw, &look, &model, Some(mirror));
                         }
                     } else {
@@ -4699,7 +5252,7 @@ impl Renderer {
             // order (RenderPass::SortCommands): those VPX marks solid first, by shader, then near
             // first; those it marks see-through with the halos and flashers, far first, below
             let mut solids: Vec<(i32, f32, &crate::scene::Draw, MeshLook)> = Vec::new();
-            for draw in self.scene.draws.iter().filter(|d| shown(d) && !d.playfield) {
+            for draw in self.scene.draws.iter().filter(|d| shown(d) && seen(d) && !d.playfield) {
                 if let Some(l) = draw.glow {
                     // lights' glows come each frame
                     if still_pass {
@@ -4765,7 +5318,7 @@ impl Renderer {
                 for (_, draw, look) in &plates {
                     let (modes, passes) = culls(draw, look, false);
                     for &mode in &modes[..passes] {
-                        SDL_BindGPUGraphicsPipeline(pass, culled(self.vpx_kicker_plate, mode));
+                        self.bind_pipeline(pass, culled(self.vpx_kicker_plate, mode));
                         SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
                         SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
                         draw_one(pass, draw, look, &model_of(draw), None);
@@ -4784,7 +5337,7 @@ impl Renderer {
                         continue;
                     }
                     if !bound {
-                        SDL_BindGPUGraphicsPipeline(pass, self.sprite);
+                        self.bind_pipeline(pass, self.sprite);
                         SDL_BindGPUVertexBuffers(pass, 0, &ob, 1);
                         SDL_PushGPUVertexUniformData(command, 0, (&raw const screen).cast(), 16);
                         bound = true;
@@ -4794,7 +5347,7 @@ impl Renderer {
                     SDL_DrawGPUPrimitives(pass, count, 1, first, 0);
                 }
                 if bound {
-                    SDL_PushGPUVertexUniformData(command, 0, (&raw const frame).cast(), size_of::<FrameUniforms>() as u32);
+                    self.push_frame(command, &frame);
                 }
             }
             draw_solid(pass, &mut solids, true);
@@ -4803,11 +5356,11 @@ impl Renderer {
             // sits on is shaded, the light's colour for its picture (fs_classic_light.sc), blended
             // only where that material is see-through, writing no depth
             if self.hdr {
-                SDL_BindGPUGraphicsPipeline(pass, self.vpx_blended);
+                self.bind_pipeline(pass, self.vpx_blended);
                 SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
                 SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
             }
-            for draw in self.scene.draws.iter().filter(|d| shown(d) && !still_pass) {
+            for draw in self.scene.draws.iter().filter(|d| shown(d) && seen(d) && !still_pass) {
                 let Some(l) = draw.glow else { continue };
                 let info = &self.scene.light_parts[l];
                 if !info.plain {
@@ -4845,7 +5398,7 @@ impl Renderer {
                         SDL_GPUTextureSamplerBinding { texture: self.white, sampler: self.sampler },
                     ];
                     SDL_BindGPUFragmentSamplers(pass, 0, bindings.as_ptr(), 6);
-                    SDL_DrawGPUIndexedPrimitives(pass, draw.index_count, 1, draw.first_index, draw.base_vertex, 0);
+                    SDL_DrawGPUIndexedPrimitives(pass, self.test_count(draw.index_count), 1, draw.first_index, draw.base_vertex, 0);
                     continue;
                 }
                 let uniforms = MaterialUniforms {
@@ -4862,7 +5415,7 @@ impl Renderer {
                 SDL_PushGPUFragmentUniformData(command, 0, (&raw const uniforms).cast(), size_of::<MaterialUniforms>() as u32);
                 let binding = SDL_GPUTextureSamplerBinding { texture: self.white, sampler: self.sampler };
                 SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
-                SDL_DrawGPUIndexedPrimitives(pass, draw.index_count, 1, draw.first_index, draw.base_vertex, 0);
+                SDL_DrawGPUIndexedPrimitives(pass, self.test_count(draw.index_count), 1, draw.first_index, draw.base_vertex, 0);
             }
             // the balls (VPX's look: VPX's ball, its nearest lights and its mirror of the playfield)
             if self.hdr && !still_pass {
@@ -4884,11 +5437,11 @@ impl Renderer {
                 SDL_PushGPUFragmentUniformData(command, 0, (&raw const uniforms).cast(), size_of::<MaterialUniforms>() as u32);
                 let binding = SDL_GPUTextureSamplerBinding { texture: self.white, sampler: self.sampler };
                 SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
-                SDL_DrawGPUIndexedPrimitives(pass, count, 1, first, base, 0);
+                SDL_DrawGPUIndexedPrimitives(pass, self.test_count(count), 1, first, base, 0);
             }
             // the classic lights' glows, added onto the table (VPX adds it in the light's own pass;
             // VPX's look: those with no picture of their own, the others below)
-            SDL_BindGPUGraphicsPipeline(pass, self.glow);
+            self.bind_pipeline(pass, self.glow);
             SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
             SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
             for draw in self.scene.draws.iter().filter(|_| !still_pass) {
@@ -4896,7 +5449,7 @@ impl Renderer {
                 let now = light_now(l);
                 let info = &self.scene.light_parts[l];
                 // (VPX's look: those on a see-through surface come with the see-through parts)
-                if !shown(draw) || now.intensity <= 0.0 || info.bulb || (self.hdr && (!info.plain || info.surface_shading.opacity_active)) {
+                if !shown(draw) || !seen(draw) || now.intensity <= 0.0 || info.bulb || (self.hdr && (!info.plain || info.surface_shading.opacity_active)) {
                     continue;
                 }
                 classic_glow(pass, draw, l);
@@ -4908,14 +5461,14 @@ impl Renderer {
                     let Some(l) = draw.glow else { continue };
                     let info = &self.scene.light_parts[l];
                     // (those on a see-through surface come with the see-through parts)
-                    if info.bulb || info.plain || !shown(draw) || info.surface_shading.opacity_active {
+                    if info.bulb || info.plain || !shown(draw) || !seen(draw) || info.surface_shading.opacity_active {
                         continue;
                     }
                     if classic_picture_dark(l) {
                         continue;
                     }
                     if !bound {
-                        SDL_BindGPUGraphicsPipeline(pass, self.vpx_classic_light);
+                        self.bind_pipeline(pass, self.vpx_classic_light);
                         SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
                         SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
                         scene_light(true, &input.view);
@@ -4926,7 +5479,10 @@ impl Renderer {
                 }
             }
             // the flashers: VPX skips one that is hidden, black, or without opacity or intensity
-            for f in self.scene.flashers.iter().filter(|_| !still_pass) {
+            for (k, f) in self.scene.flashers.iter().enumerate().filter(|_| !still_pass) {
+                if self.room_flashers.get(k).is_some_and(|&room| room) {
+                    continue;
+                }
                 let r = input.part_render.get(f.part as usize);
                 let now = r.and_then(|r| r.flasher).unwrap_or(f.start);
                 if !r.is_none_or(|r| r.visible) || now.color == 0 || now.alpha == 0.0 || now.intensity_scale == 0.0 {
@@ -4995,7 +5551,7 @@ impl Renderer {
                                 (false, _) => &[(self.backdrop_light, 0.0)],
                             };
                             for &(pipeline, term) in steps {
-                                SDL_BindGPUGraphicsPipeline(pass, pipeline);
+                                self.bind_pipeline(pass, pipeline);
                                 SDL_BindGPUVertexBuffers(pass, 0, &ob, 1);
                                 SDL_PushGPUVertexUniformData(command, 0, (&raw const screen).cast(), 16);
                                 let uniforms = backdrop_light(k, term);
@@ -5013,7 +5569,7 @@ impl Renderer {
                             }
                             let pipeline = if dmd.is_some() { self.dmd_backdrop } else { self.sprite };
                             if bound != pipeline {
-                                SDL_BindGPUGraphicsPipeline(pass, pipeline);
+                                self.bind_pipeline(pass, pipeline);
                                 SDL_BindGPUVertexBuffers(pass, 0, &ob, 1);
                                 SDL_PushGPUVertexUniformData(command, 0, (&raw const screen).cast(), 16);
                                 bound = pipeline;
@@ -5035,7 +5591,7 @@ impl Renderer {
             // the readout (in VPX's look, over the tonemapped picture)
             let readout = |pass: *mut SDL_GPURenderPass, pipeline: *mut SDL_GPUGraphicsPipeline| {
                 if text_count > 0 {
-                    SDL_BindGPUGraphicsPipeline(pass, pipeline);
+                    self.bind_pipeline(pass, pipeline);
                     SDL_BindGPUVertexBuffers(pass, 0, &ob, 1);
                     SDL_PushGPUVertexUniformData(command, 0, (&raw const screen_out).cast(), 16);
                     let binding = SDL_GPUTextureSamplerBinding { texture: self.font, sampler: self.font_sampler };
@@ -5047,6 +5603,7 @@ impl Renderer {
                 readout(pass, self.overlay);
             }
             SDL_EndGPURenderPass(pass);
+            set_shading_rate(command, null_mut());
             if still_pass {
                 return;
             }
@@ -5060,9 +5617,9 @@ impl Renderer {
             }
             // VPX's ball motion blur, from this frame's picture and the last one's (so before this
             // frame's is kept as the last), and its dynamic occlusion
-            let blur_regions = if self.motion_blur_on() && self.prev_valid.get() { self.record_motion_blur(command, input, (rw, rh)) } else { Vec::new() };
+            let blur_regions = if self.motion_blur_on() && self.prev_valid.get() { self.record_motion_blur(command, input, (rw, rh), made) } else { Vec::new() };
             if self.ao_mode() == 2 {
-                self.record_frame_ao(command, (rw, rh));
+                self.record_frame_ao(command, (rw, rh), made);
                 if let Some(e) = &self.effects {
                     self.record_embedded_ao(command, e.ao_latest_picture(), (rw, rh), (width, height));
                 }
@@ -5072,7 +5629,7 @@ impl Renderer {
             if bloom {
                 // VPX's bloom (Renderer::UpdateBloom): the bright parts' cut-off into a
                 // quarter-size picture, then the 39-texel blur across and down
-                let full = [1.0 / w, 1.0 / h, self.tone.bloom_strength, 2.25];
+                let full = [1.0 / mw, 1.0 / mh, self.tone.bloom_strength, 2.25];
                 let (bw, bh) = (self.bloom_size.0 as f32, self.bloom_size.1 as f32);
                 let small = [1.0 / bw, 1.0 / bh, 1.0, 0.0];
                 for (pipeline, source, dest, uniforms) in [
@@ -5085,7 +5642,8 @@ impl Renderer {
                     target.load_op = SDL_GPU_LOADOP_DONT_CARE;
                     target.store_op = SDL_GPU_STOREOP_STORE;
                     let pass = SDL_BeginGPURenderPass(command, &target, 1, null());
-                    SDL_BindGPUGraphicsPipeline(pass, pipeline);
+                    Self::picture_part(pass, bloom_part, self.bloom_size);
+                    self.bind_pipeline(pass, pipeline);
                     let binding = SDL_GPUTextureSamplerBinding { texture: source, sampler: self.flat_sampler };
                     SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
                     SDL_PushGPUFragmentUniformData(command, 0, uniforms.as_ptr().cast(), 16);
@@ -5096,9 +5654,9 @@ impl Renderer {
             if self.hdr {
                 self.record_embedded_copy(command, target, (rw, rh), (width, height));
             }
-            if self.hdr && !self.prev_hdr.is_null() {
+            if self.hdr && !self.prev_hdr.is_null() && !self.headset {
                 // the ball mirrors the playfield from the frame before (VPX's swapped back buffers,
-                // which hold the embedded windows too)
+                // which hold the embedded windows too); a headset's eyes swap theirs (draw_eyes)
                 let copy = SDL_BeginGPUCopyPass(command);
                 let mut from: SDL_GPUTextureLocation = zeroed();
                 from.texture = self.hdr_target;
@@ -5108,18 +5666,31 @@ impl Renderer {
                 SDL_EndGPUCopyPass(copy);
                 self.prev_valid.set(true);
             }
+            // whether the last pass wrote VR's passthrough alpha
+            let mut alpha_written = false;
             if self.hdr {
                 // VPX's tonemapping (Renderer::SetupTonemapping, its SDR path): the
                 // table's exposure and tone mapper, dither, and its colour grade
                 // into the window, or with VPX's post-processing after it, into its first picture
-                let (tonemapped, tonemap) = self.tonemap_target(target);
+                let (tonemapped, mut tonemap) = self.tonemap_target(target);
                 let chained = tonemapped != target;
+                // VR's passthrough with nothing after: the alpha from the scene's depth written here too
+                let alpha_here = !chained && !self.tonemap_environment_alpha.is_null();
+                if alpha_here {
+                    tonemap = self.tonemap_environment_alpha;
+                }
+                alpha_written = alpha_here || (chained && self.post_writes_environment_alpha());
                 let mut post: SDL_GPUColorTargetInfo = zeroed();
                 post.texture = tonemapped;
                 post.load_op = SDL_GPU_LOADOP_DONT_CARE;
                 post.store_op = SDL_GPU_STOREOP_STORE;
                 let pass = SDL_BeginGPURenderPass(command, &post, 1, null());
-                SDL_BindGPUGraphicsPipeline(pass, tonemap);
+                if chained {
+                    Self::picture_part(pass, (width, height), made_out);
+                } else {
+                    self.frame_part(pass, width, height);
+                }
+                self.bind_pipeline(pass, tonemap);
                 let lut = if self.color_grade.is_null() { self.white } else { self.color_grade };
                 // the nudge shake (VPX's screen offset), in pixels: the picture moved and filtered
                 let shake = if stage == Stage::Moving { [input.screen_offset[0] * out_w * 0.5, -input.screen_offset[1] * out_h * 0.5] } else { [0.0; 2] };
@@ -5134,8 +5705,10 @@ impl Renderer {
                     SDL_GPUTextureSamplerBinding { texture: lut, sampler: self.flat_sampler },
                     SDL_GPUTextureSamplerBinding { texture: if bloom { self.bloom[0] } else { self.white }, sampler: self.flat_sampler },
                     SDL_GPUTextureSamplerBinding { texture: ao.unwrap_or(self.white), sampler: self.flat_sampler },
+                    SDL_GPUTextureSamplerBinding { texture: if alpha_here { self.depth } else { self.white }, sampler: self.font_sampler },
                 ];
-                SDL_BindGPUFragmentSamplers(pass, 0, bindings.as_ptr(), 4);
+                let samplers = if alpha_here { 5 } else { 4 };
+                SDL_BindGPUFragmentSamplers(pass, 0, bindings.as_ptr(), samplers);
                 // the dither follows the frame's number, as VPX's does, so a picture is the same on every run
                 let frame = (self.frames_drawn.get() % 2048) as f32;
                 // the post-processing picture takes sRGB values as they are, as VPX's does
@@ -5151,8 +5724,8 @@ impl Renderer {
                         if srgb_target { 1.0 } else { 0.0 },
                         if bloom { 1.0 } else { 0.0 },
                     ],
-                    frame: [frame, 1.0 / out_w, 1.0 / out_h, if supersampled { 1.0 } else { 0.0 }],
-                    ao: [if ao.is_some() { 1.0 } else { 0.0 }, 1.0 / w, 1.0 / h, 0.0],
+                    frame: [frame, 1.0 / made_out.0 as f32, 1.0 / made_out.1 as f32, if supersampled { 1.0 } else { 0.0 }],
+                    ao: [if ao.is_some() { 1.0 } else { 0.0 }, 1.0 / mw, 1.0 / mh, 0.0],
                     hdr,
                     spline1,
                     spline2,
@@ -5163,7 +5736,7 @@ impl Renderer {
                 // (VPX's ApplyBallMotionBlur, its second half)
                 if let (Some(e), false) = (self.effects.as_ref(), blur_regions.is_empty()) {
                     bindings[0].texture = e.blur;
-                    SDL_BindGPUFragmentSamplers(pass, 0, bindings.as_ptr(), 4);
+                    SDL_BindGPUFragmentSamplers(pass, 0, bindings.as_ptr(), samplers);
                     for &region in &blur_regions {
                         let Some(mut rect) = effects::scissor_of(region, (width, height)) else { continue };
                         rect.x += shake[0].round() as i32;
@@ -5185,6 +5758,10 @@ impl Renderer {
                     readout(pass, self.overlay_post);
                     SDL_EndGPURenderPass(pass);
                 }
+            }
+            // VR's passthrough: the alpha from the scene's depth, unless the last pass wrote it
+            if !self.environment_alpha.is_null() && !alpha_written && (rw, rh) == (width, height) {
+                self.record_environment_alpha(command, target, width, height);
             }
             // the pause menu over everything, when it shows
             self.record_menu(command, target, width, height, input.text_turn);
@@ -5238,6 +5815,241 @@ impl Renderer {
             self.record(command, target, width, height, input, self.stage());
             // a screen in HDR: its picture made an ordinary sRGB one, as a screenshot is kept
             self.read_back(command, target, width, height, self.format, self.hdr10.map(|h| h.sdr_white))
+        }
+    }
+
+    /// Draws one frame into each eye's image (VR): what moves and the score display brought up to date
+    /// once, then the table for each eye with its own view into `targets`, `width` x `height` both, every
+    /// part each time (the still parts' prepass serves one view only). The frame is submitted when it
+    /// returns, so the images can go back to the headset.
+    /// With `fovea`, each eye's scene is shaded at full rate only in its discs (VR's foveation, where the
+    /// device has shading rate images).
+    pub fn draw_eyes(&mut self, inputs: [&FrameInput; 2], targets: [*mut SDL_GPUTexture; 2], width: u32, height: u32, full: (u32, u32), fovea: Option<Fovea>) -> Result<(), String> {
+        // the pictures made once at the eye's full size (its swapchain's), the top left `width` x `height` drawn
+        self.eye_drawn.set((width, height));
+        self.eye_made.set(full);
+        self.ensure_targets(full.0, full.1, inputs[0])?;
+        self.ensure_post(full.0, full.1)?;
+        let (rw, rh) = self.render_size(width, height);
+        let made = self.render_size(full.0, full.1);
+        self.ensure_effects(made.0, made.1)?;
+        unsafe {
+            let command = non_null(SDL_AcquireGPUCommandBuffer(self.device), "acquire command buffer")?;
+            let foveated = match fovea {
+                Some(f) if self.rate_texel > 0 => {
+                    if let Err(e) = self.update_rates(command, f, (rw, rh), made) {
+                        SDL_CancelGPUCommandBuffer(command);
+                        return Err(e);
+                    }
+                    true
+                }
+                _ => false,
+            };
+            self.update_text_boxes(command, inputs[0].text_boxes, width);
+            self.update_dmd(command, inputs[0].dmd);
+            self.update_animations(command, inputs[0]);
+            self.update_ramps(command, inputs[0]);
+            self.update_lights(inputs[0]);
+            for (eye, (input, target)) in inputs.into_iter().zip(targets).enumerate() {
+                if eye == 1 {
+                    self.swap_right_eye();
+                }
+                self.rate_now.set(if foveated { self.rate_images[eye] } else { null_mut() });
+                self.prev_valid.set(self.eye_prev_valid[eye]);
+                self.record(command, target, width, height, input, Stage::Full);
+                // VPX's swapped back buffers: what the eye drew is its next frame's picture before
+                if !self.prev_hdr.is_null() {
+                    std::mem::swap(&mut self.hdr_target, &mut self.prev_hdr);
+                    self.eye_prev_valid[eye] = true;
+                }
+                if eye == 1 {
+                    self.swap_right_eye();
+                }
+            }
+            check(SDL_SubmitGPUCommandBuffer(command), "submit the frame")
+        }
+    }
+
+    /// Brings each eye's shading rate image to `f`'s discs for the top left `size` drawn of pictures `made`
+    /// (the image made for those first): drawn again and uploaded on `command` when a disc moved half a texel,
+    /// changed size, or the part drawn changed.
+    unsafe fn update_rates(&mut self, command: *mut SDL_GPUCommandBuffer, f: Fovea, size: (u32, u32), made: (u32, u32)) -> Result<(), String> {
+        let t = self.rate_texel;
+        let texels = (made.0.div_ceil(t), made.1.div_ceil(t));
+        if self.rate_part != size {
+            self.rate_part = size;
+            self.rate_drawn = None;
+        }
+        if texels != self.rate_size || self.rate_images[0].is_null() {
+            self.release_rates();
+            for k in 0..2 {
+                // SAFETY: a texture of the device's, of the vendored SDL's own usage for these
+                self.rate_images[k] = unsafe { self.rate_image(texels)? };
+            }
+            let mut info: SDL_GPUTransferBufferCreateInfo = unsafe { zeroed() };
+            info.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+            info.size = 2 * texels.0 * texels.1;
+            self.rate_upload = non_null(unsafe { SDL_CreateGPUTransferBuffer(self.device, &info) }, "make the foveation's upload buffer")?;
+            self.rate_size = texels;
+            self.rate_drawn = None;
+        }
+        // half a texel, in each picture's fraction
+        let moved = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).abs() * size.0 as f32 > 0.5 * t as f32 || (a[1] - b[1]).abs() * size.1 as f32 > 0.5 * t as f32;
+        if self.rate_drawn.is_some_and(|d| d.full == f.full && d.half == f.half && !moved(d.centres[0], f.centres[0]) && !moved(d.centres[1], f.centres[1])) {
+            return Ok(());
+        }
+        let n = (texels.0 * texels.1) as usize;
+        unsafe {
+            let mapped = SDL_MapGPUTransferBuffer(self.device, self.rate_upload, true).cast::<u8>();
+            if mapped.is_null() {
+                return Err(format!("map the foveation's upload buffer: {}", sdl_error()));
+            }
+            let bytes = std::slice::from_raw_parts_mut(mapped, 2 * n);
+            for eye in 0..2 {
+                rate_map(&f, eye, texels, t, size, &mut bytes[eye * n..(eye + 1) * n]);
+            }
+            SDL_UnmapGPUTransferBuffer(self.device, self.rate_upload);
+            let copy = SDL_BeginGPUCopyPass(command);
+            for eye in 0..2 {
+                let source = SDL_GPUTextureTransferInfo { transfer_buffer: self.rate_upload, offset: (eye * n) as u32, pixels_per_row: texels.0, rows_per_layer: texels.1 };
+                let mut region: SDL_GPUTextureRegion = zeroed();
+                region.texture = self.rate_images[eye];
+                region.w = texels.0;
+                region.h = texels.1;
+                region.d = 1;
+                SDL_UploadToGPUTexture(copy, &source, &region, false);
+            }
+            SDL_EndGPUCopyPass(copy);
+        }
+        self.rate_drawn = Some(f);
+        Ok(())
+    }
+
+    /// A shading rate image of `texels`, made empty (filled by uploads: the fork found an image made
+    /// with its contents kept them).
+    unsafe fn rate_image(&self, texels: (u32, u32)) -> Result<*mut SDL_GPUTexture, String> {
+        let mut info: SDL_GPUTextureCreateInfo = unsafe { zeroed() };
+        info.r#type = SDL_GPU_TEXTURETYPE_2D;
+        info.format = SDL_GPU_TEXTUREFORMAT_R8_UINT;
+        info.usage = SDL_GPU_TEXTUREUSAGE_FRAGMENT_SHADING_RATE;
+        info.width = texels.0;
+        info.height = texels.1;
+        info.layer_count_or_depth = 1;
+        info.num_levels = 1;
+        info.sample_count = SDL_GPU_SAMPLECOUNT_1;
+        non_null(unsafe { SDL_CreateGPUTexture(self.device, &info) }, "make a foveation image")
+    }
+
+    fn release_rates(&mut self) {
+        unsafe {
+            for t in self.rate_images.iter_mut().filter(|t| !t.is_null()) {
+                SDL_ReleaseGPUTexture(self.device, *t);
+                *t = null_mut();
+            }
+            if !self.rate_upload.is_null() {
+                SDL_ReleaseGPUTransferBuffer(self.device, self.rate_upload);
+                self.rate_upload = null_mut();
+            }
+        }
+        self.rate_drawn = None;
+    }
+
+    /// A pass into the picture shown: on a headset, only its top left `width` x `height` is drawn
+    /// (VR's dynamic resolution; the runtime shows that part, its `imageRect`).
+    pub(super) unsafe fn frame_part(&self, pass: *mut SDL_GPURenderPass, width: u32, height: u32) {
+        if self.headset {
+            let viewport = SDL_GPUViewport { x: 0.0, y: 0.0, w: width as f32, h: height as f32, min_depth: 0.0, max_depth: 1.0 };
+            unsafe {
+                SDL_SetGPUViewport(pass, &viewport);
+                SDL_SetGPUScissor(pass, &SDL_Rect { x: 0, y: 0, w: width as i32, h: height as i32 });
+            }
+        }
+    }
+
+    /// A pass into one of the table's own pictures, made `made`, of which the top left `part` is drawn (VR's
+    /// dynamic resolution); nothing to set when all of it is.
+    pub(super) unsafe fn picture_part(pass: *mut SDL_GPURenderPass, part: (u32, u32), made: (u32, u32)) {
+        if part.0 < made.0 || part.1 < made.1 {
+            let viewport = SDL_GPUViewport { x: 0.0, y: 0.0, w: part.0 as f32, h: part.1 as f32, min_depth: 0.0, max_depth: 1.0 };
+            unsafe {
+                SDL_SetGPUViewport(pass, &viewport);
+                SDL_SetGPUScissor(pass, &SDL_Rect { x: 0, y: 0, w: part.0 as i32, h: part.1 as i32 });
+            }
+        }
+    }
+
+    /// VR with passthrough (`[PlayerVR] Passthrough`): the cabinet alone, the real room around it in place of
+    /// the table's. A part is the room's when its VPX 10.8.1 part group is placed in the room (`room_part`,
+    /// by the part's index), else when its bounding box lies mostly outside a box around the cabinet: the
+    /// playfield (`table`: left, top, right, bottom) widened for the backbox behind it, the lockbar and coin
+    /// door in front and the legs down to the floor. Floors, walls, skies and what stands around go; the
+    /// cabinet, its legs and backbox stay; moving parts stay. Returns the parts left out (by their index
+    /// among the file's parts) and how many flashers.
+    pub fn show_cabinet_only(&mut self, table: [f32; 4], room_part: impl Fn(u32) -> bool) -> (Vec<u32>, usize) {
+        let [left, top, right, bottom] = table;
+        let (w, h) = (right - left, bottom - top);
+        // the playfield is level here, z 0: the legs reach about the table's length down, a topper on the
+        // backbox stands taller than that above
+        let (lo, hi) = ([left - 0.3 * w, top - 0.45 * h, -1.0 * h], [right + 0.3 * w, bottom + 0.25 * h, 1.4 * h]);
+        // the share of the box `a`..`b` within the cabinet's (along a flat side, whether it's within)
+        let within = |a: [f32; 3], b: [f32; 3]| -> f32 {
+            (0..3)
+                .map(|i| {
+                    let span = b[i] - a[i];
+                    let overlap = (b[i].min(hi[i]) - a[i].max(lo[i])).max(0.0);
+                    if span > 1e-3 { overlap / span } else if a[i] >= lo[i] && a[i] <= hi[i] { 1.0 } else { 0.0 }
+                })
+                .product()
+        };
+        self.room = self
+            .scene
+            .draws
+            .iter()
+            .enumerate()
+            .map(|(k, d)| d.part.is_some_and(&room_part) || (d.group.is_none() && self.draw_boxes.get(k).copied().flatten().is_some_and(|(a, b)| within(a, b) < 0.5)))
+            .collect();
+        self.room_flashers = self
+            .scene
+            .flashers
+            .iter()
+            .map(|f| {
+                let at = [f.center[0], f.center[1], f.start.height];
+                room_part(f.part) || within(at, at) < 0.5
+            })
+            .collect();
+        let mut parts: Vec<u32> = self.scene.draws.iter().zip(&self.room).filter(|(_, r)| **r).filter_map(|(d, _)| d.part).collect();
+        parts.sort_unstable();
+        parts.dedup();
+        (parts, self.room_flashers.iter().filter(|&&r| r).count())
+    }
+
+    /// Whether the device draws with shading rate images (VR's foveation can be on).
+    pub fn foveation_possible(&self) -> bool {
+        self.rate_texel > 0
+    }
+
+    /// Swaps the right eye's pictures with those in use, the left eye's ([`Renderer::draw_eyes`]).
+    fn swap_right_eye(&mut self) {
+        if !self.right_eye_hdr[0].is_null() {
+            std::mem::swap(&mut self.hdr_target, &mut self.right_eye_hdr[0]);
+            std::mem::swap(&mut self.prev_hdr, &mut self.right_eye_hdr[1]);
+        }
+    }
+
+    /// An eye's image as it was drawn (VR), as RGBA pixels, for the test runs' pictures: copied, so the
+    /// headset's own image stays as it is, and waited for.
+    pub fn capture_eye(&mut self, eye: *mut SDL_GPUTexture, width: u32, height: u32) -> Result<Vec<u8>, String> {
+        let copy = self.texture(self.format, SDL_GPU_TEXTUREUSAGE_COLOR_TARGET, width, height, 1, SDL_GPU_SAMPLECOUNT_1)?;
+        unsafe {
+            let command = non_null(SDL_AcquireGPUCommandBuffer(self.device), "acquire command buffer")?;
+            let pass = SDL_BeginGPUCopyPass(command);
+            let mut from: SDL_GPUTextureLocation = zeroed();
+            from.texture = eye;
+            let mut to: SDL_GPUTextureLocation = zeroed();
+            to.texture = copy;
+            SDL_CopyGPUTextureToTexture(pass, &from, &to, width, height, 1, false);
+            SDL_EndGPUCopyPass(pass);
+            self.read_back(command, copy, width, height, self.format, None)
         }
     }
 
@@ -5344,6 +6156,7 @@ impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
             SDL_WaitForGPUIdle(self.device);
+            self.release_rates();
             let text_boxes: Vec<*mut SDL_GPUTexture> = self.text_box_textures.drain(..).map(|(t, _)| t).collect();
             let env = if self.env_owned { self.env_texture } else { null_mut() };
             let ball_env = if self.ball_env_owned { self.ball_env } else { null_mut() };
@@ -5353,7 +6166,7 @@ impl Drop for Renderer {
             mirrors.push(self.mirror_blur);
             mirrors.push(self.refraction_blur);
             mirrors.extend(self.refraction_textures.drain(..).chain(self.refraction_depths.drain(..)));
-            for t in self.textures.drain(..).chain(text_boxes).chain(mirrors).chain([self.white, self.font, self.msaa, self.depth, self.dmd_texture, self.hdr_target, self.color_grade, self.irradiance, env, self.bloom[0], self.bloom[1], ball_env, ball_decal, vpx_ball_env, no_decal, self.ball_override_env, self.ball_override_decal, self.prev_hdr]) {
+            for t in self.textures.drain(..).chain(text_boxes).chain(mirrors).chain([self.white, self.font, self.msaa, self.depth, self.dmd_texture, self.hdr_target, self.color_grade, self.irradiance, env, self.bloom[0], self.bloom[1], ball_env, ball_decal, vpx_ball_env, no_decal, self.ball_override_env, self.ball_override_decal, self.prev_hdr]).chain(self.right_eye_hdr) {
                 if !t.is_null() {
                     SDL_ReleaseGPUTexture(self.device, t);
                 }
@@ -5424,6 +6237,8 @@ impl Drop for Renderer {
                 self.bulb_vpx_3d,
                 self.flasher_vpx,
                 self.bulb_vpx,
+                self.environment_alpha,
+                self.tonemap_environment_alpha,
             ] {
                 if !p.is_null() {
                     SDL_ReleaseGPUGraphicsPipeline(self.device, p);
@@ -5433,6 +6248,9 @@ impl Drop for Renderer {
                 for p in twins {
                     SDL_ReleaseGPUGraphicsPipeline(self.device, p);
                 }
+            }
+            for (_, clipping) in self.clip_twin.drain() {
+                SDL_ReleaseGPUGraphicsPipeline(self.device, clipping);
             }
             self.release_backglass();
             self.release_topper();
@@ -5464,7 +6282,9 @@ impl Drop for Renderer {
             if self.claimed {
                 SDL_ReleaseWindowFromGPUDevice(self.device, self.window);
             }
-            SDL_DestroyGPUDevice(self.device);
+            if self.owns_device {
+                SDL_DestroyGPUDevice(self.device);
+            }
         }
     }
 }
@@ -5579,4 +6399,53 @@ fn overlay_vertices(text: &[Text], turn: u32, window: (f32, f32)) -> Vec<Overlay
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A left-handed perspective as VPX's (row vectors, depth 0 to 1), looking down +z.
+    fn perspective(near: f32, far: f32) -> Mat4 {
+        let q = far / (far - near);
+        Mat4 { m: [[1.2, 0.0, 0.0, 0.0], [0.0, 1.4, 0.0, 0.0], [0.0, 0.0, q, 1.0], [0.0, 0.0, -near * q, 0.0]] }
+    }
+
+    fn clip(m: &Mat4, v: [f32; 3]) -> [f32; 4] {
+        std::array::from_fn(|j| v[0] * m.m[0][j] + v[1] * m.m[1][j] + v[2] * m.m[2][j] + m.m[3][j])
+    }
+
+    #[test]
+    fn an_oblique_near_plane_cuts_along_the_mirror() {
+        let p = perspective(0.1, 100.0);
+        // a tilted plane above the eye (the view's origin), what's beyond it kept
+        let plane = [0.1, 1.0, 0.3, -0.5];
+        let m = oblique_near(&p, plane).expect("the eye is on the side cut away");
+        for v in [[0.0, 2.0, 5.0], [1.0, 0.2, 3.0], [-2.0, 0.6, 1.0], [0.5, -1.0, 10.0], [3.0, 0.4, 50.0], [0.0, 0.5, 0.0]] {
+            let side = plane[0] * v[0] + plane[1] * v[1] + plane[2] * v[2] + plane[3];
+            let (c, before) = (clip(&m, v), clip(&p, v));
+            assert_eq!(c[2] >= 0.0, side >= 0.0, "{v:?}: depth {} for the plane's {side}", c[2]);
+            // across, down and w as they were
+            assert_eq!([c[0], c[1], c[3]], [before[0], before[1], before[3]]);
+        }
+        // a point far beyond the plane, inside the old frustum, stays inside the new far plane
+        let deep = clip(&m, [0.0, 3.0, 60.0]);
+        assert!(deep[2] <= deep[3], "past the far plane: {deep:?}");
+        // the eye on the kept side: no such projection
+        assert!(oblique_near(&p, [0.0, 1.0, 0.0, 0.5]).is_none());
+    }
+
+    #[test]
+    fn a_frustum_narrows_to_a_part_of_the_screen() {
+        let p = perspective(0.1, 100.0);
+        let inside = |planes: &[[f32; 4]; 6], v: [f32; 3]| planes.iter().all(|q| q[0] * v[0] + q[1] * v[1] + q[2] * v[2] + q[3] >= 0.0);
+        let whole = frustum_planes(&p);
+        let part = frustum_planes_within(&p, [-0.2, 0.1, 0.5, 0.6]);
+        for v in [[0.0, 0.5, 5.0], [2.0, 1.0, 8.0], [-1.5, -0.4, 3.0], [0.3, 2.5, 6.0], [0.9, 1.5, 20.0], [0.1, -3.0, 2.0]] {
+            let c = clip(&p, v);
+            let (x, y) = (c[0] / c[3], c[1] / c[3]);
+            assert_eq!(inside(&whole, v), x.abs() <= 1.0 && y.abs() <= 1.0, "{v:?} at {x}, {y}");
+            assert_eq!(inside(&part, v), (-0.2..=0.5).contains(&x) && (0.1..=0.6).contains(&y), "{v:?} at {x}, {y}");
+        }
+    }
 }

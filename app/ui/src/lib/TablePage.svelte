@@ -69,6 +69,10 @@
 
   // the front ends a rating can come from, by the key the library gives
   const FRONT_NAMES = { Popper: 'PinUP Popper', PinballX: 'PinballX', PinballY: 'PinballY' };
+  // in the headset (the player's panel, `#headset`): its settings named, with no tooltip there to say
+  // what the icon is; the desktop's tools it hasn't (its details' and script's editors, its files,
+  // making media) left out
+  const headset = !!window.__VPI_HEADSET__;
 
   const t = $derived(tableById(app.tableId));
   // the front ends a picture can be from, in words
@@ -624,7 +628,8 @@
         <button type="button" class="btn small step" aria-label="Next table: {next.name}" onclick={() => go(next)}>{next.short}<Icon name="chevR" /></button>
       {/if}
     </div>
-    <div class="hint" aria-hidden="true"><span class="key">LB</span><span class="key">RB</span><span>or the arrow keys</span></div>
+    <!-- kept in the headset, empty, where neither a gamepad nor keys step through the tables -->
+    <div class="hint" aria-hidden="true">{#if !headset}<span class="key">LB</span><span class="key">RB</span><span>or the arrow keys</span>{/if}</div>
   </div>
 
   <main class="tp">
@@ -655,7 +660,7 @@
               <span class="display">{t.name}</span>
               {#if app.makingIds.includes(t.id)}
                 <span class="making">Our player is drawing it, with no window: about half a minute, with a preview video…</span>
-              {:else}
+              {:else if !headset}
                 <button type="button" class="btn" onclick={() => (mediaOpen = true)}><Icon name="image" size={16} />Make its media…</button>
                 <span class="making">VPS has no pictures of it: our player can draw it, its backglass and its score display, film a preview and make a wheel, with no window</span>
               {/if}
@@ -748,11 +753,15 @@
             {/if}
           </div>
           <button type="button" class="btn square" class:fav={t.favourite} aria-pressed={t.favourite} aria-label={t.favourite ? 'A favourite: take it off' : 'Make it a favourite'} title="Favourite" onclick={() => setFavourite(t, !t.favourite)}><Icon name="heart" size={19} fill={t.favourite} /></button>
-          <button type="button" class="btn square" aria-label="Edit its details" title="Edit its details" onclick={() => (detailsOpen = true)}><Icon name="edit" size={19} /></button>
-          <button type="button" class="btn square" aria-label="Table settings" title="Table settings" onclick={() => (settingsOpen = true)}><Icon name="sliders" size={19} /></button>
-          <button type="button" class="btn square" aria-label="Edit its script" title="Edit its script" onclick={() => (scriptOpen = true)}><Icon name="code" size={19} /></button>
-          <button type="button" class="btn square" aria-label="Show its files" title="Show its files" onclick={() => showFile(t, 'table')}><Icon name="folder" size={19} /></button>
-          <button type="button" class="btn square" aria-label="Make media" title={app.makingIds.includes(t.id) ? 'Making its media…' : 'Make media'} disabled={app.makingIds.includes(t.id)} onclick={() => (mediaOpen = true)}><Icon name="film" size={19} /></button>
+          {#if !headset}
+            <button type="button" class="btn square" aria-label="Edit its details" title="Edit its details" onclick={() => (detailsOpen = true)}><Icon name="edit" size={19} /></button>
+          {/if}
+          <button type="button" class="btn" class:square={!headset} aria-label="Table settings" title="Table settings" onclick={() => (settingsOpen = true)}><Icon name="sliders" size={19} />{#if headset}<span>Table settings</span>{/if}</button>
+          {#if !headset}
+            <button type="button" class="btn square" aria-label="Edit its script" title="Edit its script" onclick={() => (scriptOpen = true)}><Icon name="code" size={19} /></button>
+            <button type="button" class="btn square" aria-label="Show its files" title="Show its files" onclick={() => showFile(t, 'table')}><Icon name="folder" size={19} /></button>
+            <button type="button" class="btn square" aria-label="Make media" title={app.makingIds.includes(t.id) ? 'Making its media…' : 'Make media'} disabled={app.makingIds.includes(t.id)} onclick={() => (mediaOpen = true)}><Icon name="film" size={19} /></button>
+          {/if}
           <button type="button" class="btn square" aria-label="Its achievements" title="Its achievements" onclick={() => { app.prefs.scoreCard = 'achievements'; savePrefs(); tick().then(() => document.getElementById('achievements')?.scrollIntoView({ behavior: 'smooth', block: 'start' })); }}><Icon name="trophy" size={19} /></button>
           <div class="morebox" bind:this={moreBox}>
             <button type="button" class="btn square" aria-label="More" title="More" aria-expanded={more} onclick={() => (more = !more)}><Icon name="more" size={19} /></button>
@@ -796,19 +805,22 @@
           </div>
         {/if}
         {#if matchLine}
-          <div class="match {matchLine[2]}"><Icon name={matchLine[0]} size={18} width={2.4} /><span>{matchLine[1]} <button type="button" class="link change" onclick={() => (pickOpen = true)}>{t.onVps.game ? 'Not the right one?' : 'Find it on VPS'}</button></span></div>
+          <div class="match {matchLine[2]}"><Icon name={matchLine[0]} size={18} width={2.4} /><span>{matchLine[1]} {#if !headset}<button type="button" class="link change" onclick={() => (pickOpen = true)}>{t.onVps.game ? 'Not the right one?' : 'Find it on VPS'}</button>{/if}</span></div>
         {/if}
-        <div class="tested">
-          {#if app.testingIds.includes(t.id)}
-            <div class="match none"><Icon name="clock" size={18} /><span>Testing: running it with no window for about 15 seconds…</span></div>
-          {:else if t.tested}
-            <div class="match {t.tested.report.look}"><Icon name={t.tested.report.look === 'good' ? 'check' : 'alert'} size={18} width={2.4} /><span>Tested {date(t.tested.at)}: {t.tested.report.text}</span></div>
-            <button type="button" class="btn small ghost" onclick={() => testTable(t.id)}>Test again</button>
-          {:else}
-            <button type="button" class="btn small" onclick={() => testTable(t.id)} title="Runs it for about 15 seconds with no window: its physics, its script, and its machine for a ROM table"><Icon name="play" size={14} />Test it</button>
-            <span class="soft-note">About 15 seconds, no window: its script and, for a ROM table, its machine</span>
-          {/if}
-        </div>
+        <!-- not in the headset, whose panel has no test run; left out, as its display: flex outdoes hidden -->
+        {#if !headset}
+          <div class="tested">
+            {#if app.testingIds.includes(t.id)}
+              <div class="match none"><Icon name="clock" size={18} /><span>Testing: running it with no window for about 15 seconds…</span></div>
+            {:else if t.tested}
+              <div class="match {t.tested.report.look}"><Icon name={t.tested.report.look === 'good' ? 'check' : 'alert'} size={18} width={2.4} /><span>Tested {date(t.tested.at)}: {t.tested.report.text}</span></div>
+              <button type="button" class="btn small ghost" onclick={() => testTable(t.id)}>Test again</button>
+            {:else}
+              <button type="button" class="btn small" onclick={() => testTable(t.id)} title="Runs it for about 15 seconds with no window: its physics, its script, and its machine for a ROM table"><Icon name="play" size={14} />Test it</button>
+              <span class="soft-note">About 15 seconds, no window: its script and, for a ROM table, its machine</span>
+            {/if}
+          </div>
+        {/if}
         {#if t.guess}
           <div class="guess">
             <div class="match warn"><Icon name="help" size={18} /><span>Is this <strong>{t.guess.name}</strong>{t.guess.maker || t.guess.year ? ` (${[t.guess.maker, t.guess.year].filter(Boolean).join(' ')})` : ''} on VPS? It’s the nearest VPS lists, but not near enough to be sure.</span></div>
@@ -950,7 +962,8 @@
 
 
 {#if t && settingsOpen}
-  <TableSettings {t} onclose={() => (settingsOpen = false)} onfindvps={() => { settingsOpen = false; pickOpen = true; }} onscreens={() => { settingsOpen = false; screensOpen = true; }} />
+  <!-- in the headset: neither VPS's picker nor the screens' window -->
+  <TableSettings {t} onclose={() => (settingsOpen = false)} onfindvps={headset ? undefined : () => { settingsOpen = false; pickOpen = true; }} onscreens={headset ? undefined : () => { settingsOpen = false; screensOpen = true; }} />
 {/if}
 {#if t && mediaOpen}
   <MakeMedia {t} onclose={() => (mediaOpen = false)} />

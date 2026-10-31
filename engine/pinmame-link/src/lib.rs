@@ -15,6 +15,11 @@
 //! BSD-3-Clause, not GPL: `vpi-pinmame` links PinMAME and uses this crate.
 
 mod layout;
+#[cfg(windows)]
+mod win;
+// the same calls with POSIX, on Linux
+#[cfg(not(windows))]
+#[path = "unix.rs"]
 mod win;
 
 use std::io;
@@ -134,6 +139,14 @@ impl Link {
     /// The event the engine waits on, likewise: set when solenoids changed.
     pub fn to_engine_event(&self) -> *mut std::ffi::c_void {
         self.to_engine
+    }
+
+    /// The host waits up to `milliseconds` for the engine's next wake-up (or
+    /// its own, `wake_host`); true if it came. (Windows' host waits among
+    /// several objects with `to_host_event` instead.)
+    pub fn wait_for_engine(&self, milliseconds: u32) -> bool {
+        // SAFETY: an event handle we own
+        unsafe { win::WaitForSingleObject(self.to_host, milliseconds) == win::WAIT_OBJECT_0 }
     }
 
     /// The engine waits up to `milliseconds` for the host's next wake-up;

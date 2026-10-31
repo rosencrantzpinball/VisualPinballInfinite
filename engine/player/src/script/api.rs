@@ -270,7 +270,7 @@ pub(crate) fn script_folders(w: &World) -> Vec<PathBuf> {
     {
         out.push(dir.join("scripts"));
         if crate::DEVELOPMENT
-            && let Some(build) = dir.ancestors().map(|d| d.join(r"vpx-build\vpinball-5436\scripts")).find(|d| d.is_dir())
+            && let Some(build) = dir.ancestors().map(|d| d.join("vpx-build").join("vpinball-5436").join("scripts")).find(|d| d.is_dir())
         {
             out.push(build);
         }
@@ -324,7 +324,7 @@ fn music_file(w: &World, name: &str) -> Option<PathBuf> {
 /// (VPX's `GetTablePath(User, true)`), so a table never writes beside
 /// itself.
 pub(crate) fn user_directory() -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("APPDATA")?).join("Visual Pinball Infinite").join("User");
+    let dir = vpi_settings::data_folder()?.join("User");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }
@@ -556,7 +556,7 @@ fn global(m: &'static Member, a: &Args) -> Option<Res> {
         "GetTextFile" => {
             let file = a.string(0).unwrap_or_default();
             let folders = with(|_, w| script_folders(w)).unwrap_or_default();
-            match folders.iter().map(|d| d.join(&file)).find_map(|p| std::fs::read(p).ok()) {
+            match folders.iter().map(|d| super::files::native(&d.join(&file).to_string_lossy())).find_map(|p| std::fs::read(p).ok()) {
                 Some(bytes) => Ok(Ret::Str(read_text(&bytes))),
                 None => {
                     log::once(&format!("GetTextFile: {file} not found"));
@@ -624,7 +624,8 @@ fn global(m: &'static Member, a: &Args) -> Option<Res> {
         "FrameIndex" => Ok(Ret::Int(with(|_, w| w.frame_index as i32).unwrap_or(0))),
         // the precise game time, in seconds
         "PreciseGameTime" => Ok(Ret::Double(with(|e, _| e.time_sec()).unwrap_or(0.0))),
-        "RenderingMode" => Ok(Ret::Int(0)), // 2D: no stereo, no VR
+        // 2 in VR (the headset), else 2D: no stereo
+        "RenderingMode" => Ok(Ret::Int(if with(|_, w| w.vr).unwrap_or(false) { 2 } else { 0 })),
         // VPX: the desktop and single-screen views count as desktop
         "ShowDT" => Ok(Ret::Bool(with(|_, w| w.view != View::Cabinet).unwrap_or(true))),
         "ShowFSS" => Ok(Ret::Bool(with(|_, w| w.view == View::SingleScreen).unwrap_or(false))),

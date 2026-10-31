@@ -1,0 +1,30 @@
+[package]
+name = "panel-host"
+version.workspace = true
+description = "vpi-panel: the app's screens in the headset, drawn by CEF off-screen and handed to the player, which shows them in the room."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "vpi-panel"
+path = "src/main.rs"
+
+[features]
+# CEF itself, asked for where it's built (tools/steam-frame/panel.sh), with CEF_PATH naming the CEF built
+# here (tools/steam-frame/cef): without it the cef crate would fetch a prebuilt one, and without the
+# feature vpi-panel only says it was built without CEF.
+cef = ["dep:cef", "dep:image"]
+
+[dependencies]
+library = { path = "../library" }
+panel-link = { path = "../panel-link" }
+vpi-settings = { path = "../settings" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cef = { version = "=154.5.0", default-features = false, optional = true }

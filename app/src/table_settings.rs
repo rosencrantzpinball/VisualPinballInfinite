@@ -159,8 +159,12 @@ pub struct View {
     /// every table, `reach_outside_usual` (`[VPI]` `ScriptsReachOutside`).
     pub reach_outside: Option<bool>,
     pub reach_outside_usual: bool,
+    /// Where its settings are saved, and whether it's there yet.
     pub file: String,
     pub exists: bool,
+    /// Saved apart from the table, in VPI's own folder, where tables are only read (the Steam
+    /// Frame): VPX, reading the file beside the table, doesn't see them.
+    pub apart: bool,
 }
 
 /// What a brief run of the table's script tells.
@@ -211,9 +215,15 @@ fn ask_script(table: &Path) -> Result<Script, String> {
     Ok(Script { options, machine })
 }
 
-/// The table's settings file: `<table>.ini` beside it.
+/// The table's settings file as it's read: `<table>.ini` beside it, or VPI's copy of it where
+/// tables are only read (`vpi_settings::table_settings_read`: the Steam Frame).
 fn file_of(table: &Path) -> PathBuf {
-    table.with_extension("ini")
+    vpi_settings::table_settings_read(&table.with_extension("ini"))
+}
+
+/// Where the table's settings file is saved: beside it, or into VPI's copy where tables are only read.
+fn saved_file_of(table: &Path) -> PathBuf {
+    vpi_settings::table_settings_saved(&table.with_extension("ini"))
 }
 
 /// VPinMAME's settings for each game, beside the settings file, as the player reads them.
@@ -397,8 +407,9 @@ pub fn load(asked: &Asked, table: &Path, game: Option<String>) -> View {
         physics: physics_of(table).and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
         reach_outside: reach_outside_of(&main, table),
         reach_outside_usual: vpi_settings::get(&main, "VPI", "ScriptsReachOutside").and_then(vpi_settings::vpx_bool).unwrap_or(false),
-        file: file.display().to_string(),
-        exists: file.exists(),
+        file: saved_file_of(table).display().to_string(),
+        exists: saved_file_of(table).exists(),
+        apart: vpi_settings::table_settings_apart(),
     }
 }
 
@@ -535,7 +546,11 @@ pub fn save(table: &Path, options: &BTreeMap<String, Option<f32>>, for_table: &F
     if !changes.is_empty() {
         // a file made for the first time takes in the POV file's views, which it ends the reading of
         changes.splice(0..0, vpi_settings::first_table_settings(table));
-        write(&file, &vpi_settings::edit(&before, &changes)).map_err(|e| format!("The table's settings couldn't be saved: {e}"))?;
+        let saved = saved_file_of(table);
+        if let Some(dir) = saved.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("The table's settings couldn't be saved: {}: {e}", dir.display()))?;
+        }
+        write(&saved, &vpi_settings::edit(&before, &changes)).map_err(|e| format!("The table's settings couldn't be saved: {e}"))?;
     }
     if let Some((game, now)) = machine {
         // a game's name as PinMAME names its sets: no brackets to break the file's sections

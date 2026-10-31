@@ -16,6 +16,11 @@
 //! a picture of what the panel shows (for checks without a panel), and a
 //! stop. Host to engine: its state.
 
+#[cfg(windows)]
+mod win;
+// the same calls with POSIX, on Linux
+#[cfg(not(windows))]
+#[path = "unix.rs"]
 mod win;
 
 use std::io;

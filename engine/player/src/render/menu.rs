@@ -243,6 +243,7 @@ impl Renderer {
             if pass.is_null() {
                 return;
             }
+            self.frame_part(pass, width, height);
             SDL_BindGPUGraphicsPipeline(pass, m.pipeline);
             let place = MenuPlace { place: [m.at.0, m.at.1, m.size.0 as f32, m.size.1 as f32], window: [width as f32, height as f32, (turn % 4) as f32, 0.0] };
             SDL_PushGPUVertexUniformData(command, 0, (&raw const place).cast(), size_of::<MenuPlace>() as u32);

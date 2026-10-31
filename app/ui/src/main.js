@@ -13,10 +13,20 @@ import App from './App.svelte';
 import Identify from './lib/Identify.svelte';
 import Arrange from './lib/Arrange.svelte';
 import CabinetScreen from './lib/CabinetScreen.svelte';
+import Headset from './Headset.svelte';
 
 // the Screens page's helpers open the app's page in windows of their own, told by the address
 // which they are: a screen's name shown on it, or a stand-in for one of the player's windows; and
-// cabinet mode's other screens, the backglass's, the score display's and a topper's
+// cabinet mode's other screens, the backglass's, the score display's and a topper's; and the headset's
+// panel (vpi-panel), the library and a table's page shown in VR
 const hash = location.hash.slice(1);
-const helper = hash.startsWith('identify') ? Identify : hash.startsWith('arrange') ? Arrange : hash.startsWith('cabinet') ? CabinetScreen : App;
+const helper = hash.startsWith('identify')
+  ? Identify
+  : hash.startsWith('arrange')
+    ? Arrange
+    : hash.startsWith('cabinet')
+      ? CabinetScreen
+      : hash.startsWith('headset')
+        ? Headset
+        : App;
 mount(helper, { target: document.getElementById('app') });

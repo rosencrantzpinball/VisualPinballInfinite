@@ -1,0 +1,16 @@
+--- a/media/gpu/v4l2/v4l2_stateful_video_decoder.cc
++++ b/media/gpu/v4l2/v4l2_stateful_video_decoder.cc
+@@ -392,8 +392,12 @@
+   constexpr int kFullHDNumPixels = 1920 * 1080;
+   const size_t kInputBufferInMBs =
+       (config.coded_size().GetArea() <= kFullHDNumPixels) ? 2 : 4;
++  // Also give the coded size, the placeholder that V4L2's stateful decoder
++  // interface allows until the stream's own is parsed: Qualcomm's upstream
++  // iris driver refuses to start a session without one (VIDIOC_REQBUFS fails
++  // with EINVAL).
+   const auto v4l2_format = OUTPUT_queue_->SetFormat(
+-      profile_as_v4l2_fourcc, gfx::Size(), kInputBufferInMBs * kMiB);
++      profile_as_v4l2_fourcc, config.coded_size(), kInputBufferInMBs * kMiB);
+   if (!v4l2_format) {
+     std::move(init_cb).Run(DecoderStatus::Codes::kFailedToCreateDecoder);
+     return;

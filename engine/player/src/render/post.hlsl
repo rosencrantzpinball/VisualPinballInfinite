@@ -17,6 +17,16 @@ bool post_untouched(float2 u)
     return false;
 }
 
+// a pass's alpha: VR's passthrough's when asked (post_flags.y, the depth read), as environment_alpha_fs below
+// writes it, else opaque
+float post_alpha(float2 pixel)
+{
+    return post_flags.y != 0.0 && post_depth.SampleLevel(post_point_sampler, pixel * w_h_height.xy, 0.0) == 1.0 ? 0.0 : 1.0;
+}
+
+// a pass's result (each pass's pixel is `v`)
+#define post_out(c) post_result((c), post_alpha(v.clip.xy))
+
 // ---- FXAA (fs_pp_fxaa.sc) and FAAA (fs_pp_faaa.sc) ----
 //
 // Their code isn't VPX's own: VPX marks the files GPL, and ships them so, but FXAA 2 and 3 are NVIDIA's FXAA 3.11 by
@@ -663,3 +673,13 @@ float4 bilateral_cas_fs(PostVaryings v) : SV_Target
     return post_out(e[4] + sharpen * ampRGB);
 }
 
+// ---- VR's passthrough (the owner's VPX fork's fs_pp_environment_alpha.sc) ----
+//
+// The picture's alpha from the scene's depth, its colours left as they are (the pass writes alpha alone):
+// opaque wherever the table or its room drew, see-through where nothing did (the depth still cleared), where
+// the headset blends in the world.
+float4 environment_alpha_fs(PostVaryings v) : SV_Target0
+{
+    float depth = post_depth.Load(int3(v.clip.xy, 0));
+    return float4(0.0, 0.0, 0.0, depth == 1.0 ? 0.0 : 1.0);
+}

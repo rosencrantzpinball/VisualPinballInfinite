@@ -235,6 +235,7 @@ pub struct Library {
     pub GetDisplayIdentifyBits: Option<unsafe extern "C" fn(i32) -> i32>,
 }
 
+#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
@@ -242,24 +243,58 @@ unsafe extern "system" {
 }
 
 /// Look for the library's own dependencies beside it.
+#[cfg(windows)]
 const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x8;
+
+/// Loads a library (Windows: by `LoadLibraryExW`, its dependencies looked for beside it).
+#[cfg(windows)]
+unsafe fn open_library(path: &Path) -> *mut c_void {
+    let wide: Vec<u16> = path.as_os_str().to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: a null-terminated path
+    unsafe { LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), LOAD_WITH_ALTERED_SEARCH_PATH) }
+}
+
+#[cfg(windows)]
+unsafe fn symbol(module: *mut c_void, name: *const c_char) -> *mut c_void {
+    // SAFETY: a module of ours and a null-terminated name
+    unsafe { GetProcAddress(module, name) }
+}
+
+#[cfg(not(windows))]
+unsafe extern "C" {
+    fn dlopen(file: *const c_char, mode: i32) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
+}
+
+/// Loads a library (Linux: `dlopen`, every symbol bound at once, kept to itself).
+#[cfg(not(windows))]
+unsafe fn open_library(path: &Path) -> *mut c_void {
+    const RTLD_NOW: i32 = 2;
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else { return std::ptr::null_mut() };
+    // SAFETY: a null-terminated path
+    unsafe { dlopen(c.as_ptr(), RTLD_NOW) }
+}
+
+#[cfg(not(windows))]
+unsafe fn symbol(module: *mut c_void, name: *const c_char) -> *mut c_void {
+    // SAFETY: a handle dlopen gave and a null-terminated name
+    unsafe { dlsym(module, name) }
+}
 
 impl Library {
     /// Loads the library at `path` and finds every function this host uses.
     // each transmute's target is the field it fills, typed as the header has it
     #[allow(clippy::missing_transmute_annotations)]
     pub fn load(path: &Path) -> Result<Library, String> {
-        let wide: Vec<u16> = path.as_os_str().to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
-        // SAFETY: a null-terminated path; the module stays loaded for the
-        // life of the program
-        let module = unsafe { LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), LOAD_WITH_ALTERED_SEARCH_PATH) };
+        // SAFETY: the module stays loaded for the life of the program
+        let module = unsafe { open_library(path) };
         if module.is_null() {
             return Err(format!("could not load {}: {}", path.display(), std::io::Error::last_os_error()));
         }
         macro_rules! function {
             ($name:literal) => {{
                 // SAFETY: the export's address, cast to the type the header gives it
-                let f = unsafe { GetProcAddress(module, concat!($name, "\0").as_ptr() as *const c_char) };
+                let f = unsafe { symbol(module, concat!($name, "\0").as_ptr() as *const c_char) };
                 if f.is_null() {
                     return Err(format!("{} has no {}", path.display(), $name));
                 }
@@ -270,7 +305,7 @@ impl Library {
         macro_rules! optional {
             ($name:literal) => {{
                 // SAFETY: as above, when the export is there
-                let f = unsafe { GetProcAddress(module, concat!($name, "\0").as_ptr() as *const c_char) };
+                let f = unsafe { symbol(module, concat!($name, "\0").as_ptr() as *const c_char) };
                 if f.is_null() { None } else { Some(unsafe { std::mem::transmute::<*mut c_void, _>(f) }) }
             }};
         }
@@ -323,7 +358,7 @@ pub fn folder(path: &Path) -> Vec<c_char> {
     // without the `\\?\` that canonical Windows paths carry
     let mut s = text.strip_prefix(r"\\?\").unwrap_or(&text).to_string();
     if !s.ends_with('\\') && !s.ends_with('/') {
-        s.push('\\');
+        s.push(std::path::MAIN_SEPARATOR);
     }
     s.bytes().map(|b| b as c_char).chain(std::iter::once(0)).collect()
 }

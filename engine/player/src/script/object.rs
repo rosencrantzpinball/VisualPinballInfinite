@@ -243,10 +243,10 @@ unsafe extern "system" fn type_info_release(this: *mut c_void) -> u32 {
 unsafe extern "system" fn type_info_documentation(
     this: *mut c_void,
     memid: i32,
-    name: *mut *mut u16,
-    doc: *mut *mut u16,
+    name: *mut *mut OLECHAR,
+    doc: *mut *mut OLECHAR,
     help_context: *mut u32,
-    help_file: *mut *mut u16,
+    help_file: *mut *mut OLECHAR,
 ) -> HRESULT {
     unsafe {
         for p in [name, doc, help_file] {
@@ -268,7 +268,7 @@ unsafe extern "system" fn type_info_documentation(
     S_OK
 }
 
-unsafe extern "system" fn get_ids_of_names(this: *mut c_void, _riid: *const GUID, names: *const *const u16, count: u32, _lcid: u32, ids: *mut i32) -> HRESULT {
+unsafe extern "system" fn get_ids_of_names(this: *mut c_void, _riid: *const GUID, names: *const *const OLECHAR, count: u32, _lcid: u32, ids: *mut i32) -> HRESULT {
     unsafe {
         let o = &*(this as *const Obj);
         for i in 0..count as usize {

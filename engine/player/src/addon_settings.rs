@@ -20,7 +20,7 @@ fn default_path() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("VPI_ADDON_SETTINGS") {
         return Some(PathBuf::from(p));
     }
-    Some(PathBuf::from(std::env::var_os("APPDATA")?).join("Visual Pinball Infinite").join("Add-on settings.ini"))
+    Some(vpi_settings::data_folder()?.join("Add-on settings.ini"))
 }
 
 fn with<R>(f: impl FnOnce(&mut Store) -> R) -> R {

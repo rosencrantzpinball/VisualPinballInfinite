@@ -12,6 +12,8 @@
   import { notice, showFile, follow } from './store.svelte.js';
 
   let { t, onclose, onfindvps, onscreens } = $props();
+  // in the headset (the player's panel): no physics window, no files shown
+  const headset = !!window.__VPI_HEADSET__;
 
   // a rename to VPS's name put back: the files, PinUP Popper's game, and what's ours
   let putting = $state(false);
@@ -146,7 +148,12 @@
     <header>
       <div>
         <h1 id="ts-title" class="display">Settings for {t.short}</h1>
-        <p>For this table alone, over your usual settings. Kept beside it in {view ? view.file.split('\\').pop() : 'its own settings file'}, which VPX reads too.</p>
+        {#if view?.apart}
+          <!-- the Steam Frame: its tables only read, the settings in VPI's own folder -->
+          <p>For this table alone, over your usual settings. Kept in VPI’s own folder as {view.file.split(/[\\/]/).pop()}, since the tables here are only read: VPX doesn’t see these.</p>
+        {:else}
+          <p>For this table alone, over your usual settings. Kept beside it in {view ? view.file.split(/[\\/]/).pop() : 'its own settings file'}, which VPX reads too.</p>
+        {/if}
       </div>
       <button type="button" class="btn icon ghost" aria-label="Close" onclick={onclose} disabled={busy}><Icon name="x" /></button>
     </header>
@@ -214,15 +221,18 @@
             <!-- its own screens, the Screens page for it alone, beside this window -->
             {#if onscreens}<button type="button" class="btn small" onclick={onscreens}>Custom…</button>{/if}
           </div>
-          <div class="row">
-            <span class="name">Its screens</span>
-            <select class="select" value={mine.screenPreset ?? ''} onchange={(e) => (mine.screenPreset = e.currentTarget.value || null)} aria-label="Its screens">
-              <option value="">Your usual screens</option>
-              {#each presets as p (p)}<option value={p}>The preset “{p}”</option>{/each}
-              {#if mine.screenPreset && !presets.includes(mine.screenPreset)}<option value={mine.screenPreset}>“{mine.screenPreset}”, a preset that isn’t there</option>{/if}
-            </select>
-            <span class="def">{presets.length ? 'Presets are saved from the Screens page.' : 'Save a preset from the Screens page to choose it here.'}</span>
-          </div>
+          <!-- the desktop's windows: no Screens page in the headset -->
+          {#if !headset}
+            <div class="row">
+              <span class="name">Its screens</span>
+              <select class="select" value={mine.screenPreset ?? ''} onchange={(e) => (mine.screenPreset = e.currentTarget.value || null)} aria-label="Its screens">
+                <option value="">Your usual screens</option>
+                {#each presets as p (p)}<option value={p}>The preset “{p}”</option>{/each}
+                {#if mine.screenPreset && !presets.includes(mine.screenPreset)}<option value={mine.screenPreset}>“{mine.screenPreset}”, a preset that isn’t there</option>{/if}
+              </select>
+              <span class="def">{presets.length ? 'Presets are saved from the Screens page.' : 'Save a preset from the Screens page to choose it here.'}</span>
+            </div>
+          {/if}
           {#each [['playfieldVolume', 'Playfield volume'], ['backglassVolume', 'Backglass volume']] as [k, label] (k)}
             <div class="row">
               <span class="name">{label}</span>
@@ -311,11 +321,11 @@
             <span class="name">Physics</span>
             {#if view.physics}
               <span class="def strong">From {view.physics} beside it, read before it plays, as VPX reads it</span>
-              <button type="button" class="btn small ghost" onclick={() => showFile(t, 'physics')}>Show</button>
+              {#if !headset}<button type="button" class="btn small ghost" onclick={() => showFile(t, 'physics')}>Show</button>{/if}
             {:else}
               <span class="def">The table’s own</span>
             {/if}
-            <button type="button" class="btn small" aria-label="Change its physics" onclick={() => (physicsOpen = true)}>Change…</button>
+            {#if !headset}<button type="button" class="btn small" aria-label="Change its physics" onclick={() => (physicsOpen = true)}>Change…</button>{/if}
           </div>
           <div class="row">
             <span class="name">Reaching outside its files</span>

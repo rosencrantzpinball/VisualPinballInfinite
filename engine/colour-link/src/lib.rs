@@ -16,6 +16,11 @@
 //! version 2 of the GPL alone, and uses this crate.
 
 mod layout;
+#[cfg(windows)]
+mod win;
+// the same calls with POSIX, on Linux
+#[cfg(not(windows))]
+#[path = "unix.rs"]
 mod win;
 
 use std::io;

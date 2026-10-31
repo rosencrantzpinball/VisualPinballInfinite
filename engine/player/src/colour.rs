@@ -294,19 +294,21 @@ mod tests {
 
     #[test]
     fn colour_files_are_found_as_vpx_looks_and_then_in_vpinmames_folder() {
+        // the test's paths, written as Windows writes them, in this system's form
+        let here = |p: &str| p.replace('\\', std::path::MAIN_SEPARATOR_STR);
         let dir = std::env::temp_dir().join(format!("vpi-colour-find-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let table = dir.join("table");
         // made-up games, so the user's own colour files in VPinMAME's folder never answer for them
         // PIN2DMD's files in the table's pinmame folder, by PIN2DMD's names
-        std::fs::create_dir_all(table.join(r"pinmame\altcolor\vpi_test_dmd")).unwrap();
-        std::fs::write(table.join(r"pinmame\altcolor\vpi_test_dmd\pin2dmd.pal"), b"").unwrap();
-        std::fs::write(table.join(r"pinmame\altcolor\vpi_test_dmd\pin2dmd.vni"), b"").unwrap();
+        std::fs::create_dir_all(table.join(&here(r"pinmame\altcolor\vpi_test_dmd"))).unwrap();
+        std::fs::write(table.join(&here(r"pinmame\altcolor\vpi_test_dmd\pin2dmd.pal")), b"").unwrap();
+        std::fs::write(table.join(&here(r"pinmame\altcolor\vpi_test_dmd\pin2dmd.vni")), b"").unwrap();
         let found = find(Some(&table), "vpi_test_dmd", &[], &[]);
-        assert_eq!(found, Some(Files::Vni { pal: table.join(r"pinmame\altcolor\vpi_test_dmd\pin2dmd.pal"), vni: Some(table.join(r"pinmame\altcolor\vpi_test_dmd\pin2dmd.vni")) }));
+        assert_eq!(found, Some(Files::Vni { pal: table.join(&here(r"pinmame\altcolor\vpi_test_dmd\pin2dmd.pal")), vni: Some(table.join(&here(r"pinmame\altcolor\vpi_test_dmd\pin2dmd.vni"))) }));
         // a Serum file beside them comes first, its letters' case as it likes
-        std::fs::write(table.join(r"pinmame\altcolor\vpi_test_dmd\VPI_TEST_DMD.CRZ"), b"").unwrap();
-        assert_eq!(find(Some(&table), "vpi_test_dmd", &[], &[]), Some(Files::Serum { folder: table.join(r"pinmame\altcolor") }));
+        std::fs::write(table.join(&here(r"pinmame\altcolor\vpi_test_dmd\VPI_TEST_DMD.CRZ")), b"").unwrap();
+        assert_eq!(find(Some(&table), "vpi_test_dmd", &[], &[]), Some(Files::Serum { folder: table.join(&here(r"pinmame\altcolor")) }));
         // each kind switched off on its own
         let off = [("Enable".to_string(), "0".to_string())];
         assert!(matches!(find(Some(&table), "vpi_test_dmd", &off, &[]), Some(Files::Vni { .. })));
@@ -314,12 +316,12 @@ mod tests {
         // a game with no file of its own
         assert_eq!(find(Some(&table), "zzz_never", &[], &[]), None);
         // PIN2DMD's locked file, used only once the user has set the key, and its key never printed
-        std::fs::create_dir_all(table.join(r"pinmame\altcolor\vpi_test_pac")).unwrap();
-        std::fs::write(table.join(r"pinmame\altcolor\vpi_test_pac\pin2dmd.pac"), b"").unwrap();
+        std::fs::create_dir_all(table.join(&here(r"pinmame\altcolor\vpi_test_pac"))).unwrap();
+        std::fs::write(table.join(&here(r"pinmame\altcolor\vpi_test_pac\pin2dmd.pac")), b"").unwrap();
         assert_eq!(find(Some(&table), "vpi_test_pac", &[], &[]), None);
         let key = [("PacKey".to_string(), "00112233445566778899aabbccddeeff".to_string())];
         let found = find(Some(&table), "vpi_test_pac", &[], &key);
-        assert!(matches!(&found, Some(Files::Pac { pac, .. }) if *pac == table.join(r"pinmame\altcolor\vpi_test_pac\pin2dmd.pac")));
+        assert!(matches!(&found, Some(Files::Pac { pac, .. }) if *pac == table.join(&here(r"pinmame\altcolor\vpi_test_pac\pin2dmd.pac"))));
         assert!(!format!("{found:?}").contains("0011"));
         let _ = std::fs::remove_dir_all(&dir);
     }

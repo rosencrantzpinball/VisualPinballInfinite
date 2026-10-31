@@ -4,5 +4,8 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=native/altsound.cpp");
-    cc::Build::new().cpp(true).file("native/altsound.cpp").flag_if_supported("/std:c++17").warnings(true).compile("vpi_altsound");
+    // (Windows only: elsewhere AltSound doesn't play yet, src/altsound.rs)
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        cc::Build::new().cpp(true).file("native/altsound.cpp").flag_if_supported("/std:c++17").warnings(true).compile("vpi_altsound");
+    }
 }

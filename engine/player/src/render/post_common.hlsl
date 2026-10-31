@@ -33,7 +33,7 @@ PostVaryings post_vs(uint id : SV_VertexID)
 cbuffer Post : register(b0, space3)
 {
     float4 w_h_height; // xy: 1 / the picture's size; z: its width; w: 1 when its depth can be read
-    float4 post_flags; // x: the result is decoded to linear light (the target encodes sRGB itself)
+    float4 post_flags; // x: the result is decoded to linear light (the target encodes sRGB itself); y: its alpha is VR's passthrough's (post.hlsl)
 };
 
 // sRGB's curve undone (VPX's InvGamma)
@@ -44,9 +44,10 @@ float3 post_linear(float3 c)
     return float3(c.r <= 0.04045 ? lo.r : hi.r, c.g <= 0.04045 ? lo.g : hi.g, c.b <= 0.04045 ? lo.b : hi.b);
 }
 
-float4 post_out(float3 c)
+// a pass's result, of alpha `alpha` (post.hlsl's and SMAA's post_out)
+float4 post_result(float3 c, float alpha)
 {
-    return float4(post_flags.x != 0.0 ? post_linear(c) : c, 1.0);
+    return float4(post_flags.x != 0.0 ? post_linear(c) : c, alpha);
 }
 
 // every pass's samplers, whatever its pictures: linear first, point second
@@ -55,6 +56,30 @@ SamplerState post_point_sampler : register(s1, space2);
 
 // SMAA's settings (SMAA.sh: the high preset), its porting through the samplers above
 #define SMAA_CUSTOM_SL 1
+#ifdef __spirv__
+// Vulkan (Linux): SDL's Vulkan backend binds each picture with its own sampler, as one, so a picture can't be
+// sampled through another slot's sampler. Each SMAA picture carries its own (`<picture>_sampler`, which
+// smaa_passes.hlsl names), linear for every slot of an SMAA pass there (post.rs), and a point sample reads
+// the texel itself: what the two samplers above give on Direct3D.
+#define SMAATexture2D(tex) Texture2D tex, SamplerState tex##_sampler
+#define SMAATexturePass2D(tex) tex, tex##_sampler
+#define SMAASampleLevelZero(tex, coord) tex.SampleLevel(tex##_sampler, coord, 0)
+#define SMAASampleLevelZeroPoint(tex, coord) post_texel(tex, coord)
+#define SMAASampleLevelZeroOffset(tex, coord, offset) tex.SampleLevel(tex##_sampler, coord, 0, offset)
+#define SMAASample(tex, coord) tex.Sample(tex##_sampler, coord)
+#define SMAASamplePoint(tex, coord) post_texel(tex, coord)
+#define SMAASampleOffset(tex, coord, offset) tex.Sample(tex##_sampler, coord, offset)
+#define SMAAGather(tex, coord) tex.Gather(tex##_sampler, coord, 0)
+
+// the texel under `uv`, as the point sampler (clamped to the edges) reads it
+float4 post_texel(Texture2D tex, float2 uv)
+{
+    uint w, h;
+    tex.GetDimensions(w, h);
+    int2 size = int2(w, h);
+    return tex.Load(int3(clamp(int2(floor(uv * float2(size))), int2(0, 0), size - 1), 0));
+}
+#else
 #define SMAATexture2D(tex) Texture2D tex
 #define SMAATexturePass2D(tex) tex
 #define SMAASampleLevelZero(tex, coord) tex.SampleLevel(post_linear_sampler, coord, 0)
@@ -63,11 +88,12 @@ SamplerState post_point_sampler : register(s1, space2);
 #define SMAASample(tex, coord) tex.Sample(post_linear_sampler, coord)
 #define SMAASamplePoint(tex, coord) tex.Sample(post_point_sampler, coord)
 #define SMAASampleOffset(tex, coord, offset) tex.Sample(post_linear_sampler, coord, offset)
+#define SMAAGather(tex, coord) tex.Gather(post_linear_sampler, coord, 0)
+#endif
 #define SMAA_FLATTEN [flatten]
 #define SMAA_BRANCH [branch]
 #define SMAATexture2DMS2(tex) Texture2DMS<float4, 2> tex
 #define SMAALoad(tex, pos, sample) tex.Load(pos, sample)
-#define SMAAGather(tex, coord) tex.Gather(post_linear_sampler, coord, 0)
 #define SMAA_PRESET_HIGH
 #define SMAA_RT_METRICS smaa_metrics
 // 1 / the picture's size, and its size: set by each SMAA entry from its stage's uniforms

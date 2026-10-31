@@ -1,0 +1,31 @@
+--- a/tools/gn_args.py	2026-10-30 01:53:35
++++ b/tools/gn_args.py	2026-10-30 01:53:35
+@@ -84,6 +84,8 @@
+   machine = 'arm64' if python_platform.machine() == 'arm64' else 'amd64'
+ elif sys.platform.startswith('linux'):
+   platform = 'linux'
++  # Linux machines report 'aarch64' or 'x86_64'.
++  machine = 'arm64' if python_platform.machine() == 'aarch64' else 'amd64'
+ else:
+   print('Unknown operating system platform')
+   sys.exit()
+@@ -447,7 +449,8 @@
+     elif target_cpu == 'arm':
+       assert use_sysroot, 'target_cpu="arm" requires use_sysroot=true'
+     elif target_cpu == 'arm64':
+-      assert use_sysroot, 'target_cpu="arm64" requires use_sysroot=true'
++      assert use_sysroot or machine == 'arm64', \
++          'target_cpu="arm64" requires use_sysroot=true or an arm64 machine'
+ 
+   # ASAN requires Release builds.
+   if is_asan:
+@@ -674,7 +677,8 @@
+           msg('Not generating %s configuration due to missing sysroot directory'
+               % cpu)
+     else:
+-      supported_cpus = ['x64']
++      # Without a sysroot, the machine's own architecture.
++      supported_cpus = ['arm64' if machine == 'arm64' else 'x64']
+   elif platform in ('windows', 'mac'):
+     if machine == 'amd64' or os.environ.get('CEF_ENABLE_AMD64', '') == '1':
+       supported_cpus.append('x64')
