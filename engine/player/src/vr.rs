@@ -169,14 +169,6 @@ mod imp {
     /// television across a small room.
     const PANEL_METRES: (f32, f32) = (1.7, 1.0625);
     const PANEL_AWAY: f32 = 1.5;
-    /// Frames an image of the panel's swapchain stays untouched after it goes up, before a new picture
-    /// is written into it: 6 at 72 Hz, its 3 images in turn, so the panel shows up to 36 pictures a
-    /// second while it changes all the time, and changes after a pause at once. With every frame's
-    /// picture written (0), the owner saw blocks of black and white over the panel in the headset as
-    /// the pointer moved over the library, while SteamVR's recording of that session shows it whole:
-    /// the runtime may still be showing an image it has handed back. `VPI_PANEL_IMAGE_REST` sets it for
-    /// checks.
-    const PANEL_IMAGE_REST: u64 = 6;
     /// The pause menu's distance, and the height in the room of the screen it's laid out for (the
     /// window's): its picture as big as it would be on that screen.
     const MENU_AWAY: f32 = 1.2;
@@ -211,13 +203,14 @@ mod imp {
         /// pictures with new ones were kept to look at.
         solid: Vec<bool>,
         broken_kept: u32,
-        /// Frames shown so far, the frames an image rests (`PANEL_IMAGE_REST`), the frames its latest
-        /// pictures went up at (one for each image of its swapchain), and since the last count, the
-        /// pictures put up and the longest the runtime took to give an image.
+        /// Frames shown so far, the frame its two swapchains last changed places and the one the picture
+        /// being written was sent, and since the last count, the pictures put up, the most frames one
+        /// took to be written and the longest the runtime took to give an image.
         frames: u64,
-        rest: u64,
-        uploads: std::collections::VecDeque<u64>,
+        swapped_at: u64,
+        sent_at: u64,
         put_up: u32,
+        slowest: u64,
         longest_wait: std::time::Duration,
     }
 
@@ -570,9 +563,10 @@ mod imp {
                     solid: Vec::new(),
                     broken_kept: 0,
                     frames: 0,
-                    rest: std::env::var("VPI_PANEL_IMAGE_REST").ok().and_then(|v| v.parse().ok()).unwrap_or(PANEL_IMAGE_REST),
-                    uploads: std::collections::VecDeque::new(),
+                    swapped_at: 0,
+                    sent_at: 0,
                     put_up: 0,
+                    slowest: 0,
                     longest_wait: std::time::Duration::ZERO,
                 });
             }
@@ -745,7 +739,7 @@ mod imp {
             }
             // SAFETY: on the thread that draws, the session running
             unsafe { session.make_quad(&self.runtime, Layer::Menu, picture.width, picture.height)? };
-            session.quad_picture(&self.runtime, Layer::Menu, &picture.pixels, picture.width, picture.height, false)?;
+            session.quad_picture(&self.runtime, Layer::Menu, &picture.pixels, picture.width, picture.height, false, true)?;
             let m = self.menu.get_or_insert_with(MenuView::default);
             (m.size, m.at, m.screen_height, m.layout, m.shown) = ((picture.width, picture.height), picture.at, screen.1 as f32, layout.clone(), true);
             // test runs: each picture of the menu's as it came
@@ -799,22 +793,31 @@ mod imp {
             }
             let elapsed_ms = self.started.elapsed().as_millis() as u64;
             let capturing = self.options.capture.is_some() && self.next_panel_capture < self.options.capture_at.len();
-            // the next image the runtime gives is the one put up as many pictures ago as it has images:
-            // written only once it has stayed untouched `PANEL_IMAGE_REST` frames; till then the panel's
-            // newest picture waits in the link
+            // the picture sent last shown from this frame on, once the GPU has written it (the panel's two
+            // swapchains change places: `xr::QuadChain`)
             view.frames += 1;
-            let images = session.quad_images(Layer::Panel).max(1);
-            let rested = view.uploads.len() < images || view.uploads.front().is_some_and(|&at| view.frames - at >= view.rest);
-            if view.frames % 360 == 0 && view.put_up > 0 {
-                println!("panel: {} pictures put up in 5 s, the runtime giving each image within {:.1} ms", view.put_up, view.longest_wait.as_secs_f64() * 1000.0);
-                (view.put_up, view.longest_wait) = (0, std::time::Duration::ZERO);
+            if session.quad_settle(&self.runtime, Layer::Panel, false)? {
+                view.slowest = view.slowest.max(view.frames - view.sent_at);
+                view.swapped_at = view.frames;
             }
-            if rested && let Some(picture) = view.panel.picture() {
-                let waited = session.quad_picture(&self.runtime, Layer::Panel, picture.pixels, picture.width, picture.height, true)?;
-                view.uploads.push_back(view.frames);
-                while view.uploads.len() > images {
-                    view.uploads.pop_front();
-                }
+            if view.frames % 360 == 0 && view.put_up > 0 {
+                println!(
+                    "panel: {} pictures put up in 5 s, each shown within {} frames of being sent, the runtime giving each image within {:.1} ms",
+                    view.put_up,
+                    view.slowest,
+                    view.longest_wait.as_secs_f64() * 1000.0
+                );
+                (view.put_up, view.slowest, view.longest_wait) = (0, 0, std::time::Duration::ZERO);
+            }
+            // the next picture written into the swapchain not shown, a frame after they last changed
+            // places at the soonest, as SteamVR may still show the other till then; meanwhile the panel's
+            // newest picture waits in the link
+            if !session.quad_writing(Layer::Panel)
+                && view.frames > view.swapped_at
+                && let Some(picture) = view.panel.picture()
+            {
+                let waited = session.quad_picture(&self.runtime, Layer::Panel, picture.pixels, picture.width, picture.height, true, false)?;
+                view.sent_at = view.frames;
                 view.put_up += 1;
                 view.longest_wait = view.longest_wait.max(waited);
                 view.pictures += 1;

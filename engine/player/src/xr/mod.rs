@@ -546,12 +546,21 @@ impl Layer {
     }
 }
 
-/// A quad's swapchain: its pictures uploaded into it as they change, shown as a quad layer.
+/// A quad's two swapchains, of one size, its pictures uploaded as they change: the layer shows one
+/// while a new picture is written into the other's next image, and they change places once the GPU
+/// has written it. SteamVR draws quads in its lens pass, as the headset shows them: with one swapchain,
+/// the image being written could be the one it read, which showed in the headset as blocks of black and
+/// white over the panel, never in SteamVR's recordings of it.
 struct QuadChain {
-    chain: Swapchain,
+    chains: [Swapchain; 2],
+    /// The one the layer shows; the other is written.
+    front: usize,
     /// Its images are BGRA (else RGBA): a picture in the other order has its red and blue swapped.
     bgra: bool,
     transfer: *mut SDL_GPUTransferBuffer,
+    /// The GPU's copy into the other's image while it's written (null: none), which is handed over and
+    /// shown once the copy is done (`quad_settle`).
+    writing: *mut SDL_GPUFence,
     /// An image was handed over: the layer has something to show.
     shown: bool,
 }
@@ -958,6 +967,7 @@ impl Session {
                 .iter()
                 .filter_map(|&(which, q)| {
                     let c = self.quad(which).filter(|c| c.shown && frame.should_render)?;
+                    let chain = &c.chains[c.front];
                     // the pause menu's picture has straight alpha, its corners see through; the panel is whole
                     let layer_flags = match which {
                         Layer::Menu => xr::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA | xr::CompositionLayerFlags::UNPREMULTIPLIED_ALPHA,
@@ -970,10 +980,10 @@ impl Session {
                         space: self.space,
                         eye_visibility: xr::EyeVisibility::BOTH,
                         sub_image: xr::SwapchainSubImage {
-                            swapchain: c.chain.handle,
+                            swapchain: chain.handle,
                             image_rect: xr::Rect2Di {
                                 offset: xr::Offset2Di { x: 0, y: 0 },
-                                extent: xr::Extent2Di { width: q.rect.0.min(c.chain.width) as i32, height: q.rect.1.min(c.chain.height) as i32 },
+                                extent: xr::Extent2Di { width: q.rect.0.min(chain.width) as i32, height: q.rect.1.min(chain.height) as i32 },
                             },
                             image_array_index: 0,
                         },
@@ -1066,20 +1076,35 @@ impl Session {
     unsafe fn release_quad(&self, rt: &Runtime, quad: QuadChain) {
         // SAFETY: as the caller promises
         unsafe {
-            for t in quad.chain.textures {
-                SDL_ReleaseGPUTexture(self.device, t);
+            if !quad.writing.is_null() {
+                SDL_ReleaseGPUFence(self.device, quad.writing);
             }
-            (rt.f.destroy_swapchain)(quad.chain.handle);
+            for chain in quad.chains {
+                self.drop_swapchain(rt, chain);
+            }
             SDL_ReleaseGPUTransferBuffer(self.device, quad.transfer);
         }
     }
 
-    /// Makes a quad's swapchain, at least `width` by `height` pixels: made again for a bigger picture.
+    /// # Safety
+    /// On the thread that draws; the GPU done with the swapchain's images.
+    unsafe fn drop_swapchain(&self, rt: &Runtime, chain: Swapchain) {
+        // SAFETY: as the caller promises
+        unsafe {
+            for t in chain.textures {
+                SDL_ReleaseGPUTexture(self.device, t);
+            }
+            (rt.f.destroy_swapchain)(chain.handle);
+        }
+    }
+
+    /// Makes a quad's two swapchains, at least `width` by `height` pixels: made again for a bigger
+    /// picture.
     ///
     /// # Safety
     /// On the thread that draws, while the session runs.
     pub unsafe fn make_quad(&mut self, rt: &Runtime, which: Layer, width: u32, height: u32) -> Result<(), String> {
-        if self.quad(which).is_some_and(|q| q.chain.width >= width && q.chain.height >= height) {
+        if self.quad(which).is_some_and(|q| q.chains[0].width >= width && q.chains[0].height >= height) {
             return Ok(());
         }
         let name = which.name();
@@ -1095,6 +1120,34 @@ impl Session {
             let Some(&(vk_format, format, bgra)) = QUAD_FORMATS.iter().find(|(f, ..)| formats.contains(f)) else {
                 return Err(format!("the runtime offers no swapchain format for the {name} ({formats:?})"));
             };
+            let first = self.quad_swapchain(rt, name, vk_format, format, width, height)?;
+            let second = match self.quad_swapchain(rt, name, vk_format, format, width, height) {
+                Ok(chain) => chain,
+                Err(e) => {
+                    self.drop_swapchain(rt, first);
+                    return Err(e);
+                }
+            };
+            let bi = SDL_GPUTransferBufferCreateInfo { usage: SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, size: width * height * 4, props: SDL_PropertiesID(0) };
+            let transfer = SDL_CreateGPUTransferBuffer(self.device, &bi);
+            if transfer.is_null() {
+                self.drop_swapchain(rt, first);
+                self.drop_swapchain(rt, second);
+                return Err(format!("the {name}'s upload buffer: {}", crate::render::sdl_error()));
+            }
+            println!("VR: the {name}'s two swapchains, {} images each of {width}x{height}", first.textures.len());
+            *self.quad_slot(which) = Some(QuadChain { chains: [first, second], front: 0, bgra, transfer, writing: null_mut(), shown: false });
+            Ok(())
+        }
+    }
+
+    /// One of a quad's swapchains, `width` by `height` pixels of `vk_format`, its images as SDL's
+    /// textures of `format`.
+    ///
+    /// # Safety
+    /// On the thread that draws, while the session runs.
+    unsafe fn quad_swapchain(&self, rt: &Runtime, name: &str, vk_format: i64, format: SDL_GPUTextureFormat, width: u32, height: u32) -> Result<Swapchain, String> {
+        unsafe {
             let info = xr::SwapchainCreateInfo {
                 ty: xr::StructureType::SWAPCHAIN_CREATE_INFO,
                 next: null(),
@@ -1117,10 +1170,7 @@ impl Session {
             let r = (rt.f.enumerate_swapchain_images)(handle, n, &mut n, images.as_mut_ptr().cast());
             let mut chain = Swapchain { handle, width, height, textures: Vec::new(), acquired: None };
             let fail = |chain: Swapchain, e: String| {
-                for t in chain.textures {
-                    SDL_ReleaseGPUTexture(self.device, t);
-                }
-                (rt.f.destroy_swapchain)(chain.handle);
+                self.drop_swapchain(rt, chain);
                 Err(e)
             };
             if r != xr::Result::SUCCESS {
@@ -1146,78 +1196,102 @@ impl Session {
                 }
                 chain.textures.push(texture);
             }
-            let bi = SDL_GPUTransferBufferCreateInfo { usage: SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, size: width * height * 4, props: SDL_PropertiesID(0) };
-            let transfer = SDL_CreateGPUTransferBuffer(self.device, &bi);
-            if transfer.is_null() {
-                return fail(chain, format!("the {name}'s upload buffer: {}", crate::render::sdl_error()));
-            }
-            println!("VR: the {name}'s swapchain, {} images of {width}x{height}", chain.textures.len());
-            *self.quad_slot(which) = Some(QuadChain { chain, bgra, transfer, shown: false });
-            Ok(())
+            Ok(chain)
         }
     }
 
-    /// How many images a quad's swapchain has (the runtime's choice), none before it's made.
-    pub fn quad_images(&self, which: Layer) -> usize {
-        self.quad(which).map_or(0, |q| q.chain.textures.len())
-    }
-
-    /// A picture (`width` by `height`, rows packed, BGRA, else RGBA) uploaded into a quad's
-    /// swapchain's next image, handed over once the GPU has written it: the quad shows it from the
-    /// next frame on. How long the runtime took to give the image.
-    pub fn quad_picture(&mut self, rt: &Runtime, which: Layer, pixels: &[u8], width: u32, height: u32, bgra: bool) -> Result<Duration, String> {
+    /// A picture (`width` by `height`, rows packed, BGRA, else RGBA) uploaded by the GPU into the next
+    /// image of the quad's swapchain not shown; handed over and shown once the GPU has written it: at
+    /// once with `wait` (an earlier picture still being written finished first), else when
+    /// `quad_settle` finds it done, the frame waiting for nothing. Without `wait`, nothing while an
+    /// earlier picture is still being written (`quad_writing`). How long the runtime took to give the
+    /// image.
+    pub fn quad_picture(&mut self, rt: &Runtime, which: Layer, pixels: &[u8], width: u32, height: u32, bgra: bool, wait: bool) -> Result<Duration, String> {
+        if wait && self.quad_writing(which) {
+            self.quad_settle(rt, which, true)?;
+        }
         let (device, name) = (self.device, which.name());
-        let Some(panel) = self.quad_slot(which).as_mut() else { return Ok(Duration::ZERO) };
-        let (width, height) = (width.min(panel.chain.width), height.min(panel.chain.height));
+        let Some(quad) = self.quad_slot(which).as_mut() else { return Ok(Duration::ZERO) };
+        let back = &quad.chains[1 - quad.front];
+        let (handle, width, height) = (back.handle, width.min(back.width), height.min(back.height));
         let row = width as usize * 4;
-        if width == 0 || height == 0 || pixels.len() < row * height as usize {
+        if !quad.writing.is_null() || width == 0 || height == 0 || pixels.len() < row * height as usize {
             return Ok(Duration::ZERO);
         }
-        // SAFETY: our swapchain, an image acquired, waited for, written by the GPU's copy and released once;
-        // the upload buffer is ours and holds `width * height * 4` bytes at most
-        unsafe {
+        // SAFETY: our swapchain, an image acquired, waited for, written by the GPU's copy and released once
+        // (by `quad_settle` once written, or here, unwritten, when the copy couldn't be sent); the upload
+        // buffer is ours and holds `width * height * 4` bytes at most
+        let waited = unsafe {
             let mut index = 0;
             let asked = Instant::now();
             let acquire = xr::SwapchainImageAcquireInfo { ty: xr::StructureType::SWAPCHAIN_IMAGE_ACQUIRE_INFO, next: null() };
-            check(rt, (rt.f.acquire_swapchain_image)(panel.chain.handle, &acquire, &mut index), &format!("acquiring the {name}'s image"))?;
-            let wait = xr::SwapchainImageWaitInfo { ty: xr::StructureType::SWAPCHAIN_IMAGE_WAIT_INFO, next: null(), timeout: xr::Duration::INFINITE };
-            check(rt, (rt.f.wait_swapchain_image)(panel.chain.handle, &wait), &format!("waiting for the {name}'s image"))?;
+            check(rt, (rt.f.acquire_swapchain_image)(handle, &acquire, &mut index), &format!("acquiring the {name}'s image"))?;
+            let wait_info = xr::SwapchainImageWaitInfo { ty: xr::StructureType::SWAPCHAIN_IMAGE_WAIT_INFO, next: null(), timeout: xr::Duration::INFINITE };
+            check(rt, (rt.f.wait_swapchain_image)(handle, &wait_info), &format!("waiting for the {name}'s image"))?;
             let waited = asked.elapsed();
-            let mapped = SDL_MapGPUTransferBuffer(device, panel.transfer, true).cast::<u8>();
-            let uploaded = if mapped.is_null() {
-                false
+            let mapped = SDL_MapGPUTransferBuffer(device, quad.transfer, true).cast::<u8>();
+            let fence = if mapped.is_null() {
+                null_mut()
             } else {
                 let out = std::slice::from_raw_parts_mut(mapped, row * height as usize);
                 out.copy_from_slice(&pixels[..row * height as usize]);
-                if panel.bgra != bgra {
+                if quad.bgra != bgra {
                     for px in out.chunks_exact_mut(4) {
                         px.swap(0, 2);
                     }
                 }
-                SDL_UnmapGPUTransferBuffer(device, panel.transfer);
+                SDL_UnmapGPUTransferBuffer(device, quad.transfer);
                 let cmd = SDL_AcquireGPUCommandBuffer(device);
                 let pass = SDL_BeginGPUCopyPass(cmd);
-                let from = SDL_GPUTextureTransferInfo { transfer_buffer: panel.transfer, offset: 0, pixels_per_row: width, rows_per_layer: height };
-                let to = SDL_GPUTextureRegion { texture: panel.chain.textures[index as usize], mip_level: 0, layer: 0, x: 0, y: 0, z: 0, w: width, h: height, d: 1 };
+                let from = SDL_GPUTextureTransferInfo { transfer_buffer: quad.transfer, offset: 0, pixels_per_row: width, rows_per_layer: height };
+                let to = SDL_GPUTextureRegion { texture: quad.chains[1 - quad.front].textures[index as usize], mip_level: 0, layer: 0, x: 0, y: 0, z: 0, w: width, h: height, d: 1 };
                 SDL_UploadToGPUTexture(pass, &from, &to, false);
                 SDL_EndGPUCopyPass(pass);
-                // handed over once written: the runtime may read it on a device of its own, which waits
-                // for nothing of ours
-                let fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
-                !fence.is_null() && {
-                    let written = SDL_WaitForGPUFences(device, true, &fence, 1);
-                    SDL_ReleaseGPUFence(device, fence);
-                    written
-                }
+                // handed over only once written: the runtime may read it on a device of its own, which
+                // waits for nothing of ours
+                SDL_SubmitGPUCommandBufferAndAcquireFence(cmd)
             };
-            let release = xr::SwapchainImageReleaseInfo { ty: xr::StructureType::SWAPCHAIN_IMAGE_RELEASE_INFO, next: null() };
-            check(rt, (rt.f.release_swapchain_image)(panel.chain.handle, &release), &format!("handing the {name}'s image over"))?;
-            if !uploaded {
+            if fence.is_null() {
+                // nothing written: handed back as it was, the layer still showing the other swapchain
+                let release = xr::SwapchainImageReleaseInfo { ty: xr::StructureType::SWAPCHAIN_IMAGE_RELEASE_INFO, next: null() };
+                check(rt, (rt.f.release_swapchain_image)(handle, &release), &format!("handing the {name}'s image back"))?;
                 return Err(format!("the {name}'s picture: {}", crate::render::sdl_error()));
             }
-            panel.shown = true;
-            Ok(waited)
+            quad.writing = fence;
+            waited
+        };
+        if wait {
+            self.quad_settle(rt, which, true)?;
         }
+        Ok(waited)
+    }
+
+    /// Hands over the picture the GPU has written into the quad's swapchain not shown (`quad_picture`),
+    /// once its copy is done, or with `wait` once it is: the layer shows that swapchain from then on.
+    /// Whether it did.
+    pub fn quad_settle(&mut self, rt: &Runtime, which: Layer, wait: bool) -> Result<bool, String> {
+        let (device, name) = (self.device, which.name());
+        let Some(quad) = self.quad_slot(which).as_mut().filter(|q| !q.writing.is_null()) else { return Ok(false) };
+        // SAFETY: the fence of our copy, released once; the image it wrote acquired from that swapchain
+        unsafe {
+            let done = if wait { SDL_WaitForGPUFences(device, true, &quad.writing, 1) } else { SDL_QueryGPUFence(device, quad.writing) };
+            if !done {
+                return if wait { Err(format!("the {name}'s picture: {}", crate::render::sdl_error())) } else { Ok(false) };
+            }
+            SDL_ReleaseGPUFence(device, quad.writing);
+            quad.writing = null_mut();
+            let back = 1 - quad.front;
+            let release = xr::SwapchainImageReleaseInfo { ty: xr::StructureType::SWAPCHAIN_IMAGE_RELEASE_INFO, next: null() };
+            check(rt, (rt.f.release_swapchain_image)(quad.chains[back].handle, &release), &format!("handing the {name}'s image over"))?;
+            quad.front = back;
+            quad.shown = true;
+        }
+        Ok(true)
+    }
+
+    /// The GPU is still writing a picture of the quad's (`quad_picture`, not yet `quad_settle`d).
+    pub fn quad_writing(&self, which: Layer) -> bool {
+        self.quad(which).is_some_and(|q| !q.writing.is_null())
     }
 
     /// The session's handle and space, for the controls.
