@@ -168,7 +168,7 @@ mod imp {
         /// The next capture time's index for the panel's pictures (test runs, `--vr-capture`).
         next_panel_capture: usize,
         /// The panel and the pause menu drawn into the eyes (`render::room`), by their `slot`s; none
-        /// with them as the runtime's quad layers (`VPI_XR_QUAD_LAYERS=1`), which SteamVR showed broken.
+        /// with them as the runtime's quad layers (`VPI_XR_QUAD_LAYERS=1`).
         room: Option<RoomPictures>,
     }
 
@@ -552,7 +552,7 @@ mod imp {
                 None => None,
             };
             // the panel and the pause menu drawn into the eyes, unless the runtime's quad layers are asked
-            // for (SteamVR showed those in blocks of black and white wherever their pictures changed)
+            // for
             let room = if std::env::var("VPI_XR_QUAD_LAYERS").is_ok_and(|v| v == "1") {
                 println!("VR: the panel and the pause menu as the runtime's quad layers (VPI_XR_QUAD_LAYERS)");
                 None

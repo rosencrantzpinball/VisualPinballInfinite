@@ -118,7 +118,9 @@ panel in the room (it draws flat over each eye), an analog plunger (the stick's 
   repaints of the left column, a layer of its own repainted in place under the pointer, came out as noise with
   "All tables" drawn again down the column at 7 of 14 rows hovered with it, at none without it (`hover-tune-1`,
   `hover-plain-1`). The panel now starts without it, Turnip choosing for itself (721b50f, installed); the player
-  and its tables keep it. Next: the owner's worn try.
+  and its tables keep it. The owner's worn try (21:45): clean. So the blocks were Chromium's own drawing all along,
+  never SteamVR's quads (the 15:50 recording caught none, by chance); the panel stays drawn into the eyes, the
+  quad layers kept behind `VPI_XR_QUAD_LAYERS=1`.
 
 ## Playing it on the Frame
 
@@ -437,3 +439,4 @@ the headset is unworn. GPU = SteamVR's own count (`/perfmetrics_meta/app/gpu_fra
 | 10-31 21:24 | 19070df, installed | `room-steam-2`: through the Steam client, stopped after 30 s; the owner wore the headset through it | The panel's GPU process without Valve's two layers, the player with them; the library 0.5 s into VR, 72 fps. The owner: blocks still, maybe fewer, then "quite a bit", in the left column alone |
 | 10-31 21:36 | the same | `hover-tune-1`, `hover-plain-1`: the panel alone on X11 (`frame.sh panel`, Steam's gamescope WSI and VRAM report limit set), the pointer stopping on 14 rows of the left column a second each, then on a table's tile; pictures 0.7 s into each stop, each compared with the one before any hover, away from the pointer's row (`tools/steam-frame/hover-check.py`); with `TU_AUTOTUNE_ALGO=profiled`, then without | With it: 7 of 14 stops with 150,000–200,000 pixels changed across the column away from the pointer, and 5,000–7,000 elsewhere: noise, "All tables" drawn again twice down the column. Without it: none at any stop. The column came back whole once the pointer left it |
 | 10-31 21:40 | 721b50f, installed (`frame.sh install`) | `fix-steam-1`: through the Steam client, stopped after 30 s | The panel's GPU process without `TU_AUTOTUNE_ALGO` and without Valve's two layers, the player with all three; the library 0.5 s into VR |
+| 10-31 21:45 | 721b50f, installed | The owner, worn, through Steam: the library, the pointer over the left column | Clean, as far as the owner can tell |

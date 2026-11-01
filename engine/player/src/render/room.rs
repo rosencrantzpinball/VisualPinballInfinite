@@ -1,10 +1,9 @@
 //! Pictures standing in the room, drawn into the headset's eye pictures (`vr.rs`), ours: the library's
-//! panel and the pause menu. SteamVR showed them as quad layers broken into blocks of black and white
-//! wherever a picture changed (under the pointer), in the headset alone — its recording showed them
-//! whole — whatever the player did about handing their images over (`docs/steam-frame/PLAN.md`,
-//! decision 20). Drawn into the eyes they reach the runtime as the tables do. Each picture is uploaded
-//! with its mipmaps and sampled trilinear with anisotropy, and its edges are smoothed by how much of
-//! each pixel they cover.
+//! panel and the pause menu, which reach the runtime as the tables do, in the eyes' own layer (as the
+//! runtime's quad layers before, while blocks over the panel were blamed on SteamVR's showing of them;
+//! they were Chromium's own drawing: `crate::panel`, `docs/steam-frame/PLAN.md` decision 20). Each picture
+//! is uploaded with its mipmaps and sampled trilinear with anisotropy, and its edges are smoothed by how
+//! much of each pixel they cover.
 
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};

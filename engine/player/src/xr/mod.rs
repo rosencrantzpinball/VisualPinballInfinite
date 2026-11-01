@@ -548,9 +548,9 @@ impl Layer {
 
 /// A quad's two swapchains, of one size, its pictures uploaded as they change: the layer shows one
 /// while a new picture is written into the other's next image, and they change places once the GPU
-/// has written it. SteamVR draws quads in its lens pass, as the headset shows them: with one swapchain,
-/// the image being written could be the one it read, which showed in the headset as blocks of black and
-/// white over the panel, never in SteamVR's recordings of it.
+/// has written it, so the runtime never reads an image being written and the frame never waits for the
+/// copy. (The blocks over the panel this was first meant for were Chromium's own drawing:
+/// `crate::panel`.)
 struct QuadChain {
     chains: [Swapchain; 2],
     /// The one the layer shows; the other is written.
