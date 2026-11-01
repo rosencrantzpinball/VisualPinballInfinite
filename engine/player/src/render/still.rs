@@ -30,6 +30,13 @@ use super::*;
 /// VPX's passes for the still parts (`STATIC_PRERENDER_ITERATIONS`).
 pub(super) const PASSES: usize = 128;
 
+/// How many of the passes a frame draws: all of them at once, as VPX draws them; in the browser
+/// (`engine/web`) a few a frame, the frames meanwhile drawing every part, as before the passes are
+/// done. A browser can't wait for the graphics card, and its own GPU process gives up when a page's
+/// work holds the card too long: Chrome lost its device to the 128 passes sent at once in a large
+/// window.
+const PASSES_AT_ONCE: usize = if cfg!(target_family = "wasm") { 4 } else { PASSES };
+
 /// Which parts a frame draws: all of them, as before; the still ones, in one
 /// pass shifted by this much (screen units); or only the moving ones, over
 /// the still ones' picture.
@@ -86,6 +93,9 @@ pub(super) struct Still {
     pub(super) size: (u32, u32),
     /// The pictures hold the still parts as they are.
     pub(super) valid: Cell<bool>,
+    /// The passes still to draw, and when the first of them was drawn (`PASSES_AT_ONCE`).
+    left: Cell<usize>,
+    started: Cell<Option<std::time::Instant>>,
     /// Adding a pass to the average: the first replaces it, the last keeps
     /// its mark of the table's pixels (VPX: the centred pass's depth).
     accumulate: [*mut SDL_GPUGraphicsPipeline; 3],
@@ -118,6 +128,7 @@ impl Renderer {
             && let Some(s) = &self.still
         {
             s.valid.set(false);
+            s.left.set(PASSES);
         }
         self.view_changing = changing;
     }
@@ -168,6 +179,8 @@ impl Renderer {
             mirror_depth: Vec::new(),
             size: (width, height),
             valid: Cell::new(false),
+            left: Cell::new(PASSES),
+            started: Cell::new(None),
             accumulate: pipelines.0,
             restore: pipelines.1,
             restore_color: pipelines.2,
@@ -275,7 +288,8 @@ impl Renderer {
 
     /// Draws the still parts' pictures when they don't hold the still parts
     /// as `input` has them (VPX's `RenderStaticPrepass`): 128 passes, each its
-    /// own command buffer, waited for once all are sent.
+    /// own command buffer, waited for once all are sent; `PASSES_AT_ONCE` of
+    /// them a call, the rest at the next frames'.
     pub(super) fn draw_still(&self, input: &FrameInput, width: u32, height: u32) -> Result<(), String> {
         let Some(s) = self.still.as_ref() else { return Ok(()) };
         // the table's size (supersampled), the passes shifted by its texels
@@ -283,9 +297,12 @@ impl Renderer {
         if self.view_changing || s.valid.get() || s.size != (rw, rh) {
             return Ok(());
         }
-        let started = std::time::Instant::now();
+        let started = s.started.get().unwrap_or_else(std::time::Instant::now);
+        s.started.set(Some(started));
         let (w, h) = (rw as f32, rh as f32);
-        for n in (0..PASSES).rev() {
+        let left = s.left.get().min(PASSES);
+        let to = left.saturating_sub(PASSES_AT_ONCE);
+        for n in (to..left).rev() {
             let [u1, u2] = shift(n);
             unsafe {
                 let command = non_null(SDL_AcquireGPUCommandBuffer(self.device), "acquire command buffer")?;
@@ -302,6 +319,11 @@ impl Renderer {
                 check(SDL_SubmitGPUCommandBuffer(command), "draw the still parts")?;
             }
         }
+        s.left.set(to);
+        if to > 0 {
+            return Ok(());
+        }
+        s.started.set(None);
         unsafe { SDL_WaitForGPUIdle(self.device) };
         // VPX's static occlusion, baked into the picture once its passes are done
         if self.ao_mode() == 1 {

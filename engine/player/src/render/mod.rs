@@ -2373,9 +2373,14 @@ impl Renderer {
         let height = (env_height.min(256) / 8).max(1);
         let width = height * 2;
         self.irradiance = self.texture(IRRADIANCE_FORMAT, SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER, width, height, 1, SDL_GPU_SAMPLECOUNT_1)?;
-        let source = format!("#define IRRADIANCE\n{MATERIAL_HLSL}");
+        // in the browser the samples are taken in passes, each its own command buffer, added together:
+        // in one draw they hold the graphics card long enough (130 ms on an M4 Pro, through WebGPU) for
+        // macOS to stop the browser's work as impacting interactivity; elsewhere in one, as VPX takes them
+        const SAMPLES: u32 = 32_768;
+        let passes: u32 = if cfg!(target_family = "wasm") { 16 } else { 1 };
+        let source = if passes > 1 { format!("#define IRRADIANCE\n#define IRRADIANCE_PASSES\n{MATERIAL_HLSL}") } else { format!("#define IRRADIANCE\n{MATERIAL_HLSL}") };
         let vs = self.shader(&source, c"irradiance_vs", c"vs_5_1", SDL_GPU_SHADERSTAGE_VERTEX, 0, 0)?;
-        let fs = match self.shader(&source, c"irradiance_fs", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 0) {
+        let fs = match self.shader(&source, c"irradiance_fs", c"ps_5_1", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, u32::from(passes > 1)) {
             Ok(fs) => fs,
             Err(e) => {
                 unsafe { SDL_ReleaseGPUShader(self.device, vs) };
@@ -2385,6 +2390,13 @@ impl Renderer {
         unsafe {
             let mut color: SDL_GPUColorTargetDescription = zeroed();
             color.format = IRRADIANCE_FORMAT;
+            if passes > 1 {
+                // each pass's share added, the alpha left as cleared
+                let b = &mut color.blend_state;
+                b.enable_blend = true;
+                (b.src_color_blendfactor, b.dst_color_blendfactor, b.color_blend_op) = (SDL_GPU_BLENDFACTOR_ONE, SDL_GPU_BLENDFACTOR_ONE, SDL_GPU_BLENDOP_ADD);
+                (b.src_alpha_blendfactor, b.dst_alpha_blendfactor, b.alpha_blend_op) = (SDL_GPU_BLENDFACTOR_ZERO, SDL_GPU_BLENDFACTOR_ONE, SDL_GPU_BLENDOP_ADD);
+            }
             let mut p: SDL_GPUGraphicsPipelineCreateInfo = zeroed();
             p.vertex_shader = vs;
             p.fragment_shader = fs;
@@ -2398,22 +2410,36 @@ impl Renderer {
             SDL_ReleaseGPUShader(self.device, vs);
             SDL_ReleaseGPUShader(self.device, fs);
             let pipeline = non_null(pipeline, "create the irradiance pipeline")?;
-            let command = SDL_AcquireGPUCommandBuffer(self.device);
-            if command.is_null() {
-                SDL_ReleaseGPUGraphicsPipeline(self.device, pipeline);
-                return Err(format!("acquire command buffer: {}", sdl_error()));
+            let mut submitted = true;
+            for k in 0..passes {
+                let command = SDL_AcquireGPUCommandBuffer(self.device);
+                if command.is_null() {
+                    SDL_ReleaseGPUGraphicsPipeline(self.device, pipeline);
+                    return Err(format!("acquire command buffer: {}", sdl_error()));
+                }
+                let mut target: SDL_GPUColorTargetInfo = zeroed();
+                target.texture = self.irradiance;
+                target.load_op = match (passes, k) {
+                    (1, _) => SDL_GPU_LOADOP_DONT_CARE,
+                    (_, 0) => SDL_GPU_LOADOP_CLEAR,
+                    _ => SDL_GPU_LOADOP_LOAD,
+                };
+                target.clear_color = SDL_FColor { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+                target.store_op = SDL_GPU_STOREOP_STORE;
+                let pass = SDL_BeginGPURenderPass(command, &target, 1, null());
+                SDL_BindGPUGraphicsPipeline(pass, pipeline);
+                let binding = SDL_GPUTextureSamplerBinding { texture: self.env_texture, sampler: self.env_sampler };
+                SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
+                if passes > 1 {
+                    // this pass's samples: the first, and the one after its last
+                    let each = SAMPLES / passes;
+                    let range = [(k * each) as f32, ((k + 1) * each) as f32, 0.0, 0.0];
+                    SDL_PushGPUFragmentUniformData(command, 0, range.as_ptr().cast(), std::mem::size_of_val(&range) as u32);
+                }
+                SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
+                SDL_EndGPURenderPass(pass);
+                submitted &= SDL_SubmitGPUCommandBuffer(command);
             }
-            let mut target: SDL_GPUColorTargetInfo = zeroed();
-            target.texture = self.irradiance;
-            target.load_op = SDL_GPU_LOADOP_DONT_CARE;
-            target.store_op = SDL_GPU_STOREOP_STORE;
-            let pass = SDL_BeginGPURenderPass(command, &target, 1, null());
-            SDL_BindGPUGraphicsPipeline(pass, pipeline);
-            let binding = SDL_GPUTextureSamplerBinding { texture: self.env_texture, sampler: self.env_sampler };
-            SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
-            SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
-            SDL_EndGPURenderPass(pass);
-            let submitted = SDL_SubmitGPUCommandBuffer(command);
             SDL_ReleaseGPUGraphicsPipeline(self.device, pipeline);
             check(submitted, "compute the environment's irradiance")
         }

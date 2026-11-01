@@ -38,6 +38,18 @@ Everything is built from source in the build image (`tools/steam-frame/in-image.
 
 To try it here: `python3 tools/web/serve.py <out folder>`, then open <http://localhost:8765>.
 
+For testing, the page takes options in its address (several together, joined by `&`):
+
+- `?size=1280x720`: the canvas at that many pixels, whatever the window;
+- `?profile`: every render pass timed on the graphics card (WebGPU's timestamp queries, where the browser has them),
+  read in the console with `vpi.gpu.profile()`;
+- `?manual`: no frames of the page's own, only those `vpi.step(n)` asks for;
+- `?plain`: none of WebGPU's optional features, as a browser without them has it;
+- `?autotest=<name>&seconds=4`: plays that long by itself, then saves `<name>.png` (what WebGPU drew) and `<name>.json`
+  (the browser, its WebGPU features, every WebGPU error, the frame times) through `serve.py --captures <folder>`;
+  `vpi.capture(name)` in the console saves a picture likewise. Opening one such address in each browser gives
+  pictures to compare with the player's own (`tools/steam-frame/flat.sh ... --shot`).
+
 ## Hosting
 
 The out folder goes on the host as it is. The host needs nothing special:
@@ -48,7 +60,7 @@ The out folder goes on the host as it is. The host needs nothing special:
 - No cross-origin isolation headers: the program uses no shared memory or threads.
 
 Browsers: those with WebGPU (Chrome and Edge 113 and later, Safari 26, Firefox where WebGPU is on). The page says so when
-there's none.
+there's none. Safari's WebGPU has no clip distances: the table's mirrors are left out there.
 
 ## How it works
 
@@ -62,9 +74,17 @@ page's thread, a frame each animation frame: the input, the physics up to the mo
 preparation, the picture (`engine/web/src/play.rs`). The page's files are WASI's, kept in memory (`site/vpi.js`): the
 table's, read only, and `/data`, saved to local storage.
 
-Measured on a MacBook in Chrome 152 (Symphony IX 1.0.2, 1024 × 768): the table starts in about 5 s once
-fetched; a frame takes the page's thread 1.2 ms (median; 2 ms at the 99th percentile) at 60 frames a second; the
-program's memory is about 1.2 GB (the table's pictures and its sounds decoded, as on the desktop).
+The graphics card's work is kept in short pieces: macOS stops a browser's GPU work that holds the display too
+long ("Impacting Interactivity"), and Chrome then loses its WebGPU device and, after a few such losses, switches
+WebGPU off until it's restarted. So in the browser the environment's irradiance is worked out in 16 passes of about
+8 ms (one draw of 130 ms elsewhere), the still parts' 128 passes are drawn 4 a frame (all at once elsewhere), and the
+page lets the card finish the table's start before its first frame.
+
+Measured on an M4 Pro Mac with Symphony IX 1.0.2: the table starts in about 5 s once fetched. In Chrome 156 at
+2274 × 1293 a frame takes the graphics card about 8 ms (median; 10 ms at the 90th percentile) and the page's thread
+1.3 ms, 120 frames a second on a 120 Hz screen; in Safari 26.2, 60 frames a second and 4 ms of the page's thread. The
+pictures of both match the player's own on Linux within 3% region by region. The program's memory is about 1.2 GB (the
+table's pictures and its sounds decoded, as on the desktop).
 
 ## Licences
 

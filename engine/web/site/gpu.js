@@ -65,6 +65,18 @@ export class Gpu {
     this.width = 0;
     this.height = 0;
     this.current = null; // this frame's canvas texture
+    // `?profile`: each render pass timed on the graphics card (timestamp queries), by its pipelines
+    this.profiling = device.features.has('timestamp-query') && new URLSearchParams(location.search).has('profile');
+    this.passTimes = []; // [ms, label] of the passes timed lately
+    this.submitTimes = []; // each command buffer's passes added up, in ms
+  }
+
+  // what the passes timed lately took: the slowest, and each command buffer's total
+  profile() {
+    const sorted = [...this.passTimes].sort((a, b) => b[0] - a[0]);
+    const totals = [...this.submitTimes].sort((a, b) => a - b);
+    const q = (p) => totals[Math.min(totals.length - 1, Math.floor(p * totals.length))]?.toFixed(2);
+    return { passes: this.passTimes.length, slowest: sorted.slice(0, 8).map(([ms, l]) => `${ms.toFixed(1)} ms ${l}`), submits: totals.length, submit_median_ms: q(0.5), submit_p90_ms: q(0.9), submit_max_ms: q(1) };
   }
 
   // the program's imports (module vpi_gpu)
@@ -348,9 +360,12 @@ export class Gpu {
       }
       let encoder = device.createCommandEncoder();
       let recorded = false;
+      // profiling: up to 64 passes' start and end times, read back once done
+      const timed = this.profiling ? { set: device.createQuerySet({ type: 'timestamp', count: 128 }), labels: [], encoders: [] } : null;
       // an upload after commands keeps its place: what came before goes first
       const flush = () => {
         if (recorded) {
+          if (timed) timed.encoders.push(timed.labels.length);
           queue.submit([encoder.finish()]);
           encoder = device.createCommandEncoder();
           recorded = false;
@@ -475,6 +490,11 @@ export class Gpu {
                 if (!colorAttachments.length) passSize = [Math.max(1, t.texture.width >> mip), Math.max(1, t.texture.height >> mip)];
               }
             }
+            if (timed && timed.labels.length < 64) {
+              const at = timed.labels.length;
+              desc.timestampWrites = { querySet: timed.set, beginningOfPassWriteIndex: 2 * at, endOfPassWriteIndex: 2 * at + 1 };
+              timed.labels.push('');
+            }
             pass = encoder.beginRenderPass(desc);
             recorded = true;
             pipe = null;
@@ -490,6 +510,8 @@ export class Gpu {
             break;
           case 3: // PIPELINE
             pipe = this.pipelines[w[k++]];
+            // a timed pass named after its first pipeline
+            if (timed && pass && timed.labels.length && timed.labels[timed.labels.length - 1] === '' && pipe) timed.labels[timed.labels.length - 1] = `${pipe.vs.entry}+${pipe.fs.entry}`;
             variant = null;
             groupsDirty = true;
             break;
@@ -620,7 +642,36 @@ export class Gpu {
         }
       }
       if (pass) pass.end();
-      queue.submit([encoder.finish()]);
+      if (timed && timed.labels.length) {
+        // the last encoder resolves them all: the earlier ones' passes are done by then
+        const n = 2 * timed.labels.length;
+        const resolve = device.createBuffer({ size: n * 8, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
+        const read = device.createBuffer({ size: n * 8, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        encoder.resolveQuerySet(timed.set, 0, n, resolve, 0);
+        encoder.copyBufferToBuffer(resolve, 0, read, 0, n * 8);
+        queue.submit([encoder.finish()]);
+        read.mapAsync(GPUMapMode.READ).then(() => {
+          const t = new BigInt64Array(read.getMappedRange());
+          let total = 0;
+          timed.labels.forEach((label, k) => {
+            const ms = Number(t[2 * k + 1] - t[2 * k]) / 1e6;
+            if (ms >= 0 && ms < 60000) {
+              total += ms;
+              this.passTimes.push([ms, label || '(no draws)']);
+            }
+          });
+          if (this.passTimes.length > 4000) this.passTimes.splice(0, this.passTimes.length - 4000);
+          this.submitTimes.push(total);
+          if (this.submitTimes.length > 600) this.submitTimes.shift();
+          read.unmap();
+          read.destroy();
+          resolve.destroy();
+          timed.set.destroy();
+        }).catch(() => {});
+      } else {
+        if (timed) timed.set.destroy();
+        queue.submit([encoder.finish()]);
+      }
       return 1;
     } catch (e) {
       if (this.errors++ < 20) this.log(`gpu submit: ${e.stack || e}`);

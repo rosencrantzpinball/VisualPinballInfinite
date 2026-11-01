@@ -565,12 +565,15 @@ async function main() {
   }
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) {
-    status("WebGPU found no graphics card it can use here.");
+    // a browser turns WebGPU off for a while after a graphics card error, its own or another page's
+    status('WebGPU found no graphics card it can use here. If it played here a moment ago, the browser has switched WebGPU off after a graphics error: quit the browser and open it again.');
     return;
   }
   // `?plain` asks for none of WebGPU's optional features, as a browser without them would have it
   const plain = new URLSearchParams(location.search).has('plain');
   const wanted = plain ? [] : ['clip-distances', 'float32-filterable', 'depth-clip-control'].filter((f) => adapter.features.has(f));
+  // `?profile`: the graphics card's own times of each pass (gpu.js)
+  if (new URLSearchParams(location.search).has('profile') && adapter.features.has('timestamp-query')) wanted.push('timestamp-query');
   const limits = {};
   for (const k of ['maxTextureDimension2D', 'maxBufferSize', 'maxColorAttachmentBytesPerSample', 'maxSampledTexturesPerShaderStage', 'maxSamplersPerShaderStage', 'maxUniformBufferBindingSize', 'maxUniformBuffersPerShaderStage', 'maxDynamicUniformBuffersPerPipelineLayout', 'maxInterStageShaderVariables', 'maxVertexAttributes', 'maxVertexBuffers']) {
     if (adapter.limits[k] !== undefined) limits[k] = adapter.limits[k];
@@ -598,7 +601,8 @@ async function main() {
   const canvas = $('table');
   const context = canvas.getContext('webgpu');
   const format = navigator.gpu.getPreferredCanvasFormat();
-  context.configure({ device, format, alphaMode: 'opaque', viewFormats: [`${format}-srgb`] });
+  // read back too, for vpi.capture
+  context.configure({ device, format, alphaMode: 'opaque', viewFormats: [`${format}-srgb`], usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
   const gpu = new Gpu(device, canvas, context, format, log);
 
   // the canvas at the screen's pixels (twice the page's at most), as its box changes; the player
@@ -614,7 +618,15 @@ async function main() {
     resized?.(canvas.width, canvas.height);
     sized();
   };
-  new ResizeObserver((entries) => {
+  // `?size=1280x720`: the canvas at that many pixels, whatever its box (pictures to compare with the player's)
+  const fixed = new URLSearchParams(location.search).get('size')?.match(/^(\d+)x(\d+)$/);
+  if (fixed) {
+    canvas.width = +fixed[1];
+    canvas.height = +fixed[2];
+    canvas.style.objectFit = 'contain';
+    sized();
+  }
+  if (!fixed) new ResizeObserver((entries) => {
     const e = entries[0];
     const box = e.devicePixelContentBoxSize?.[0];
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -693,6 +705,9 @@ async function main() {
     status('The table could not start: the browser’s console says why.');
     return;
   }
+  // the graphics card done with the table's start (its pictures uploaded, its environment's light
+  // worked out) before any frame adds to it
+  await device.queue.onSubmittedWorkDone();
   log(`the table started in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
   setTimeout(() => sessionStorage.removeItem('vpi-retried'), 30000);
   resized = (w, h) => x.vpi_web_resized(w, h);
@@ -818,7 +833,39 @@ async function main() {
     const n = x.vpi_web_state();
     return JSON.parse(new TextDecoder().decode(new Uint8Array(x.memory.buffer, x.vpi_web_scratch(0), n)));
   };
-  window.vpi = { exports: x, gpu, sound, files, stats, device, state };
+  // the frame drawn now, as the canvas holds it, saved by the page's server (tools/web/serve.py --captures)
+  const capture = async (name) => {
+    x.vpi_web_frame();
+    const tex = gpu.current ?? context.getCurrentTexture();
+    const [w, h] = [tex.width, tex.height];
+    const row = Math.ceil((w * 4) / 256) * 256;
+    const buffer = device.createBuffer({ size: row * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const encoder = device.createCommandEncoder();
+    encoder.copyTextureToBuffer({ texture: tex }, { buffer, bytesPerRow: row }, { width: w, height: h });
+    device.queue.submit([encoder.finish()]);
+    gpu.presented();
+    await buffer.mapAsync(GPUMapMode.READ);
+    const src = new Uint8Array(buffer.getMappedRange());
+    const rgba = new Uint8ClampedArray(w * h * 4);
+    const bgra = format.startsWith('bgra');
+    for (let y = 0; y < h; y++) {
+      for (let k = 0; k < w; k++) {
+        const s = y * row + k * 4, d = (y * w + k) * 4;
+        rgba[d] = src[s + (bgra ? 2 : 0)];
+        rgba[d + 1] = src[s + 1];
+        rgba[d + 2] = src[s + (bgra ? 0 : 2)];
+        rgba[d + 3] = 255;
+      }
+    }
+    buffer.unmap();
+    buffer.destroy();
+    const off = new OffscreenCanvas(w, h);
+    off.getContext('2d').putImageData(new ImageData(rgba, w, h), 0, 0);
+    const png = await off.convertToBlob({ type: 'image/png' });
+    const res = await fetch(`capture?name=${encodeURIComponent(name)}`, { method: 'POST', body: png });
+    return { name, width: w, height: h, saved: res.ok };
+  };
+  window.vpi = { exports: x, gpu, sound, files, stats, device, state, capture };
 
   // the frames
   let last = 0;
@@ -861,7 +908,45 @@ async function main() {
       status(r === 0 ? 'Thanks for playing.' : 'The table stopped: the browser’s console says why.');
     }
   };
-  requestAnimationFrame(frame);
+  // `?manual`: no frames of its own, only those vpi.step(n) asks for (to time the graphics card's work)
+  const manual = new URLSearchParams(location.search).has('manual');
+  window.vpi.step = (n = 1) => {
+    for (let k = 0; k < n; k++) {
+      x.vpi_web_frame();
+      gpu.presented();
+    }
+    return window.vpi.state();
+  };
+  if (!manual) requestAnimationFrame(frame);
+
+  // `?autotest=<name>`: plays a few seconds by itself (`&seconds=4`), then saves its picture and a report
+  // (the browser, its WebGPU, every WebGPU error) through the page's server (serve.py --captures)
+  const autotest = new URLSearchParams(location.search).get('autotest');
+  if (autotest) {
+    playing = true;
+    x.vpi_web_focus(1);
+    const seconds = +(new URLSearchParams(location.search).get('seconds') ?? 4);
+    await new Promise((r) => setTimeout(r, seconds * 1000));
+    const picture = await capture(`${autotest}.png`);
+    const report = {
+      userAgent: navigator.userAgent,
+      adapter: { vendor: adapter.info?.vendor, architecture: adapter.info?.architecture, description: adapter.info?.description },
+      canvasFormat: format,
+      features: [...device.features],
+      errors: [...gpu.errorLog.entries()].map(([message, count]) => ({ count, message })),
+      state: window.vpi.state(),
+      stats: stats.summary(),
+      profile: gpu.profiling ? gpu.profile() : null,
+      picture,
+    };
+    await fetch(`capture?name=${encodeURIComponent(autotest)}.json`, { method: 'POST', body: JSON.stringify(report, null, 1) });
+    // done: no more frames, the graphics card let go
+    ended = true;
+    device.destroy();
+    overlay.hidden = false;
+    $('play').hidden = true;
+    status(`Test ${autotest} saved: this tab can be closed.`);
+  }
 }
 
 main().catch((e) => {

@@ -77,6 +77,8 @@ const SOURCES: &[(&[Part], &[&str])] = &[
     (&[Text("#define BALL\n"), File("material.hlsl")], &["fs_vpx_ball"]),
     (&[Text("#define CLASSIC_LIGHT\n"), File("material.hlsl")], &["fs_vpx_classic_light"]),
     (&[Text("#define IRRADIANCE\n"), File("material.hlsl")], &["irradiance_vs", "irradiance_fs"]),
+    // the browser's: its samples in passes (`Renderer::prepare_environment`)
+    (&[Text("#define IRRADIANCE\n#define IRRADIANCE_PASSES\n"), File("material.hlsl")], &["irradiance_vs", "irradiance_fs"]),
     (
         &[File("bloom.hlsl")],
         &["bloom_vs", "bloom_cut_fs", "blur_h_fs", "blur_v_fs", "blur19_h_fs", "blur19_v_fs", "blur_kernel_h_fs", "blur_kernel_v_fs"],

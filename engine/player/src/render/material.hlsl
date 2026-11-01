@@ -700,6 +700,20 @@ IrradianceVaryings irradiance_vs(uint id : SV_VertexID)
 Texture2D<float4> irradiance_env : register(t0, space2);
 SamplerState irradiance_env_sampler : register(s0, space2);
 
+#ifdef IRRADIANCE_PASSES
+// the browser's build takes the samples in passes, each its own short piece of the graphics card's work
+// (`prepare_environment`), added together: x the first sample of this one, y the one after its last
+cbuffer IrradianceSamples : register(b0, space3)
+{
+    float4 irradiance_samples;
+};
+#define IRRADIANCE_FIRST int(irradiance_samples.x)
+#define IRRADIANCE_END int(irradiance_samples.y)
+#else
+#define IRRADIANCE_FIRST 0
+#define IRRADIANCE_END NumSamples
+#endif
+
 float3 cos_hemisphere_sample(float2 t)
 {
     float phi = t.y * (2.0 * PI);
@@ -734,7 +748,7 @@ float4 irradiance_fs(IrradianceVaryings v) : SV_Target0
     const float InvNumSamples = 1.0 / float(NumSamples);
     const float g = 15936.0 / float(NumSamples);
     float3 irradiance = float3(0.0, 0.0, 0.0);
-    [loop] for (int i = 0; i < NumSamples; ++i)
+    [loop] for (int i = IRRADIANCE_FIRST; i < IRRADIANCE_END; ++i)
     {
         float2 u = float2(float(i) * InvNumSamples, frac(float(i) * g));
         float3 Li = rotate_to_vector_upper(cos_hemisphere_sample(u), N);
