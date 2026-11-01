@@ -12,10 +12,21 @@ import subprocess
 import sys
 
 run, moves_text, first = sys.argv[1], sys.argv[2], int(sys.argv[3])
-W, H = 1600, 1000
-COLUMN = 300  # the left column's width in the picture, pixels
-BAND = 34  # rows within this of the pointer's y are its own (the hovered row and its ring)
 LIMIT = 24  # a channel moved by more than this counts as changed
+
+
+def size_of(path):
+    """A PNG's width and height, from its header."""
+    with open(path, "rb") as f:
+        head = f.read(24)
+    return int.from_bytes(head[16:20], "big"), int.from_bytes(head[20:24], "big")
+
+
+W, H = size_of(os.path.join(run, f"shot-{first}.png"))
+# at 1600 px wide (the app's page at 125 %): the left column 300 px wide; rows within 34 px of the pointer's
+# its own (the hovered row and its ring); in proportion at other sizes
+COLUMN = 300 * W // 1600
+BAND = 34 * W // 1600
 
 
 def pixels(ms):

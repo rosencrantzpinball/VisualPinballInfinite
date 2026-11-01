@@ -20,12 +20,13 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// The largest page, in pixels.
-pub const WIDTH_MAX: u32 = 2048;
-pub const HEIGHT_MAX: u32 = 1280;
+/// The largest page, in pixels: the app's 1280 by 800 CSS pixels at 250 %.
+pub const WIDTH_MAX: u32 = 3200;
+pub const HEIGHT_MAX: u32 = 2000;
 const FRAME_BYTES: usize = WIDTH_MAX as usize * HEIGHT_MAX as usize * 4;
 const MAGIC: u32 = u32::from_le_bytes(*b"VPIP");
-const VERSION: u32 = 1;
+/// The block's layout: a player and a panel of different layouts don't open each other's.
+const VERSION: u32 = 2;
 /// Ring sizes, powers of two: the counters wrap.
 const INPUTS: usize = 512;
 const REQUESTS: usize = 8;

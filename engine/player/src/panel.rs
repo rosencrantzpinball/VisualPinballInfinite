@@ -11,9 +11,10 @@ pub use panel_link::{Frame, Input, Request};
 use panel_link::{Link, state};
 
 /// The panel's pictures, in pixels, and the scale its pages are drawn at: the app's screens 1280 by 800
-/// CSS pixels, as on a laptop's screen.
-pub const SIZE: (u32, u32) = (1600, 1000);
-pub const SCALE: u32 = 125;
+/// CSS pixels, as on a laptop's screen, drawn at twice that for the text's sake in the headset (the
+/// runtime samples the quad layer at the screens' own pixels).
+pub const SIZE: (u32, u32) = (2560, 1600);
+pub const SCALE: u32 = 200;
 
 pub struct Panel {
     link: Link,
@@ -21,20 +22,32 @@ pub struct Panel {
     started: Instant,
 }
 
-/// Chromium draws the panel's pages through ANGLE, GLX and zink, on Vulkan, and the panel starts without
-/// what the game's environment asks of Vulkan for the tables' sake (`VPI_PANEL_KEEP_ENV=1` keeps it, for
-/// tests); the player and its tables keep it all:
+/// Chromium draws the panel's pages through ANGLE, GLX and zink, on Vulkan (Turnip), and the panel starts
+/// with what Vulkan is asked for the tables' sake changed (`VPI_PANEL_KEEP_ENV=1` leaves it, for tests);
+/// the player and its tables keep it all:
 ///
-/// - Turnip's autotune by profiling (`TU_AUTOTUNE_ALGO=profiled`, run.sh's): with it, Chromium's repaints
-///   of the library's left column (a layer of its own, repainted in place under the pointer) came out in
-///   blocks of noise with parts of the column drawn again in the wrong places, at 7 of 14 rows hovered,
-///   and never without it (`hover-tune-1`, `hover-plain-1`, 2026-10-31): what the owner saw in the headset.
-///   Turnip makes its own choice for the panel.
+/// - Turnip renders each of the panel's passes directly (`TU_DEBUG=sysmem`): its tiled rendering drew
+///   the pages wrong. Chosen often by Turnip's autotune by profiling (`TU_AUTOTUNE_ALGO=profiled`,
+///   run.sh's), it broke the library's left column up into noise as it was repainted under the pointer,
+///   parts of the column drawn again in the wrong places (`hover-tune-1`, 2026-10-31: 7 of 14 rows
+///   hovered), what the owner saw in the headset; at twice the pixels, with Turnip's own choice, it drew
+///   the page's toolbar twice from the first picture (`hover2x-plain-1`). Rendering directly, neither
+///   (`hover2x-sysmem-1`). The autotune setting goes too.
 /// - Valve's Vulkan layers that Steam loads into games on the Steam Frame (`VK_INSTANCE_LAYERS`) and that
 ///   rewrite what a game draws, its Renderpass Optimizer and its FDM injection, at the owner's word: a
 ///   page needs neither.
 const AUTOTUNE: &str = "TU_AUTOTUNE_ALGO";
+const TU_DEBUG: &str = "TU_DEBUG";
 const REWRITING_LAYERS: [&str; 2] = ["VK_LAYER_VALVE_rpo", "VK_LAYER_VALVE_fdm_injection"];
+
+/// Turnip's debug options asked for (`TU_DEBUG`, `,` between them) with direct rendering among them.
+fn rendering_directly(asked: Option<&str>) -> String {
+    match asked.map(str::trim).filter(|a| !a.is_empty()) {
+        Some(a) if a.split(',').any(|o| o.trim() == "sysmem") => a.to_string(),
+        Some(a) => format!("{a},sysmem"),
+        None => "sysmem".to_string(),
+    }
+}
 
 /// The instance layers asked for (`VK_INSTANCE_LAYERS`, `:` between them) without `REWRITING_LAYERS`;
 /// none if nothing's left.
@@ -74,8 +87,11 @@ impl Panel {
                 command.arg("--ui").arg(built);
             }
         }
-        // Chromium kept from what Vulkan is asked for the tables' sake
+        // Chromium kept from what Vulkan is asked for the tables' sake, and rendering directly
         if std::env::var_os("VPI_PANEL_KEEP_ENV").is_none() {
+            let debug = rendering_directly(std::env::var(TU_DEBUG).ok().as_deref());
+            println!("panel: started with {TU_DEBUG}={debug}, Turnip rendering each pass directly");
+            command.env(TU_DEBUG, debug);
             if let Ok(algo) = std::env::var(AUTOTUNE) {
                 println!("panel: started without {AUTOTUNE}={algo}, Turnip choosing for itself");
                 command.env_remove(AUTOTUNE);
@@ -166,6 +182,14 @@ impl Drop for Panel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_panel_renders_directly_whatever_else_turnip_is_asked() {
+        assert_eq!(rendering_directly(None), "sysmem");
+        assert_eq!(rendering_directly(Some(" ")), "sysmem");
+        assert_eq!(rendering_directly(Some("noubwc")), "noubwc,sysmem");
+        assert_eq!(rendering_directly(Some("sysmem,noubwc")), "sysmem,noubwc");
+    }
 
     #[test]
     fn the_panel_keeps_the_layers_that_dont_rewrite_drawing() {
