@@ -21,6 +21,20 @@ pub struct Panel {
     started: Instant,
 }
 
+/// Valve's Vulkan layers that Steam loads into games on the Steam Frame (`VK_INSTANCE_LAYERS`) and that
+/// rewrite what a game draws: its Renderpass Optimizer and its FDM injection. Chromium draws the panel's
+/// pages through ANGLE, GLX and zink, on Vulkan, and with them in its way the owner saw parts of a page
+/// drawn in the wrong places, and blocks (2026-10-31); the panel starts without them, the player and its
+/// tables keeping them (`VPI_PANEL_KEEP_LAYERS=1` keeps them for the panel too, for tests).
+const REWRITING_LAYERS: [&str; 2] = ["VK_LAYER_VALVE_rpo", "VK_LAYER_VALVE_fdm_injection"];
+
+/// The instance layers asked for (`VK_INSTANCE_LAYERS`, `:` between them) without `REWRITING_LAYERS`;
+/// none if nothing's left.
+fn layers_kept(asked: &str) -> Option<String> {
+    let kept: Vec<&str> = asked.split(':').filter(|l| !l.is_empty() && !REWRITING_LAYERS.contains(l)).collect();
+    (!kept.is_empty()).then(|| kept.join(":"))
+}
+
 impl Panel {
     /// The panel's program: in the game's folder, `panel/vpi-panel` with CEF's files; in a development
     /// build, beside the player, where its build puts it.
@@ -51,6 +65,19 @@ impl Panel {
             if built.join("index.html").is_file() {
                 command.arg("--ui").arg(built);
             }
+        }
+        // Chromium kept from the layers that rewrite a game's drawing
+        if let Ok(asked) = std::env::var("VK_INSTANCE_LAYERS")
+            && std::env::var_os("VPI_PANEL_KEEP_LAYERS").is_none()
+        {
+            let kept = layers_kept(&asked);
+            if kept.as_deref() != Some(asked.as_str()) {
+                println!("panel: started without the Vulkan layers {asked} asks for, keeping {}", kept.as_deref().unwrap_or("none"));
+            }
+            match kept {
+                Some(kept) => command.env("VK_INSTANCE_LAYERS", kept),
+                None => command.env_remove("VK_INSTANCE_LAYERS"),
+            };
         }
         let child = command.spawn().map_err(|e| format!("{}: {e}", program.display()))?;
         println!("panel: {} started on {}", program.display(), library.display());
@@ -127,6 +154,14 @@ impl Drop for Panel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_panel_keeps_the_layers_that_dont_rewrite_drawing() {
+        assert_eq!(layers_kept("VK_LAYER_VALVE_rpo:VK_LAYER_VALVE_fdm_injection"), None);
+        assert_eq!(layers_kept("VK_LAYER_A:VK_LAYER_VALVE_rpo:VK_LAYER_B"), Some("VK_LAYER_A:VK_LAYER_B".into()));
+        assert_eq!(layers_kept("VK_LAYER_A"), Some("VK_LAYER_A".into()));
+        assert_eq!(layers_kept(""), None);
+    }
 
     /// A 32 by 16 picture of the page's own dark, with `blocks` (block column, row) painted `colour`.
     fn picture(blocks: &[(usize, usize)], colour: [u8; 3]) -> Vec<u8> {
