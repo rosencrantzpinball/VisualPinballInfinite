@@ -107,7 +107,18 @@ panel in the room (it draws flat over each eye), an analog plunger (the stick's 
   coverage), and hands SteamVR no quad layers (`VPI_XR_QUAD_LAYERS=1` brings them back); the library's eyes are 1.25
   times the recommended size (2160 px on the Frame, its screens' own) for the text. Checked under Monado (`room-1`,
   `room-2`: the panel upright and readable, its edges smooth), then unworn on the Frame with Steam's Vulkan layers
-  (`room-lib-1`, `room-menu-1`) and installed: ba31f64. Next: the owner's worn try of the left column.
+  (`room-lib-1`, `room-menu-1`) and installed: ba31f64. The owner's fourth worn try (21:20): blocks still, drawn
+  into the eyes as well, staying until the page changes again, with parts of the page drawn in the wrong places
+  ("All tables" where another button was, its picture corrupt): the page's own drawing. In the owner's sessions
+  Chromium's GPU process has Valve's layers under zink (`libVkLayer_VALVE_rpo`, `libVkLayer_VALVE_fdm_injection`),
+  which no run over ssh had; so the player started the panel without them, keeping them itself for the tables
+  (19070df). Blocks still, in the left column alone (the owner, 21:25). The cause, found on the Frame without the
+  headset: run.sh's `TU_AUTOTUNE_ALGO=profiled` (Turnip choosing tiled or direct rendering for each render pass
+  by profiling, for the tables), which the panel inherited and the clean `hover-dense` never had: Chromium's
+  repaints of the left column, a layer of its own repainted in place under the pointer, came out as noise with
+  "All tables" drawn again down the column at 7 of 14 rows hovered with it, at none without it (`hover-tune-1`,
+  `hover-plain-1`). The panel now starts without it, Turnip choosing for itself (721b50f, installed); the player
+  and its tables keep it. Next: the owner's worn try.
 
 ## Playing it on the Frame
 
@@ -422,3 +433,7 @@ the headset is unworn. GPU = SteamVR's own count (`/perfmetrics_meta/app/gpu_fra
 | 10-31 21:13 | ba31f64, staged | `room-lib-1`: as `sweep-0` (`--env DISPLAY=:1`, the pointer swept down the left column and back every 1.5 s from 8 to 40 s), with Steam's Vulkan layers (`VK_INSTANCE_LAYERS=VK_LAYER_VALVE_rpo:VK_LAYER_VALVE_fdm_injection`, `DISABLE_VULKAN_FDM_INJECTION_LAYER=1`); the panel drawn into the eyes | Each eye 2160×2160 (1.25 × 1728); 288–300 pictures in 5 s through the sweep (no cap now), each drawn the next frame; 72 fps, CPU a frame 0.7 ms p50 (1.0–1.2 at p90), GPU 1.2 ms (the runtime's count); the eyes at 15 s show the left column sharp, the pointer's ring and its row's highlight in place. The two frames of about 60 ms are the captures' own read-backs. CPU 65 °C |
 | 10-31 21:15 | the same | `room-menu-1`: Symphony IX 1.0.2 with Steam's Vulkan layers, the pause menu by scripted keys (`pause` at 8 and 17 s) | The menu drawn into the eyes over the table at 1.2 m, the table whole around and behind it (the layers leave our pass's loaded picture alone); its picture at 9.1 s; the frame it opened 13.6 ms CPU, 17.8 ms GPU at most (14–25 and 16–28 before); 72 fps otherwise. CPU 72–74 °C |
 | 10-31 21:17 | ba31f64, installed (`frame.sh install`) | `room-steam-1`: through the Steam client, stopped after 35 s | The library at 2160 px an eye, its first picture 0.6 s into VR, 72 fps, CPU a frame 0.1 ms; ended on the stop with its panel and Steam's launch |
+| 10-31 21:20 | ba31f64, installed | The owner, worn, through Steam: the library | Blocks still, drawn into the eyes too, staying until the page changes again, parts of the page in the wrong places ("All tables" where another button was). Chromium's GPU process has `libVkLayer_VALVE_rpo` and `libVkLayer_VALVE_fdm_injection` under zink (read from `/proc`) |
+| 10-31 21:24 | 19070df, installed | `room-steam-2`: through the Steam client, stopped after 30 s; the owner wore the headset through it | The panel's GPU process without Valve's two layers, the player with them; the library 0.5 s into VR, 72 fps. The owner: blocks still, maybe fewer, then "quite a bit", in the left column alone |
+| 10-31 21:36 | the same | `hover-tune-1`, `hover-plain-1`: the panel alone on X11 (`frame.sh panel`, Steam's gamescope WSI and VRAM report limit set), the pointer stopping on 14 rows of the left column a second each, then on a table's tile; pictures 0.7 s into each stop, each compared with the one before any hover, away from the pointer's row (the session scratchpad's `hover_check.py`); with `TU_AUTOTUNE_ALGO=profiled`, then without | With it: 7 of 14 stops with 150,000–200,000 pixels changed across the column away from the pointer, and 5,000–7,000 elsewhere: noise, "All tables" drawn again twice down the column. Without it: none at any stop. The column came back whole once the pointer left it |
+| 10-31 21:40 | 721b50f, installed (`frame.sh install`) | `fix-steam-1`: through the Steam client, stopped after 30 s | The panel's GPU process without `TU_AUTOTUNE_ALGO` and without Valve's two layers, the player with all three; the library 0.5 s into VR |
