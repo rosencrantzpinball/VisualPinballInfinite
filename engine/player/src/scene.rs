@@ -900,7 +900,10 @@ fn decode_in_parallel<J: Sync>(jobs: &[J], decode: impl Fn(&J) -> Option<Image> 
 /// in the jobs' order.
 pub(crate) fn in_parallel<J: Sync, R: Send>(jobs: &[J], work: impl Fn(&J) -> R + Sync) -> Vec<R> {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let threads = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get).clamp(1, 8).min(jobs.len());
+    let threads = crate::threads().min(jobs.len());
+    if threads <= 1 {
+        return jobs.iter().map(work).collect();
+    }
     let next = AtomicUsize::new(0);
     let mut out: Vec<Option<R>> = std::iter::repeat_with(|| None).take(jobs.len()).collect();
     std::thread::scope(|scope| {

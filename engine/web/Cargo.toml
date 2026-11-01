@@ -1,0 +1,25 @@
+[package]
+name = "vpi-web"
+version.workspace = true
+description = "Plays one table in a web browser: the player on WebGPU, Web Audio and the browser's gamepads."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+# A WebAssembly module (wasm32-wasip1) the page (site/) starts; elsewhere an empty library.
+[lib]
+crate-type = ["cdylib"]
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+player = { path = "../player", features = ["web"] }
+physics-compat = { path = "../physics-compat" }
+table-physics = { path = "../table-physics" }
+vpi-settings = { path = "../settings" }
+vpin = "0.38"
+sdl3-sys = { version = "0.7", default-features = false, features = ["no-link"] }
+sdl3-ttf-sys = { version = "0.7", default-features = false, features = ["no-link"] }
+# SDL_ttf's part the player uses, in Rust (src/sdl/ttf.rs): fonts read and drawn
+ab_glyph = "0.2"
+ttf-parser = "0.25"

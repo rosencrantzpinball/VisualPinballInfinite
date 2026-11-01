@@ -1,0 +1,35 @@
+From f3a01a676ae373a2dd337aab0c19d977849f616c Mon Sep 17 00:00:00 2001
+From: VPinInfinite <340424849+VPinInfinite@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 09:08:45 -0600
+Subject: [PATCH] Visual Pinball Infinite: WebAssembly takes 32-bit ARM's CPU
+ context
+
+Wine's winnt.h stops at a CPU it has no CONTEXT for, and WebAssembly is none of its CPUs: the browser's build of libwinevbs (wasm32) couldn't compile. WebAssembly takes 32-bit ARM's context and its runtime function and unwind types, which nothing fills there: it has no registers to save, and libwinevbs never unwinds.
+---
+ wine/include/winnt.h | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/wine/include/winnt.h b/wine/include/winnt.h
+index d01a96f..dc17fed 100644
+--- a/wine/include/winnt.h
++++ b/wine/include/winnt.h
+@@ -1775,7 +1775,9 @@ typedef struct _ARM_CONTEXT
+     ULONG Padding2[2];              /* 198 */
+ } ARM_CONTEXT;
+ 
+-#ifdef __arm__
++/* Visual Pinball Infinite: WebAssembly (the browser build) takes 32-bit ARM's context, which nothing
++ * there fills: it has no registers to save, and libwinevbs never unwinds */
++#if defined(__arm__) || defined(__wasm32__)
+ 
+ #define CONTEXT_CONTROL CONTEXT_ARM_CONTROL
+ #define CONTEXT_INTEGER CONTEXT_ARM_INTEGER
+@@ -1810,7 +1812,7 @@ typedef struct _KNONVOLATILE_CONTEXT_POINTERS
+     PULONGLONG D15;
+ } KNONVOLATILE_CONTEXT_POINTERS, *PKNONVOLATILE_CONTEXT_POINTERS;
+ 
+-#endif /* __arm__ */
++#endif /* __arm__ || __wasm32__ */
+ 
+ #define CONTEXT_ARM64           0x400000
+ #define CONTEXT_ARM64_CONTROL         (CONTEXT_ARM64 | 0x00000001)

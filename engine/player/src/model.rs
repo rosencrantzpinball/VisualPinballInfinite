@@ -95,11 +95,17 @@ pub fn load(vpx: &VPX) -> Result<(Document, Pictures), String> {
     // it?), which decode a picture only when they must (then kept); the pieces meanwhile. The rest are
     // decoded as they're uploaded (`Image::pending`)
     let jobs: Vec<usize> = (0..n).collect();
-    let (mut answers, built) = std::thread::scope(|scope| {
-        let built = scope.spawn(|| pieces(vpx));
+    let (mut answers, built) = if crate::threads() <= 1 {
+        // no threads (the browser's program): in turn
         let answers: Vec<Answer> = in_parallel(&jobs, |&i| table_meshes::answer(&vpx.images[i], candidate[i]));
-        (answers, built.join())
-    });
+        (answers, Ok::<_, Box<dyn std::any::Any + Send>>(pieces(vpx)))
+    } else {
+        std::thread::scope(|scope| {
+            let built = scope.spawn(|| pieces(vpx));
+            let answers: Vec<Answer> = in_parallel(&jobs, |&i| table_meshes::answer(&vpx.images[i], candidate[i]));
+            (answers, built.join())
+        })
+    };
     let (pieces, groups) = built.map_err(|_| "building the table's pieces failed".to_string())?;
     let (doc, sources) = layout(vpx, pieces, groups, &answers);
     let pictures = Pictures { sources, material: answers.iter_mut().map(|a| a.picture.take()).collect(), script: (0..n).map(|_| None).collect() };

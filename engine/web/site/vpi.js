@@ -1,0 +1,870 @@
+// Visual Pinball Infinite in the browser: the page that starts the player (vpi.wasm, engine/web) on
+// one table and drives it. It fetches the table's files (manifest.json lists them) into the program's
+// files, which WASI's calls reach: /table, read only, and /data, the player's settings and what the
+// table keeps (its high scores), kept in this browser's local storage. Each animation frame it hands
+// the program the keys, mouse and gamepads, asks for a frame, and plays the sound that comes.
+
+import { Gpu } from './gpu.js';
+
+const $ = (id) => document.getElementById(id);
+const status = (text) => ($('status').textContent = text);
+const log = (text) => console.log(text);
+
+// ---- the program's files (WASI's preview 1, enough for the player) ----
+
+const E = { SUCCESS: 0, ACCES: 2, BADF: 8, EXIST: 20, INVAL: 28, ISDIR: 31, NOENT: 44, NOSYS: 52, NOTDIR: 54, NOTEMPTY: 55 };
+const FILETYPE = { CHAR: 2, DIR: 3, FILE: 4 };
+
+class Dir {
+  constructor() {
+    this.children = new Map();
+    this.mtime = BigInt(Date.now()) * 1000000n;
+  }
+}
+class File {
+  constructor(data, persist) {
+    this.data = data;
+    this.size = data.length;
+    this.persist = persist;
+    this.mtime = BigInt(Date.now()) * 1000000n;
+  }
+  grow(n) {
+    if (n <= this.data.length) return;
+    const d = new Uint8Array(Math.max(n, this.data.length * 2, 4096));
+    d.set(this.data.subarray(0, this.size));
+    this.data = d;
+  }
+  bytes() {
+    return this.data.subarray(0, this.size);
+  }
+}
+
+class Files {
+  constructor(storeKey) {
+    this.root = new Dir();
+    this.storeKey = storeKey;
+    this.dirty = false;
+    this.saveTimer = 0;
+  }
+  // a path's parts, `.` and `..` resolved
+  parts(path) {
+    const out = [];
+    for (const p of path.split('/')) {
+      if (p === '' || p === '.') continue;
+      if (p === '..') out.pop();
+      else out.push(p);
+    }
+    return out;
+  }
+  lookup(parts) {
+    let node = this.root;
+    for (const p of parts) {
+      if (!(node instanceof Dir)) return null;
+      node = node.children.get(p);
+      if (!node) return null;
+    }
+    return node;
+  }
+  parent(parts, create) {
+    let node = this.root;
+    for (const p of parts.slice(0, -1)) {
+      let next = node.children.get(p);
+      if (!next && create) node.children.set(p, (next = new Dir()));
+      if (!(next instanceof Dir)) return null;
+      node = next;
+    }
+    return node;
+  }
+  put(path, data, persist) {
+    const parts = this.parts(path);
+    this.parent(parts, true).children.set(parts[parts.length - 1], new File(data, persist));
+  }
+  mkdir(path) {
+    const parts = this.parts(path);
+    let node = this.root;
+    for (const p of parts) {
+      let next = node.children.get(p);
+      if (!next) node.children.set(p, (next = new Dir()));
+      node = next;
+    }
+  }
+  // /data, from and to local storage: each file as base64, by its path
+  load() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(this.storeKey) || '{}');
+      for (const [path, b64] of Object.entries(saved)) {
+        const bin = atob(b64);
+        const data = new Uint8Array(bin.length);
+        for (let k = 0; k < bin.length; k++) data[k] = bin.charCodeAt(k);
+        this.put(path, data, true);
+      }
+    } catch (e) {
+      log(`the saved settings couldn't be read: ${e}`);
+    }
+  }
+  changed() {
+    this.dirty = true;
+    clearTimeout(this.saveTimer);
+    this.saveTimer = setTimeout(() => this.save(), 500);
+  }
+  save() {
+    if (!this.dirty) return;
+    this.dirty = false;
+    const out = {};
+    const walk = (dir, path) => {
+      for (const [name, node] of dir.children) {
+        const p = `${path}/${name}`;
+        if (node instanceof Dir) walk(node, p);
+        else if (node.persist) {
+          let bin = '';
+          const b = node.bytes();
+          for (let k = 0; k < b.length; k += 0x8000) bin += String.fromCharCode.apply(null, b.subarray(k, k + 0x8000));
+          out[p] = btoa(bin);
+        }
+      }
+    };
+    walk(this.root, '');
+    try {
+      localStorage.setItem(this.storeKey, JSON.stringify(out));
+    } catch (e) {
+      log(`the settings couldn't be saved in this browser: ${e}`);
+    }
+  }
+}
+
+class Wasi {
+  constructor(files, env, out) {
+    this.files = files;
+    this.env = env;
+    this.out = out; // (fd, text)
+    this.fds = new Map([[3, { node: files.root, path: '/', pos: 0 }]]);
+    this.next = 4;
+    this.memory = null;
+    this.lines = ['', '', ''];
+    this.decoder = new TextDecoder();
+    this.encoder = new TextEncoder();
+  }
+  get view() {
+    return new DataView(this.memory.buffer);
+  }
+  get bytes() {
+    return new Uint8Array(this.memory.buffer);
+  }
+  str(p, n) {
+    return this.decoder.decode(new Uint8Array(this.memory.buffer, p, n));
+  }
+  // the node at `path` from the folder `fd` has open
+  resolve(fd, path) {
+    const base = this.fds.get(fd);
+    if (!base || !(base.node instanceof Dir)) return null;
+    return this.files.parts(`${base.path}/${path}`);
+  }
+  stat(node, at) {
+    const v = this.view;
+    const type = node instanceof Dir ? FILETYPE.DIR : FILETYPE.FILE;
+    for (let k = 0; k < 64; k += 8) v.setBigUint64(at + k, 0n, true);
+    v.setBigUint64(at + 8, BigInt(node.ino ??= Wasi.ino++), true);
+    v.setUint8(at + 16, type);
+    v.setBigUint64(at + 24, 1n, true);
+    v.setBigUint64(at + 32, BigInt(node instanceof File ? node.size : 4096), true);
+    v.setBigUint64(at + 40, node.mtime, true);
+    v.setBigUint64(at + 48, node.mtime, true);
+    v.setBigUint64(at + 56, node.mtime, true);
+  }
+  imports() {
+    const w = this;
+    return {
+      args_get: () => E.SUCCESS,
+      args_sizes_get: (argc, size) => {
+        w.view.setUint32(argc, 0, true);
+        w.view.setUint32(size, 0, true);
+        return E.SUCCESS;
+      },
+      environ_sizes_get: (count, size) => {
+        const all = Object.entries(w.env).map(([k, v]) => `${k}=${v}\0`);
+        w.view.setUint32(count, all.length, true);
+        w.view.setUint32(size, all.reduce((n, s) => n + w.encoder.encode(s).length, 0), true);
+        return E.SUCCESS;
+      },
+      environ_get: (list, buf) => {
+        let at = buf;
+        Object.entries(w.env).forEach(([k, v], i) => {
+          const b = w.encoder.encode(`${k}=${v}\0`);
+          w.bytes.set(b, at);
+          w.view.setUint32(list + 4 * i, at, true);
+          at += b.length;
+        });
+        return E.SUCCESS;
+      },
+      clock_res_get: (id, res) => {
+        w.view.setBigUint64(res, 1000n, true);
+        return E.SUCCESS;
+      },
+      clock_time_get: (id, precision, time) => {
+        const ns = id === 0 ? BigInt(Date.now()) * 1000000n : BigInt(Math.round(performance.now() * 1e6));
+        w.view.setBigUint64(time, ns, true);
+        return E.SUCCESS;
+      },
+      random_get: (buf, len) => {
+        for (let k = 0; k < len; k += 65536) crypto.getRandomValues(new Uint8Array(w.memory.buffer, buf + k, Math.min(65536, len - k)));
+        return E.SUCCESS;
+      },
+      fd_prestat_get: (fd, buf) => {
+        if (fd !== 3) return E.BADF;
+        w.view.setUint8(buf, 0);
+        w.view.setUint32(buf + 4, 1, true);
+        return E.SUCCESS;
+      },
+      fd_prestat_dir_name: (fd, path, len) => {
+        if (fd !== 3) return E.BADF;
+        w.bytes[path] = 47; // '/'
+        return E.SUCCESS;
+      },
+      fd_fdstat_get: (fd, buf) => {
+        const v = w.view;
+        const f = w.fds.get(fd);
+        const type = fd <= 2 ? FILETYPE.CHAR : !f ? -1 : f.node instanceof Dir ? FILETYPE.DIR : FILETYPE.FILE;
+        if (type < 0) return E.BADF;
+        v.setUint8(buf, type);
+        v.setUint16(buf + 2, f?.append ? 1 : 0, true);
+        v.setBigUint64(buf + 8, 0xffffffffffffffffn, true);
+        v.setBigUint64(buf + 16, 0xffffffffffffffffn, true);
+        return E.SUCCESS;
+      },
+      fd_fdstat_set_flags: () => E.SUCCESS,
+      fd_filestat_get: (fd, buf) => {
+        const f = w.fds.get(fd);
+        if (!f) return fd <= 2 ? E.SUCCESS : E.BADF;
+        w.stat(f.node, buf);
+        return E.SUCCESS;
+      },
+      fd_filestat_set_size: (fd, size) => {
+        const f = w.fds.get(fd);
+        if (!f || !(f.node instanceof File)) return E.BADF;
+        const n = Number(size);
+        f.node.grow(n);
+        if (n > f.node.size) f.node.data.fill(0, f.node.size, n);
+        f.node.size = n;
+        if (f.node.persist) w.files.changed();
+        return E.SUCCESS;
+      },
+      path_open: (dirfd, dirflags, path, len, oflags, rights, inheriting, fdflags, out) => {
+        const parts = w.resolve(dirfd, w.str(path, len));
+        if (!parts) return E.BADF;
+        let node = w.files.lookup(parts);
+        const create = oflags & 1, directory = oflags & 2, exclusive = oflags & 4, truncate = oflags & 8;
+        if (node && create && exclusive) return E.EXIST;
+        if (!node) {
+          if (!create) return E.NOENT;
+          const parent = w.files.parent(parts, false);
+          if (!parent) return E.NOENT;
+          const persist = parts[0] === 'data';
+          if (!persist) return E.ACCES; // the table's folder is only read
+          node = new File(new Uint8Array(0), true);
+          parent.children.set(parts[parts.length - 1], node);
+          w.files.changed();
+        }
+        if (directory && !(node instanceof Dir)) return E.NOTDIR;
+        if (node instanceof File && truncate) {
+          if (!node.persist) return E.ACCES;
+          node.size = 0;
+          w.files.changed();
+        }
+        const fd = w.next++;
+        w.fds.set(fd, { node, path: `/${parts.join('/')}`, pos: 0, append: (fdflags & 1) !== 0 });
+        w.view.setUint32(out, fd, true);
+        return E.SUCCESS;
+      },
+      fd_close: (fd) => {
+        if (!w.fds.delete(fd)) return E.BADF;
+        return E.SUCCESS;
+      },
+      fd_read: (fd, iovs, n, nread) => {
+        const f = w.fds.get(fd);
+        if (!f || !(f.node instanceof File)) return fd === 0 ? (w.view.setUint32(nread, 0, true), E.SUCCESS) : E.BADF;
+        const v = w.view;
+        const bytes = w.bytes;
+        let total = 0;
+        for (let k = 0; k < n; k++) {
+          const p = v.getUint32(iovs + 8 * k, true);
+          const l = v.getUint32(iovs + 8 * k + 4, true);
+          const take = Math.max(0, Math.min(l, f.node.size - f.pos));
+          bytes.set(f.node.data.subarray(f.pos, f.pos + take), p);
+          f.pos += take;
+          total += take;
+          if (take < l) break;
+        }
+        v.setUint32(nread, total, true);
+        return E.SUCCESS;
+      },
+      fd_pread: (fd, iovs, n, offset, nread) => {
+        const f = w.fds.get(fd);
+        if (!f || !(f.node instanceof File)) return E.BADF;
+        const keep = f.pos;
+        f.pos = Number(offset);
+        const r = w.imports().fd_read(fd, iovs, n, nread);
+        f.pos = keep;
+        return r;
+      },
+      fd_write: (fd, iovs, n, nwritten) => {
+        const v = w.view;
+        let total = 0;
+        if (fd === 1 || fd === 2) {
+          for (let k = 0; k < n; k++) {
+            const p = v.getUint32(iovs + 8 * k, true);
+            const l = v.getUint32(iovs + 8 * k + 4, true);
+            w.lines[fd] += w.str(p, l);
+            total += l;
+          }
+          let nl;
+          while ((nl = w.lines[fd].indexOf('\n')) >= 0) {
+            w.out(fd, w.lines[fd].slice(0, nl));
+            w.lines[fd] = w.lines[fd].slice(nl + 1);
+          }
+          v.setUint32(nwritten, total, true);
+          return E.SUCCESS;
+        }
+        const f = w.fds.get(fd);
+        if (!f || !(f.node instanceof File)) return E.BADF;
+        if (!f.node.persist) return E.ACCES;
+        if (f.append) f.pos = f.node.size;
+        for (let k = 0; k < n; k++) {
+          const p = v.getUint32(iovs + 8 * k, true);
+          const l = v.getUint32(iovs + 8 * k + 4, true);
+          f.node.grow(f.pos + l);
+          f.node.data.set(new Uint8Array(w.memory.buffer, p, l), f.pos);
+          f.pos += l;
+          f.node.size = Math.max(f.node.size, f.pos);
+          total += l;
+        }
+        f.node.mtime = BigInt(Date.now()) * 1000000n;
+        w.files.changed();
+        v.setUint32(nwritten, total, true);
+        return E.SUCCESS;
+      },
+      fd_seek: (fd, offset, whence, out) => {
+        const f = w.fds.get(fd);
+        if (!f || !(f.node instanceof File)) return E.BADF;
+        const base = whence === 0 ? 0 : whence === 1 ? f.pos : f.node.size;
+        const pos = base + Number(offset);
+        if (pos < 0) return E.INVAL;
+        f.pos = pos;
+        w.view.setBigUint64(out, BigInt(pos), true);
+        return E.SUCCESS;
+      },
+      fd_tell: (fd, out) => {
+        const f = w.fds.get(fd);
+        if (!f) return E.BADF;
+        w.view.setBigUint64(out, BigInt(f.pos), true);
+        return E.SUCCESS;
+      },
+      fd_sync: () => E.SUCCESS,
+      fd_datasync: () => E.SUCCESS,
+      fd_readdir: (fd, buf, len, cookie, used) => {
+        const f = w.fds.get(fd);
+        if (!f || !(f.node instanceof Dir)) return E.NOTDIR;
+        const v = w.view;
+        const entries = [...f.node.children.entries()];
+        let at = 0;
+        for (let k = Number(cookie); k < entries.length && at < len; k++) {
+          const [name, node] = entries[k];
+          const nb = w.encoder.encode(name);
+          const head = new DataView(new ArrayBuffer(24));
+          head.setBigUint64(0, BigInt(k + 1), true);
+          head.setBigUint64(8, BigInt((node.ino ??= Wasi.ino++)), true);
+          head.setUint32(16, nb.length, true);
+          head.setUint8(20, node instanceof Dir ? FILETYPE.DIR : FILETYPE.FILE);
+          const entry = new Uint8Array(24 + nb.length);
+          entry.set(new Uint8Array(head.buffer), 0);
+          entry.set(nb, 24);
+          const take = Math.min(entry.length, len - at);
+          w.bytes.set(entry.subarray(0, take), buf + at);
+          at += take;
+        }
+        v.setUint32(used, at, true);
+        return E.SUCCESS;
+      },
+      path_filestat_get: (fd, flags, path, len, buf) => {
+        const parts = w.resolve(fd, w.str(path, len));
+        const node = parts && w.files.lookup(parts);
+        if (!node) return E.NOENT;
+        w.stat(node, buf);
+        return E.SUCCESS;
+      },
+      path_filestat_set_times: () => E.SUCCESS,
+      path_create_directory: (fd, path, len) => {
+        const parts = w.resolve(fd, w.str(path, len));
+        if (!parts) return E.BADF;
+        if (w.files.lookup(parts)) return E.EXIST;
+        if (parts[0] !== 'data') return E.ACCES;
+        const parent = w.files.parent(parts, false);
+        if (!parent) return E.NOENT;
+        parent.children.set(parts[parts.length - 1], new Dir());
+        return E.SUCCESS;
+      },
+      path_remove_directory: (fd, path, len) => {
+        const parts = w.resolve(fd, w.str(path, len));
+        const node = parts && w.files.lookup(parts);
+        if (!node) return E.NOENT;
+        if (!(node instanceof Dir)) return E.NOTDIR;
+        if (node.children.size) return E.NOTEMPTY;
+        w.files.parent(parts, false).children.delete(parts[parts.length - 1]);
+        return E.SUCCESS;
+      },
+      path_unlink_file: (fd, path, len) => {
+        const parts = w.resolve(fd, w.str(path, len));
+        const node = parts && w.files.lookup(parts);
+        if (!node) return E.NOENT;
+        if (node instanceof Dir) return E.ISDIR;
+        if (!node.persist) return E.ACCES;
+        w.files.parent(parts, false).children.delete(parts[parts.length - 1]);
+        w.files.changed();
+        return E.SUCCESS;
+      },
+      path_rename: (fd, old, oldLen, newFd, path, len) => {
+        const from = w.resolve(fd, w.str(old, oldLen));
+        const to = w.resolve(newFd, w.str(path, len));
+        const node = from && w.files.lookup(from);
+        if (!node) return E.NOENT;
+        if (from[0] !== 'data' || to[0] !== 'data') return E.ACCES;
+        const parent = w.files.parent(to, false);
+        if (!parent) return E.NOENT;
+        w.files.parent(from, false).children.delete(from[from.length - 1]);
+        parent.children.set(to[to.length - 1], node);
+        w.files.changed();
+        return E.SUCCESS;
+      },
+      path_readlink: () => E.INVAL,
+      path_symlink: () => E.NOSYS,
+      path_link: () => E.NOSYS,
+      poll_oneoff: (input, output, n, nevents) => {
+        // the page's thread never sleeps: every wait is over at once
+        const v = w.view;
+        for (let k = 0; k < n; k++) {
+          v.setBigUint64(output + 32 * k, v.getBigUint64(input + 48 * k, true), true);
+          v.setUint16(output + 32 * k + 8, 0, true);
+          v.setUint8(output + 32 * k + 10, v.getUint8(input + 48 * k + 8));
+        }
+        v.setUint32(nevents, n, true);
+        return E.SUCCESS;
+      },
+      proc_exit: (code) => {
+        throw new Error(`the player stopped (exit ${code})`);
+      },
+      proc_raise: () => E.NOSYS,
+      sched_yield: () => E.SUCCESS,
+      sock_accept: () => E.NOSYS,
+      sock_recv: () => E.NOSYS,
+      sock_send: () => E.NOSYS,
+      sock_shutdown: () => E.NOSYS,
+    };
+  }
+}
+Wasi.ino = 1;
+
+// ---- keys: the page's KeyboardEvent.code as SDL's scancode (USB's numbers) ----
+
+const SCANCODES = (() => {
+  const m = {};
+  for (let k = 0; k < 26; k++) m[`Key${String.fromCharCode(65 + k)}`] = 4 + k;
+  for (let k = 1; k <= 9; k++) m[`Digit${k}`] = 29 + k;
+  m.Digit0 = 39;
+  Object.assign(m, {
+    Enter: 40, Escape: 41, Backspace: 42, Tab: 43, Space: 44, Minus: 45, Equal: 46, BracketLeft: 47, BracketRight: 48,
+    Backslash: 49, Semicolon: 51, Quote: 52, Backquote: 53, Comma: 54, Period: 55, Slash: 56, CapsLock: 57,
+    PrintScreen: 70, ScrollLock: 71, Pause: 72, Insert: 73, Home: 74, PageUp: 75, Delete: 76, End: 77, PageDown: 78,
+    ArrowRight: 79, ArrowLeft: 80, ArrowDown: 81, ArrowUp: 82, NumLock: 83, NumpadDivide: 84, NumpadMultiply: 85,
+    NumpadSubtract: 86, NumpadAdd: 87, NumpadEnter: 88, NumpadDecimal: 99, IntlBackslash: 100, ContextMenu: 101,
+    ControlLeft: 224, ShiftLeft: 225, AltLeft: 226, MetaLeft: 227, ControlRight: 228, ShiftRight: 229, AltRight: 230, MetaRight: 231,
+  });
+  for (let k = 1; k <= 12; k++) m[`F${k}`] = 57 + k;
+  for (let k = 1; k <= 9; k++) m[`Numpad${k}`] = 88 + k;
+  m.Numpad0 = 98;
+  return m;
+})();
+
+// ---- sound: Web Audio, fed each frame from the player's mixer ----
+
+const WORKLET = `
+class Feed extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.chunks = [];
+    this.at = 0;
+    this.port.onmessage = (e) => this.chunks.push(e.data);
+  }
+  process(inputs, outputs) {
+    const l = outputs[0][0], r = outputs[0][1] || l;
+    let i = 0;
+    while (i < l.length && this.chunks.length) {
+      const c = this.chunks[0];
+      const n = Math.min(l.length - i, (c.length >> 1) - this.at);
+      for (let k = 0; k < n; k++) {
+        l[i + k] = c[(this.at + k) * 2];
+        r[i + k] = c[(this.at + k) * 2 + 1];
+      }
+      i += n;
+      this.at += n;
+      if (this.at >= c.length >> 1) {
+        this.chunks.shift();
+        this.at = 0;
+      }
+    }
+    if (i < l.length) {
+      l.fill(0, i);
+      r.fill(0, i);
+    }
+    return true;
+  }
+}
+registerProcessor('vpi-feed', Feed);`;
+
+class Sound {
+  constructor() {
+    this.ctx = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
+    this.node = null;
+    this.sent = 0;
+    this.start = 0;
+    this.ahead = 0.05; // seconds queued ahead of what plays
+  }
+  async ready() {
+    const url = URL.createObjectURL(new Blob([WORKLET], { type: 'text/javascript' }));
+    await this.ctx.audioWorklet.addModule(url);
+    this.node = new AudioWorkletNode(this.ctx, 'vpi-feed', { numberOfInputs: 0, outputChannelCount: [2] });
+    this.node.connect(this.ctx.destination);
+  }
+  // what the mixer has for the time to come, short of `ahead` queued
+  pump(exports, memory) {
+    if (!this.node || this.ctx.state !== 'running') return;
+    if (!this.start) this.start = this.ctx.currentTime;
+    const played = (this.ctx.currentTime - this.start) * 48000;
+    if (this.sent < played) {
+      // the page was too slow: what's late is lost, and more is kept ahead from now on
+      this.sent = played;
+      this.ahead = Math.min(0.15, this.ahead + 0.01);
+    }
+    const want = Math.ceil((played + this.ahead * 48000 - this.sent) / 128) * 128;
+    if (want <= 0) return;
+    const p = exports.vpi_web_audio(want);
+    const chunk = new Float32Array(memory.buffer, p, want * 2).slice();
+    this.node.port.postMessage(chunk, [chunk.buffer]);
+    this.sent += want;
+  }
+}
+
+// ---- the page ----
+
+async function main() {
+  const manifest = await (await fetch('manifest.json')).json();
+  document.title = manifest.title;
+  $('title').textContent = manifest.title;
+  if (manifest.byline) $('byline').textContent = manifest.byline;
+  if (!navigator.gpu) {
+    status('This browser has no WebGPU: Visual Pinball Infinite needs a recent Chrome, Edge, Safari or Firefox.');
+    return;
+  }
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  if (!adapter) {
+    status("WebGPU found no graphics card it can use here.");
+    return;
+  }
+  // `?plain` asks for none of WebGPU's optional features, as a browser without them would have it
+  const plain = new URLSearchParams(location.search).has('plain');
+  const wanted = plain ? [] : ['clip-distances', 'float32-filterable', 'depth-clip-control'].filter((f) => adapter.features.has(f));
+  const limits = {};
+  for (const k of ['maxTextureDimension2D', 'maxBufferSize', 'maxColorAttachmentBytesPerSample', 'maxSampledTexturesPerShaderStage', 'maxSamplersPerShaderStage', 'maxUniformBufferBindingSize', 'maxUniformBuffersPerShaderStage', 'maxDynamicUniformBuffersPerPipelineLayout', 'maxInterStageShaderVariables', 'maxVertexAttributes', 'maxVertexBuffers']) {
+    if (adapter.limits[k] !== undefined) limits[k] = adapter.limits[k];
+  }
+  const device = await adapter.requestDevice({ requiredFeatures: wanted, requiredLimits: limits });
+  let lost = false;
+  const pageStarted = performance.now();
+  device.lost.then((info) => {
+    lost = true;
+    if (info.reason === 'destroyed') return;
+    console.error(`WebGPU device lost (${info.reason}): ${info.message}`);
+    // lost while starting (macOS's GPU recovering from the page before this one, as a reload can
+    // make it): one more try on its own
+    if (performance.now() - pageStarted < 30000 && !sessionStorage.getItem('vpi-retried')) {
+      sessionStorage.setItem('vpi-retried', '1');
+      location.reload();
+      return;
+    }
+    $('overlay').hidden = false;
+    $('play').hidden = false;
+    $('play').textContent = 'Reload';
+    $('play').onclick = () => location.reload();
+    status('The graphics card stopped the table (the browser’s console says why).');
+  });
+  const canvas = $('table');
+  const context = canvas.getContext('webgpu');
+  const format = navigator.gpu.getPreferredCanvasFormat();
+  context.configure({ device, format, alphaMode: 'opaque', viewFormats: [`${format}-srgb`] });
+  const gpu = new Gpu(device, canvas, context, format, log);
+
+  // the canvas at the screen's pixels (twice the page's at most), as its box changes; the player
+  // starts once it has its size, so its first pictures are drawn at it
+  const maxSide = Math.min(device.limits.maxTextureDimension2D, 3840);
+  let resized = null;
+  let sized;
+  const firstSize = new Promise((r) => (sized = r));
+  const fit = (w, h) => {
+    const scale = Math.min(1, maxSide / Math.max(w, h));
+    canvas.width = Math.max(1, Math.round(w * scale));
+    canvas.height = Math.max(1, Math.round(h * scale));
+    resized?.(canvas.width, canvas.height);
+    sized();
+  };
+  new ResizeObserver((entries) => {
+    const e = entries[0];
+    const box = e.devicePixelContentBoxSize?.[0];
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    if (box && dpr === (window.devicePixelRatio || 1)) fit(box.inlineSize, box.blockSize);
+    else fit(e.contentRect.width * dpr, e.contentRect.height * dpr);
+  }).observe(canvas);
+
+  // the table's files, fetched with their progress
+  const files = new Files(`vpi:${manifest.id}:data`);
+  files.mkdir('/data/table-settings');
+  files.load();
+  const total = manifest.files.reduce((n, f) => n + f.size, 0);
+  let got = 0;
+  const bar = $('progress');
+  const fetchFile = async (f) => {
+    const res = await fetch(f.url);
+    if (!res.ok) throw new Error(`${f.url}: ${res.status}`);
+    const data = new Uint8Array(f.size);
+    const reader = res.body.getReader();
+    let at = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (at + value.length > data.length) throw new Error(`${f.url}: bigger than the manifest says`);
+      data.set(value, at);
+      at += value.length;
+      got += value.length;
+      bar.value = got / total;
+    }
+    files.put(f.path, at === f.size ? data : data.subarray(0, at), false);
+  };
+  // the small files eight at a time, the big ones (the table) after, one by one
+  const small = manifest.files.filter((f) => f.size < 4 << 20);
+  for (let k = 0; k < small.length; k += 8) await Promise.all(small.slice(k, k + 8).map(fetchFile));
+  for (const f of manifest.files.filter((f) => f.size >= 4 << 20)) {
+    status(`Fetching ${decodeURIComponent(f.url.split('/').pop())} (${Math.round(f.size / 1e6)} MB)…`);
+    await fetchFile(f);
+  }
+  status('Starting the player…');
+  // compiled as it arrives; whole, where the host doesn't serve it as application/wasm
+  const wasm = await WebAssembly.compileStreaming(fetch('vpi.wasm')).catch(async () => WebAssembly.compile(await (await fetch('vpi.wasm')).arrayBuffer()));
+  const env = { VPI_TABLE: manifest.table, VPI_DATA: '/data', VPI_TABLE_SETTINGS: '/data/table-settings', HOME: '/data' };
+  const wasi = new Wasi(files, env, (fd, line) => (fd === 2 ? console.warn(line) : console.log(line)));
+  const sound = new Sound();
+  const page = {
+    page_pixel_density: () => canvas.width / Math.max(1, canvas.clientWidth),
+    page_screen_size: (wp, hp) => {
+      const v = new Uint32Array(memory().buffer);
+      const d = window.devicePixelRatio || 1;
+      v[wp >> 2] = Math.round(screen.width * d);
+      v[hp >> 2] = Math.round(screen.height * d);
+    },
+    page_refresh_rate: () => refresh,
+    page_fullscreen: (on) => (on ? canvas.requestFullscreen?.().catch(() => {}) : document.exitFullscreen?.().catch(() => {})),
+    page_rumble: (index, strong, weak, ms) => {
+      const pad = navigator.getGamepads()[index];
+      pad?.vibrationActuator?.playEffect?.('dual-rumble', { duration: ms, strongMagnitude: strong, weakMagnitude: weak }).catch(() => {});
+    },
+  };
+  const instance = await WebAssembly.instantiate(wasm, { wasi_snapshot_preview1: wasi.imports(), vpi_gpu: gpu.imports(), vpi_page: page });
+  const x = instance.exports;
+  const memory = () => x.memory;
+  wasi.memory = x.memory;
+  gpu.memory = x.memory;
+  x.vpi_web_init();
+  await sound.ready();
+
+  // the screen's refresh, from the frames' times
+  let refresh = 60;
+  const times = [];
+  status('Loading the table… (a big table takes a while)');
+  await firstSize;
+  await new Promise((r) => setTimeout(r, 30));
+  const t0 = performance.now();
+  if (!x.vpi_web_start(refresh)) {
+    status('The table could not start: the browser’s console says why.');
+    return;
+  }
+  log(`the table started in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+  setTimeout(() => sessionStorage.removeItem('vpi-retried'), 30000);
+  resized = (w, h) => x.vpi_web_resized(w, h);
+
+  // play waits for a click (the browser plays sound only after one)
+  let playing = false;
+  x.vpi_web_focus(0);
+  const overlay = $('overlay');
+  status('');
+  $('play').hidden = false;
+  const go = async () => {
+    overlay.hidden = true;
+    canvas.focus();
+    playing = true;
+    x.vpi_web_focus(1);
+    // the browser lets sound start only after a press of its own choosing (a gamepad's may not
+    // count): until it does, the next click or key starts it
+    await sound.ctx.resume().catch(() => {});
+    if (sound.ctx.state !== 'running') {
+      const unlock = () => sound.ctx.resume().then(() => {
+        if (sound.ctx.state === 'running') ['pointerdown', 'keydown'].forEach((k) => window.removeEventListener(k, unlock, true));
+      });
+      ['pointerdown', 'keydown'].forEach((k) => window.addEventListener(k, unlock, true));
+    }
+  };
+  $('play').onclick = go;
+  canvas.addEventListener('pointerdown', () => {
+    if (!playing && overlay.hidden) go();
+  });
+  window.addEventListener('blur', () => {
+    if (playing) {
+      playing = false;
+      x.vpi_web_focus(0);
+    }
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && playing) {
+      playing = false;
+      x.vpi_web_focus(0);
+    }
+  });
+  window.addEventListener('pagehide', () => {
+    files.save();
+    // the graphics card's memory let go at once, not when the browser gets round to it
+    device.destroy();
+  });
+
+  // keys and mouse
+  const key = (e, down) => {
+    const code = SCANCODES[e.code];
+    if (code === undefined || e.ctrlKey || e.metaKey) return;
+    if (!playing) {
+      if (down && overlay.hidden) go();
+      return;
+    }
+    e.preventDefault();
+    x.vpi_web_key(code, down ? 1 : 0, e.repeat ? 1 : 0);
+  };
+  window.addEventListener('keydown', (e) => key(e, true));
+  window.addEventListener('keyup', (e) => key(e, false));
+  const at = (e) => {
+    const r = canvas.getBoundingClientRect();
+    return [e.clientX - r.left, e.clientY - r.top];
+  };
+  canvas.addEventListener('pointermove', (e) => x.vpi_web_mouse_move(...at(e)));
+  canvas.addEventListener('pointerdown', (e) => playing && x.vpi_web_mouse_button([1, 2, 3, 4, 5][e.button] ?? 1, 1, ...at(e)));
+  canvas.addEventListener('pointerup', (e) => playing && x.vpi_web_mouse_button([1, 2, 3, 4, 5][e.button] ?? 1, 0, ...at(e)));
+  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    x.vpi_web_mouse_wheel(-Math.sign(e.deltaY));
+  }, { passive: false });
+  $('fullscreen').onclick = async () => {
+    if (document.fullscreenElement) await document.exitFullscreen();
+    else {
+      await document.documentElement.requestFullscreen();
+      // Esc reaches the table (the pause menu); holding it leaves full screen
+      await navigator.keyboard?.lock?.(['Escape']).catch(() => {});
+    }
+    canvas.focus();
+  };
+
+  let ended = false;
+  // gamepads: each frame, every pad's state to the player
+  const encoder = new TextEncoder();
+  const known = new Set();
+  const pads = () => {
+    const now = new Set();
+    for (const pad of navigator.getGamepads()) {
+      if (!pad || !pad.connected) continue;
+      now.add(pad.index);
+      const name = encoder.encode(pad.id);
+      const nameEnd = (name.length + 3) & ~3;
+      const nb = pad.buttons.length, na = pad.axes.length;
+      const p = x.vpi_web_scratch(nameEnd + 4 * (nb + na));
+      new Uint8Array(x.memory.buffer, p, name.length).set(name);
+      const fl = new Float32Array(x.memory.buffer, p + nameEnd, nb + na);
+      pad.buttons.forEach((b, k) => (fl[k] = b.value || (b.pressed ? 1 : 0)));
+      pad.axes.forEach((a, k) => (fl[nb + k] = a));
+      x.vpi_web_pad(pad.index, pad.mapping === 'standard' ? 1 : 0, name.length, nb, na);
+      // a press while play waits starts it again, as a click or a key does
+      if (!playing && !ended && document.hasFocus() && $('play').textContent === 'Play' && pad.buttons.some((b) => b.pressed)) go();
+    }
+    for (const k of known) if (!now.has(k)) x.vpi_web_pad_gone(k);
+    known.clear();
+    now.forEach((k) => known.add(k));
+  };
+
+  // what a frame takes the page, for the console (vpi.stats)
+  const stats = {
+    times: [],
+    add(ms) {
+      this.times.push(ms);
+      if (this.times.length > 240) this.times.shift();
+    },
+    summary() {
+      const t = [...this.times].sort((a, b) => a - b);
+      const at = (q) => t[Math.min(t.length - 1, Math.floor(q * t.length))]?.toFixed(2);
+      return { frames: t.length, median_ms: at(0.5), p90_ms: at(0.9), max_ms: at(1), refresh_hz: refresh.toFixed(1) };
+    },
+  };
+  const state = () => {
+    const n = x.vpi_web_state();
+    return JSON.parse(new TextDecoder().decode(new Uint8Array(x.memory.buffer, x.vpi_web_scratch(0), n)));
+  };
+  window.vpi = { exports: x, gpu, sound, files, stats, device, state };
+
+  // the frames
+  let last = 0;
+  const frame = (t) => {
+    if (ended || lost) return;
+    if (last) {
+      times.push(t - last);
+      if (times.length === 120) {
+        const sorted = [...times].sort((a, b) => a - b);
+        const hz = 1000 / sorted[60];
+        if (Math.abs(hz - refresh) > 1) {
+          refresh = hz;
+          x.vpi_web_refresh(hz);
+        }
+        times.length = 0;
+      }
+    }
+    last = t;
+    requestAnimationFrame(frame);
+    const began = performance.now();
+    let r;
+    try {
+      pads();
+      r = x.vpi_web_frame();
+    } catch (e) {
+      // the program stopped (a Rust panic aborts it): said, and the page stops with it
+      console.error(e);
+      r = -1;
+    }
+    gpu.presented();
+    sound.pump(x, x.memory);
+    stats.add(performance.now() - began);
+    if (r <= 0) {
+      ended = true;
+      files.save();
+      overlay.hidden = false;
+      $('play').hidden = false;
+      $('play').textContent = 'Play again';
+      $('play').onclick = () => location.reload();
+      status(r === 0 ? 'Thanks for playing.' : 'The table stopped: the browser’s console says why.');
+    }
+  };
+  requestAnimationFrame(frame);
+}
+
+main().catch((e) => {
+  status(`Something went wrong: ${e.message}`);
+  console.error(e);
+});

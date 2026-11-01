@@ -968,6 +968,12 @@ impl Game {
         self.world.pup.as_ref().map(|p| p.pup.summary())
     }
 
+    /// The volume keys' presses since the last look, on the table's sound (the browser's loop
+    /// runs the game itself, `engine/web`).
+    pub fn poll_volume_keys(&mut self, keys: &mut crate::volume::Keys) {
+        keys.poll(&mut self.world.sounds);
+    }
+
     /// Whether the script asked to end play (`QuitPlayer`).
     pub fn quit_requested(&self) -> bool {
         self.world.quit_requested

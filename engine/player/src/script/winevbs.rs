@@ -110,7 +110,7 @@ mod os {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_family = "wasm")))]
 mod os {
     use std::ffi::{CString, c_char, c_int, c_void};
     use std::os::unix::ffi::OsStrExt;
@@ -143,6 +143,80 @@ mod os {
     }
 }
 
+/// In the browser (engine/web) libwinevbs is built into the program (`tools/web/libwinevbs.sh`), not
+/// loaded: its exports are found by name among the functions linked in. Declared with their own
+/// types: WebAssembly checks every call's type against the function's.
+#[cfg(target_family = "wasm")]
+mod os {
+    use std::ffi::{c_char, c_int, c_void};
+
+    use super::{Callbacks, FileFenceFn, GUID, HRESULT, OLECHAR, SAFEARRAYBOUND, VARIANT};
+    unsafe extern "C" {
+        fn CoCreateInstance(clsid: *const GUID, outer: *mut c_void, context: u32, iid: *const GUID, object: *mut *mut c_void) -> HRESULT;
+        fn SysAllocStringLen(text: *const OLECHAR, len: u32) -> *mut OLECHAR;
+        fn SysFreeString(text: *mut OLECHAR);
+        fn SysStringLen(text: *mut OLECHAR) -> u32;
+        fn VariantInit(v: *mut VARIANT);
+        fn VariantClear(v: *mut VARIANT) -> HRESULT;
+        fn VariantCopy(to: *mut VARIANT, from: *const VARIANT) -> HRESULT;
+        fn VariantCopyInd(to: *mut VARIANT, from: *const VARIANT) -> HRESULT;
+        fn VariantChangeType(to: *mut VARIANT, from: *const VARIANT, flags: u16, vt: u16) -> HRESULT;
+        fn SafeArrayCreateVector(vt: u16, lower: i32, count: u32) -> *mut c_void;
+        fn SafeArrayPutElement(array: *mut c_void, at: *const i32, value: *mut c_void) -> HRESULT;
+        fn SafeArrayGetElement(array: *mut c_void, at: *const i32, value: *mut c_void) -> HRESULT;
+        fn SafeArrayGetLBound(array: *mut c_void, dim: u32, bound: *mut i32) -> HRESULT;
+        fn SafeArrayGetUBound(array: *mut c_void, dim: u32, bound: *mut i32) -> HRESULT;
+        fn SafeArrayGetDim(array: *mut c_void) -> u32;
+        fn SafeArrayCreate(vt: u16, dims: u32, bounds: *const SAFEARRAYBOUND) -> *mut c_void;
+        fn SafeArrayAccessData(array: *mut c_void, data: *mut *mut c_void) -> HRESULT;
+        fn SafeArrayUnaccessData(array: *mut c_void) -> HRESULT;
+        fn libwinevbs_set_file_fence(fence: Option<FileFenceFn>, root: *const OLECHAR);
+        fn libwinevbs_init(callbacks: *const Callbacks);
+        fn vsnprintf(buffer: *mut c_char, count: usize, format: *const c_char, args: *mut c_void) -> c_int;
+    }
+
+    /// The library, always there.
+    pub fn open(_path: &std::path::Path) -> *mut c_void {
+        std::ptr::NonNull::<c_void>::dangling().as_ptr()
+    }
+
+    /// # Safety
+    /// `name` is NUL-terminated.
+    pub unsafe fn symbol(_module: *mut c_void, name: &str) -> *mut c_void {
+        let f: *const () = match name.trim_end_matches('\0') {
+            "CoCreateInstance" => CoCreateInstance as *const (),
+            "SysAllocStringLen" => SysAllocStringLen as *const (),
+            "SysFreeString" => SysFreeString as *const (),
+            "SysStringLen" => SysStringLen as *const (),
+            "VariantInit" => VariantInit as *const (),
+            "VariantClear" => VariantClear as *const (),
+            "VariantCopy" => VariantCopy as *const (),
+            "VariantCopyInd" => VariantCopyInd as *const (),
+            "VariantChangeType" => VariantChangeType as *const (),
+            "SafeArrayCreateVector" => SafeArrayCreateVector as *const (),
+            "SafeArrayPutElement" => SafeArrayPutElement as *const (),
+            "SafeArrayGetElement" => SafeArrayGetElement as *const (),
+            "SafeArrayGetLBound" => SafeArrayGetLBound as *const (),
+            "SafeArrayGetUBound" => SafeArrayGetUBound as *const (),
+            "SafeArrayGetDim" => SafeArrayGetDim as *const (),
+            "SafeArrayCreate" => SafeArrayCreate as *const (),
+            "SafeArrayAccessData" => SafeArrayAccessData as *const (),
+            "SafeArrayUnaccessData" => SafeArrayUnaccessData as *const (),
+            "libwinevbs_set_file_fence" => libwinevbs_set_file_fence as *const (),
+            "libwinevbs_init" => libwinevbs_init as *const (),
+            _ => std::ptr::null(),
+        };
+        f.cast_mut().cast()
+    }
+
+    /// # Safety
+    /// `format` and `args` are a `printf` format and its `va_list`, a pointer to the arguments in
+    /// WebAssembly's C.
+    pub unsafe fn format(buffer: &mut [c_char], format: *const c_char, args: *mut c_void) -> i32 {
+        unsafe { vsnprintf(buffer.as_mut_ptr(), buffer.len(), format, args) }
+    }
+}
+
 /// Where to look for `winevbs64.dll`: next to the program (how it ships),
 /// then, in the repository (development builds), our own build with our
 /// patches (`tools/libwinevbs`, built into `vpx-build/libwinevbs/build`), then
@@ -169,7 +243,7 @@ fn candidates() -> Vec<PathBuf> {
 /// Where to look for `libwinevbs.so` on Linux: next to the program (how a package carries it),
 /// then, in a development build, our own build (`tools/libwinevbs/setup.sh`, into
 /// `vpx-build/linux-aarch64/libwinevbs/build`).
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_family = "wasm")))]
 fn candidates() -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Ok(exe) = std::env::current_exe()
@@ -184,6 +258,12 @@ fn candidates() -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// In the browser, the library built in.
+#[cfg(target_family = "wasm")]
+fn candidates() -> Vec<PathBuf> {
+    vec![PathBuf::from("libwinevbs (built in)")]
 }
 
 unsafe extern "C" fn log(level: i32, format: *const c_char, args: *mut c_void) {
@@ -263,7 +343,7 @@ pub fn get() -> Result<&'static WineVbs, String> {
         .get_or_init(|| {
             let tried = candidates();
             for path in &tried {
-                if path.exists() {
+                if cfg!(target_family = "wasm") || path.exists() {
                     return load_from(path);
                 }
             }

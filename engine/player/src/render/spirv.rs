@@ -1,7 +1,8 @@
 //! The shaders as SPIR-V, for SDL_GPU's Vulkan backend (Linux): DXC compiled every one the
 //! renderer asks for when the player was built (`build.rs`), where on Windows FXC compiles them as
 //! the player starts (`fxc.rs`). A shader is found by its source, put together as the renderer
-//! puts it together, and its entry point.
+//! puts it together, and its entry point. In the browser's build (`engine/web`) the same table
+//! holds each one as WGSL, which the web crate's SDL hands to WebGPU.
 
 use std::ffi::CStr;
 

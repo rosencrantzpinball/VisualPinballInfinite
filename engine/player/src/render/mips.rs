@@ -192,7 +192,7 @@ fn block_edge(rows: &[f32], sw: usize, sx: isize, present: &[bool; 4]) -> ([f32;
 /// Splits `dst`'s rows (`dh` of `row_len` values) among threads when there
 /// are many, calling `fill(first_row, rows)` for each part.
 fn by_rows<T: Send>(dst: &mut [T], dh: usize, row_len: usize, fill: impl Fn(usize, &mut [T]) + Sync) {
-    let threads = if dst.len() >= (1 << 20) { std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 8) } else { 1 };
+    let threads = if dst.len() >= (1 << 20) { crate::threads() } else { 1 };
     if threads == 1 {
         fill(0, dst);
         return;

@@ -35,9 +35,6 @@ colour-link = { path = "../colour-link" }
 dof-link = { path = "../dof-link" }
 dmd-link = { path = "../dmd-link" }
 roxmltree = "0.21"
-# PinUP labels' text, as VPX draws it: SDL_ttf with its own FreeType and HarfBuzz, built in
-# statically like SDL; no SVG glyphs (plutosvg), which packs' fonts don't use
-sdl3-ttf-sys = { version = "0.7", default-features = false, features = ["build-static-vendored", "no-sdlttf-plutosvg"] }
 serde_json = "1"
 # Compressed sounds and music (MP3, Ogg Vorbis, FLAC, WAV), as VPX decodes them with miniaudio
 symphonia = { version = "0.6", default-features = false, features = ["mp3", "ogg", "vorbis", "flac", "wav", "pcm", "adpcm", "opt-simd"] }
@@ -53,8 +50,21 @@ sdl3-sys = { version = "0.7", default-features = false, features = ["build-from-
 
 # Built into the program too; on Linux SDL uses the system's C library, as every program there does
 # (SDL 3.4.18 doesn't build for Linux without it)
-[target.'cfg(not(windows))'.dependencies]
+[target.'cfg(all(not(windows), not(target_family = "wasm")))'.dependencies]
 sdl3-sys = { version = "0.7", default-features = false, features = ["build-from-source-static"] }
+
+# PinUP labels' text, as VPX draws it: SDL_ttf with its own FreeType and HarfBuzz, built in
+# statically like SDL; no SVG glyphs (plutosvg), which packs' fonts don't use
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+sdl3-ttf-sys = { version = "0.7", default-features = false, features = ["build-static-vendored", "no-sdlttf-plutosvg"] }
+
+# In the browser (engine/web): SDL's and SDL_ttf's declarations alone, SDL itself the web crate's own
+# stand-in on WebGPU, Web Audio and the browser's gamepads; no SDL_ttf there (no PinUP labels' text)
+[target.'cfg(target_family = "wasm")'.dependencies]
+sdl3-sys = { version = "0.7", default-features = false, features = ["no-link"] }
+sdl3-ttf-sys = { version = "0.7", default-features = false, features = ["no-link"] }
+
+[target.'cfg(not(windows))'.dependencies]
 # OpenXR's types, for VR on Linux (the Steam Frame): the loader itself is loaded at run time (src/xr)
 openxr-sys = "0.14"
 # the link to vpi-panel, the app's screens in the headset (src/panel.rs)
@@ -63,3 +73,9 @@ panel-link = { path = "../panel-link" }
 [build-dependencies]
 # The bridge to FFmpeg for PinUP packs' media (native/pup_av.cpp)
 cc = "1"
+# The shaders' SPIR-V made WGSL, for the browser's WebGPU (the `web` feature)
+naga = { version = "30", default-features = false, features = ["spv-in", "wgsl-out"], optional = true }
+
+[features]
+# The player built for the browser (engine/web): its shaders as WGSL
+web = ["dep:naga"]

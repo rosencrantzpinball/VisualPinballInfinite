@@ -16,6 +16,7 @@ members = [
     "engine/dmddevice-host",
     "engine/panel-link",
     "engine/panel-host",
+    "engine/web",
     "engine/library",
     "engine/settings",
     "engine/achievements",
@@ -32,6 +33,14 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/VPinInfinite/VisualPinballInfinite"
 rust-version = "1.98"
+
+# The browser's build (engine/web, tools/web/package.sh): the release build optimized across its crates as
+# one, a smaller and quicker WebAssembly module; its own profile, so the other builds keep theirs
+[profile.web]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+strip = "debuginfo"
 
 # The release build with line tables, for crash reports that name source lines:
 # cargo build --profile crashdebug -p player (target/crashdebug/)

@@ -40,7 +40,7 @@ impl ScriptHost {
         let site = Site::new(items.iter().map(|i| (i.name.to_lowercase(), i.obj)).collect());
         unsafe {
             let mut parse: *mut c_void = std::ptr::null_mut();
-            let hr = (lib.co_create_instance)(&CLSID_VBSCRIPT, std::ptr::null_mut(), CLSCTX_INPROC_SERVER, &IID_IACTIVESCRIPTPARSE64, &mut parse);
+            let hr = (lib.co_create_instance)(&CLSID_VBSCRIPT, std::ptr::null_mut(), CLSCTX_INPROC_SERVER, &IID_IACTIVESCRIPTPARSE, &mut parse);
             if failed(hr) || parse.is_null() {
                 return Err(format!("could not start the VBScript engine ({hr:#x})"));
             }

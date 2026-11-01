@@ -7,6 +7,12 @@
 /// beside the program alone.
 pub const DEVELOPMENT: bool = option_env!("VPI_RELEASE_BUILD").is_none();
 
+/// How many threads the player's loading spreads over: the processors, up to eight; one in the
+/// browser (`engine/web`), whose program has no threads of its own, so the work is done in turn.
+pub fn threads() -> usize {
+    if cfg!(target_family = "wasm") { 1 } else { std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get).clamp(1, 8) }
+}
+
 pub mod addon_settings;
 pub mod alphadmd;
 pub mod alphanumeric;

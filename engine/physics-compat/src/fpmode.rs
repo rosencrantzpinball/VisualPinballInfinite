@@ -93,6 +93,19 @@ fn write_fpcr(v: u64) {
     unsafe { std::arch::asm!("msr fpcr, {}", in(reg) v, options(nomem, nostack, preserves_flags)) };
 }
 
+/// WebAssembly (the browser build) has no such mode: its floats keep IEEE 754's tiny numbers, so
+/// there the rare tiny values can play out a little differently than in VPX.
+#[cfg(target_family = "wasm")]
+#[must_use = "the mode is restored when this is dropped"]
+pub struct VpxFloatMode;
+
+#[cfg(target_family = "wasm")]
+impl VpxFloatMode {
+    pub fn enter() -> Self {
+        Self
+    }
+}
+
 #[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod tests {
     use super::*;

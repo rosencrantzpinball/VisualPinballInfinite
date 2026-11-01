@@ -40,6 +40,13 @@ pub const IID_IUNKNOWN: GUID = GUID { data1: 0x0000_0000, data2: 0, data3: 0, da
 pub const IID_IDISPATCH: GUID = GUID { data1: 0x0002_0400, data2: 0, data3: 0, data4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46] };
 pub const IID_IACTIVESCRIPT: GUID = GUID { data1: 0xBB1A_2AE1, data2: 0xA4F9, data3: 0x11CF, data4: [0x8F, 0x20, 0x00, 0x80, 0x5F, 0x2C, 0xD0, 0x64] };
 pub const IID_IACTIVESCRIPTPARSE64: GUID = GUID { data1: 0xC7EF_7658, data2: 0xE1EE, data3: 0x480E, data4: [0x97, 0xEA, 0xD5, 0x2C, 0xB4, 0xD7, 0x6D, 0x17] };
+/// The same interface in a 32-bit program (the browser's): its own number, its cookies 32 bits.
+pub const IID_IACTIVESCRIPTPARSE32: GUID = GUID { data1: 0xBB1A_2AE2, data2: 0xA4F9, data3: 0x11CF, data4: [0x8F, 0x20, 0x00, 0x80, 0x5F, 0x2C, 0xD0, 0x64] };
+/// `IActiveScriptParse` as the engine has it, for the program's pointer size (Wine's `_WIN64`).
+#[cfg(target_pointer_width = "64")]
+pub const IID_IACTIVESCRIPTPARSE: GUID = IID_IACTIVESCRIPTPARSE64;
+#[cfg(target_pointer_width = "32")]
+pub const IID_IACTIVESCRIPTPARSE: GUID = IID_IACTIVESCRIPTPARSE32;
 pub const IID_IACTIVESCRIPTSITE: GUID = GUID { data1: 0xDB01_A1E3, data2: 0xA42B, data3: 0x11CF, data4: [0x8F, 0x20, 0x00, 0x80, 0x5F, 0x2C, 0xD0, 0x64] };
 pub const CLSID_VBSCRIPT: GUID = GUID { data1: 0xB54F_3741, data2: 0x5B07, data3: 0x11CF, data4: [0xA4, 0xB0, 0x00, 0xAA, 0x00, 0x4A, 0x55, 0xE8] };
 
@@ -82,18 +89,24 @@ pub struct SAFEARRAYBOUND {
     pub lower_bound: i32,
 }
 
-/// A VARIANT: a type tag and 16 bytes of value.
+/// A VARIANT: a type tag and 16 bytes of value; 8 in a 32-bit program (the browser's), where the
+/// biggest of its values (a record's two pointers, a double) takes 8.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct VARIANT {
     pub vt: u16,
     pub reserved: [u16; 3],
-    pub data: [u64; 2],
+    pub data: [u64; VARIANT_WORDS],
 }
+
+#[cfg(target_pointer_width = "64")]
+const VARIANT_WORDS: usize = 2;
+#[cfg(target_pointer_width = "32")]
+const VARIANT_WORDS: usize = 1;
 
 impl Default for VARIANT {
     fn default() -> Self {
-        VARIANT { vt: VT_EMPTY, reserved: [0; 3], data: [0; 2] }
+        VARIANT { vt: VT_EMPTY, reserved: [0; 3], data: [0; VARIANT_WORDS] }
     }
 }
 
@@ -115,7 +128,8 @@ impl VARIANT {
     }
     pub fn set_ptr<T>(&mut self, vt: u16, p: *mut T) {
         self.vt = vt;
-        self.data = [p as usize as u64, 0];
+        self.data = [0; VARIANT_WORDS];
+        self.data[0] = p as usize as u64;
     }
 }
 
@@ -293,7 +307,7 @@ pub struct IActiveScriptParse64Vtbl {
         item_name: *const OLECHAR,
         context: *mut c_void,
         delimiter: *const OLECHAR,
-        source_context: u64,
+        source_context: usize,
         starting_line: u32,
         flags: u32,
         result: *mut VARIANT,

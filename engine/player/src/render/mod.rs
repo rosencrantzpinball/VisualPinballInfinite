@@ -140,7 +140,7 @@ unsafe fn upload_chain(copy: *mut SDL_GPUCopyPass, transfer: *mut SDL_GPUTransfe
 /// `f` of each item, in order, worked out on up to 8 threads.
 fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let threads = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get).clamp(1, 8).min(items.len());
+    let threads = crate::threads().min(items.len());
     if threads <= 1 {
         return items.iter().map(f).collect();
     }
@@ -2703,6 +2703,22 @@ impl Renderer {
         // what each takes while it's decoded (one bigger than the budget goes alone); its mipmaps
         // add up to a third more while it waits, left out as the budget was measured without them
         let costs: Vec<usize> = groups.iter().map(|((t, _), _)| sources.get(*t).map_or(0, crate::table_meshes::decode_cost).min(DECODE_BUDGET)).collect();
+        // no threads (the browser's program): each in turn, decoded, uploaded and let go
+        if crate::threads() <= 1 {
+            let mut since_wait = 0usize;
+            for (((t, how), slots), cost) in groups.iter().zip(&costs) {
+                let image = sources.get(*t).and_then(|s| crate::scene::Image::decode(s, *how));
+                let chain = image.as_ref().map(image_chain).unwrap_or_default();
+                self.upload_decoded(slots, image.as_ref(), &chain, sources.get(*t))?;
+                since_wait += cost;
+                if since_wait > DECODE_BUDGET {
+                    unsafe { SDL_WaitForGPUIdle(self.device) };
+                    since_wait = 0;
+                }
+            }
+            unsafe { SDL_WaitForGPUIdle(self.device) };
+            return Ok(());
+        }
         let free = Mutex::new(DECODE_BUDGET);
         let freed = Condvar::new();
         let next = AtomicUsize::new(0);
