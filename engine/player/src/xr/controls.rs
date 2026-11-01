@@ -1,6 +1,7 @@
 //! The controllers, through OpenXR's actions: each pressed as the keyboard's keys are, VPX 5436's actions
 //! by their keys, as the VPX fork maps the Steam Frame's controllers (`XRInputHandler`'s default mapping):
-//! the triggers flip (the staged flipper past 60 %), the grips are the magna-saves, A starts, B adds a
+//! the triggers flip (the staged flipper past 60 %), the grips are the magna-saves (and take hold of a
+//! panel pointed at, to move it, as SteamVR's grips do its windows), A starts, B adds a
 //! credit, the right stick pulled back (or clicked) is the plunger, the bumpers nudge, the left stick
 //! clicked recentres the table; the left view button opens the menu, which the d-pad moves through and A
 //! picks in; the right menu button opens it with Quit picked. Bindings are offered for the Frame's
@@ -57,12 +58,14 @@ const ACTIONS: &[(&str, &[&str], Does)] = &[
     ("right_aim", &["/user/hand/right/input/aim/pose"], Does::Aim(1)),
 ];
 
-/// What the hands do for the panel's pointer this frame: each trigger's pull (0 to 1, left then right)
-/// and the right stick (x, y; up positive).
+/// What the hands do for the panel's pointer this frame: each trigger's pull (0 to 1, left then right),
+/// the right stick (x, y; up positive) and each grip held (the magna-saves' buttons), which takes hold
+/// of a panel pointed at.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Pointing {
     pub trigger: [f32; 2],
     pub stick: [f32; 2],
+    pub grip: [bool; 2],
 }
 
 /// The profiles bindings are offered for, the Frame's first.
@@ -203,6 +206,8 @@ impl Controls {
     pub fn sync(&mut self, rt: &Runtime, session: xr::Session, focused: bool, mut key: impl FnMut(u8, bool)) -> bool {
         let mut want = [false; 256];
         let mut recentre = false;
+        // the grips let go while the session hasn't the controllers
+        self.pointing.grip = [false; 2];
         if focused {
             // SAFETY: our attached action set and its actions
             unsafe {
@@ -217,6 +222,11 @@ impl Controls {
                                 s.ty = xr::StructureType::ACTION_STATE_BOOLEAN;
                                 if (rt.f.get_action_state_boolean)(session, &get, &mut s) == xr::Result::SUCCESS && s.is_active != xr::FALSE && s.current_state != xr::FALSE {
                                     want[code as usize] = true;
+                                    if code == k::LEFT_MAGNA_SAVE {
+                                        self.pointing.grip[0] = true;
+                                    } else if code == k::RIGHT_MAGNA_SAVE {
+                                        self.pointing.grip[1] = true;
+                                    }
                                 }
                             }
                             Does::Trigger { key: code, press, release } => {

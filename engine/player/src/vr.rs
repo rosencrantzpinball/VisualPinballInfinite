@@ -163,20 +163,32 @@ mod imp {
         panel: Option<PanelView>,
         /// The pause menu, a panel in the room while it shows.
         menu: Option<MenuView>,
-        /// The flipper presses kept from the game (`FLIPPER_KEYS`'), pulled at the pause menu.
-        flippers_kept: [bool; 4],
+        /// The presses kept from the game (`KEPT_KEYS`'), made at the pause menu.
+        keys_kept: [bool; 6],
         /// The next capture time's index for the panel's pictures (test runs, `--vr-capture`).
         next_panel_capture: usize,
-        /// The panel and the pause menu drawn into the eyes (`render::room`), by their `slot`s; none
-        /// with them as the runtime's quad layers (`VPI_XR_QUAD_LAYERS=1`).
+        /// The panel, the pause menu and the laser drawn into the eyes (`render::room`), by their `slot`s;
+        /// none with them as the runtime's quad layers (`[PlayerVR]` `PanelQuadLayers`, the default).
         room: Option<RoomPictures>,
+        /// The laser this frame: the pointing hand's aim, and where it meets the panel or the pause menu;
+        /// and the dot where it meets the pause menu (the panel's page draws its own).
+        laser: Option<(Pose, Option<[f32; 3]>)>,
+        dot: Option<Pose>,
+        /// The pictures that never change (the laser's, the dot's), uploaded once wanted.
+        still_pictures: Vec<Layer>,
+        /// Test runs (`VPI_XR_TEST_HAND=<from>-<to>:<degrees>`): the right hand's grip held from `from` to
+        /// `to` ms into VR, as it turns by `degrees` (`tested_hands`), and the way it points before.
+        test_hand: Option<(u64, u64, f32)>,
+        test_way: Option<[f32; 3]>,
     }
 
-    /// The panel's and the pause menu's pictures in the room's drawing.
+    /// The panel's, the pause menu's, the laser's and the dot's pictures in the room's drawing.
     fn slot(layer: Layer) -> usize {
         match layer {
             Layer::Panel => 0,
             Layer::Menu => 1,
+            Layer::Laser => 2,
+            Layer::Dot => 3,
         }
     }
 
@@ -205,10 +217,11 @@ mod imp {
     /// window's): its picture as big as it would be on that screen.
     const MENU_AWAY: f32 = 1.2;
     const MENU_SCREEN_METRES: f32 = 1.0;
-    /// The triggers' keys: the flippers and the staged flippers.
-    const FLIPPER_KEYS: [u8; 4] = {
+    /// The keys a hand presses at the pause menu, kept from the game there: the triggers' (the flippers
+    /// and the staged flippers) and the grips' (the magna-saves, which take hold of the menu).
+    const KEPT_KEYS: [u8; 6] = {
         use crate::dik::default_keys as k;
-        [k::LEFT_FLIPPER, k::RIGHT_FLIPPER, k::STAGED_LEFT_FLIPPER, k::STAGED_RIGHT_FLIPPER]
+        [k::LEFT_FLIPPER, k::RIGHT_FLIPPER, k::STAGED_LEFT_FLIPPER, k::STAGED_RIGHT_FLIPPER, k::LEFT_MAGNA_SAVE, k::RIGHT_MAGNA_SAVE]
     };
     /// The library's room around the panel: near black (#07080b, linear), darker than the panel's own.
     const LIBRARY_DARK: SDL_FColor = SDL_FColor { r: 0.0022, g: 0.0025, b: 0.0034, a: 1.0 };
@@ -235,6 +248,9 @@ mod imp {
         /// pictures with new ones were kept to look at.
         solid: Vec<bool>,
         broken_kept: u32,
+        /// A grip's hold on it (`held`), and each grip as it was.
+        grab: Option<Grab>,
+        gripped: [bool; 2],
         /// Frames shown so far, the frame its two swapchains last changed places and the one the picture
         /// being written was sent, and since the last count, the pictures put up, the most frames one
         /// took to be written and the longest the runtime took to give an image.
@@ -265,6 +281,9 @@ mod imp {
         wheel: f32,
         /// The pointing hand's ray meets it.
         aiming: bool,
+        /// A grip's hold on it (`held`), and each grip as it was.
+        grab: Option<Grab>,
+        gripped: [bool; 2],
     }
 
     impl MenuView {
@@ -318,6 +337,183 @@ mod imp {
         let local = rotate([-x, -y, -z, w], hit);
         let (u, v) = (local[0] / size.0 + 0.5, 0.5 - local[1] / size.1);
         ((0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v)).then_some((u, v))
+    }
+
+    fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+        [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+    }
+
+    /// Two turns (x, y, z, w) one after the other: `first`, then `then`.
+    fn turned(then: [f32; 4], first: [f32; 4]) -> [f32; 4] {
+        let ([ax, ay, az, aw], [bx, by, bz, bw]) = (then, first);
+        [aw * bx + ax * bw + ay * bz - az * by, aw * by - ax * bz + ay * bw + az * bx, aw * bz + ax * by - ay * bx + az * bw, aw * bw - ax * bx - ay * by - az * bz]
+    }
+
+    /// `local`, a pose in `frame`'s own space, in the room.
+    fn in_room(frame: &Pose, local: &Pose) -> Pose {
+        let p = rotate(frame.orientation, local.position);
+        Pose { position: [0, 1, 2].map(|i| frame.position[i] + p[i]), orientation: turned(frame.orientation, local.orientation) }
+    }
+
+    /// `pose`, in the room, in `frame`'s own space.
+    fn in_frame(frame: &Pose, pose: &Pose) -> Pose {
+        let [x, y, z, w] = frame.orientation;
+        let back = [-x, -y, -z, w];
+        Pose { position: rotate(back, [0, 1, 2].map(|i| pose.position[i] - frame.position[i])), orientation: turned(back, pose.orientation) }
+    }
+
+    /// The point (`u`, `v`) of a panel at `pose`, `size` metres (from its top left, as shares of its width
+    /// and height), in the room.
+    fn on_panel(pose: &Pose, size: (f32, f32), (u, v): (f32, f32)) -> [f32; 3] {
+        let p = rotate(pose.orientation, [(u - 0.5) * size.0, (0.5 - v) * size.1, 0.0]);
+        [0, 1, 2].map(|i| pose.position[i] + p[i])
+    }
+
+    /// The turn taking the room's axes to `x`, `y` and `z` (each a unit vector, at right angles).
+    fn from_axes(x: [f32; 3], y: [f32; 3], z: [f32; 3]) -> [f32; 4] {
+        let (m00, m11, m22) = (x[0], y[1], z[2]);
+        let trace = m00 + m11 + m22;
+        if trace > 0.0 {
+            let s = 0.5 / (trace + 1.0).sqrt();
+            [(y[2] - z[1]) * s, (z[0] - x[2]) * s, (x[1] - y[0]) * s, 0.25 / s]
+        } else if m00 > m11 && m00 > m22 {
+            let s = 2.0 * (1.0 + m00 - m11 - m22).sqrt();
+            [0.25 * s, (y[0] + x[1]) / s, (z[0] + x[2]) / s, (y[2] - z[1]) / s]
+        } else if m11 > m22 {
+            let s = 2.0 * (1.0 + m11 - m00 - m22).sqrt();
+            [(y[0] + x[1]) / s, 0.25 * s, (z[1] + y[2]) / s, (z[0] - x[2]) / s]
+        } else {
+            let s = 2.0 * (1.0 + m22 - m00 - m11).sqrt();
+            [(z[0] + x[2]) / s, (z[1] + y[2]) / s, 0.25 * s, (x[1] - y[0]) / s]
+        }
+    }
+
+    /// The laser: its width in the room, how far it reaches when it meets nothing, its picture's size.
+    const LASER_WIDTH: f32 = 0.005;
+    const LASER_MISS: f32 = 0.6;
+    const LASER_PICTURE: (u32, u32) = (16, 256);
+
+    /// The laser's picture, RGBA with straight alpha, sRGB, its top the far end: a white core in a pale
+    /// blue glow across it, fading in over the fifth of it nearest the hand.
+    fn laser_picture() -> Vec<u8> {
+        let (w, h) = LASER_PICTURE;
+        let mut out = Vec::with_capacity((w * h * 4) as usize);
+        for row in 0..h {
+            let fade = ((1.0 - (row as f32 + 0.5) / h as f32) / 0.2).clamp(0.0, 1.0);
+            for column in 0..w {
+                // 0 in the middle, 1 at the edges
+                let across = ((column as f32 + 0.5) / w as f32 - 0.5).abs() * 2.0;
+                let core = (1.0 - across / 0.35).clamp(0.0, 1.0);
+                let glow = (1.0 - across).clamp(0.0, 1.0).powi(2);
+                let rgb = [0.6 + 0.4 * core, 0.82 + 0.18 * core, 1.0f32];
+                out.extend(rgb.map(|c| (c * 255.0).round() as u8));
+                out.push(((0.9 * core + 0.45 * glow).min(1.0) * fade * 255.0).round() as u8);
+            }
+        }
+        out
+    }
+
+    /// The pointer's dot on the pause menu: its width in the room, how far before the menu it stands, and
+    /// its picture's size.
+    const DOT_WIDTH: f32 = 0.018;
+    const DOT_BEFORE: f32 = 0.002;
+    const DOT_PICTURE: (u32, u32) = (64, 64);
+
+    /// The dot's picture, RGBA with straight alpha, sRGB: a near white disc in a dark rim, seen on the
+    /// menu's dark rows and its picked one alike, its edges smooth.
+    fn dot_picture() -> Vec<u8> {
+        let (w, h) = DOT_PICTURE;
+        let mut out = Vec::with_capacity((w * h * 4) as usize);
+        for row in 0..h {
+            for column in 0..w {
+                // distance from the middle, the picture's half width 1; a pixel is 2 / w across
+                let (x, y) = ((column as f32 + 0.5) / w as f32 * 2.0 - 1.0, (row as f32 + 0.5) / h as f32 * 2.0 - 1.0);
+                let r = (x * x + y * y).sqrt();
+                let pixel = 2.0 / w as f32;
+                let inside = |edge: f32| ((edge - r) / pixel + 0.5).clamp(0.0, 1.0);
+                let (disc, rim) = (inside(0.62), inside(0.92));
+                let rgb = [0.94 * disc + 0.04 * (1.0 - disc), 0.96 * disc + 0.05 * (1.0 - disc), 1.0 * disc + 0.08 * (1.0 - disc)];
+                out.extend(rgb.map(|c| (c * 255.0).round() as u8));
+                out.push(((disc + (rim - disc) * 0.85) * 255.0).round() as u8);
+            }
+        }
+        out
+    }
+
+    /// The laser from `aim` (along its -z) to `to`, where it meets a panel, else `LASER_MISS` on: a thin
+    /// quad along it, its +y towards the far end, turned about it to face `head`. Its pose and size.
+    fn beam(aim: &Pose, to: Option<[f32; 3]>, head: [f32; 3]) -> Option<(Pose, (f32, f32))> {
+        let start = aim.position;
+        let d = rotate(aim.orientation, [0.0, 0.0, -1.0]);
+        let end = to.unwrap_or([0, 1, 2].map(|i| start[i] + d[i] * LASER_MISS));
+        let along = [0, 1, 2].map(|i| end[i] - start[i]);
+        let length = dot(along, along).sqrt();
+        if length < 0.01 {
+            return None;
+        }
+        let y = along.map(|c| c / length);
+        let middle = [0, 1, 2].map(|i| (start[i] + end[i]) * 0.5);
+        // across it, square to the line of sight; any square to it when it's seen end on
+        let mut x = cross(y, [0, 1, 2].map(|i| head[i] - middle[i]));
+        for other in [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]] {
+            if dot(x, x) > 1e-10 {
+                break;
+            }
+            x = cross(y, other);
+        }
+        let n = dot(x, x).sqrt().max(1e-6);
+        let x = x.map(|c| c / n);
+        Some((Pose { position: middle, orientation: from_axes(x, y, cross(x, y)) }, (LASER_WIDTH, length)))
+    }
+
+    /// How a grip takes a panel nearer or sends it away (the stick, up away): at most this fast, metres a
+    /// second, and no nearer or farther than these.
+    const GRAB_SPEED: f32 = 1.5;
+    const GRAB_NEAREST: f32 = 0.3;
+    const GRAB_FARTHEST: f32 = 5.0;
+
+    /// A panel held by a hand's grip: the hand, and where the panel is in that hand's aim's own space.
+    #[derive(Clone, Copy, Debug)]
+    struct Grab {
+        hand: usize,
+        held: Pose,
+    }
+
+    /// The grips on a panel at `pose`, `size` metres, this frame, as SteamVR's grips move its windows: a
+    /// grip pressed with its hand's ray on the panel takes hold of it, and it follows that hand's aim
+    /// (`aims`) until the grip is let go, `reach` metres farther along (nearer, negative) each frame it's
+    /// held. `gripped`: each grip as it was. The panel's pose now.
+    fn held(grab: &mut Option<Grab>, gripped: &mut [bool; 2], pose: Pose, size: (f32, f32), aims: [Option<Pose>; 2], grips: [bool; 2], reach: f32) -> Pose {
+        for hand in 0..2 {
+            let pressed = grips[hand] && !gripped[hand];
+            gripped[hand] = grips[hand];
+            if pressed
+                && grab.is_none()
+                && let Some(aim) = aims[hand]
+                && hit(&aim, &pose, size).is_some()
+            {
+                *grab = Some(Grab { hand, held: in_frame(&aim, &pose) });
+            }
+        }
+        let Some(g) = grab.as_mut() else { return pose };
+        if !grips[g.hand] {
+            *grab = None;
+            return pose;
+        }
+        let Some(aim) = aims[g.hand] else { return pose };
+        if reach != 0.0 {
+            let far = dot(g.held.position, g.held.position).sqrt().max(1e-4);
+            let to = (far + reach).clamp(GRAB_NEAREST, GRAB_FARTHEST);
+            g.held.position = g.held.position.map(|c| c * to / far);
+        }
+        in_room(&aim, &g.held)
+    }
+
+    /// The turn pointing -z along `d` (a unit vector), its x level: a hand aiming that way (test runs).
+    fn look(d: [f32; 3]) -> [f32; 4] {
+        let yaw = (-d[0]).atan2(-d[2]);
+        let pitch = d[1].clamp(-1.0, 1.0).asin();
+        turned([0.0, (yaw / 2.0).sin(), 0.0, (yaw / 2.0).cos()], [(pitch / 2.0).sin(), 0.0, 0.0, (pitch / 2.0).cos()])
     }
 
     /// VR's dynamic resolution, as the fork steers it (its `UpdateDynamicResolution` of 2026-10-28): each eye
@@ -464,6 +660,14 @@ mod imp {
                 settle_until: None,
                 steps,
             };
+            // the panel, the pause menu and the laser as the runtime's quad layers (`[PlayerVR]`
+            // `PanelQuadLayers`, ours, on by default), else drawn into the eyes; `VPI_XR_QUAD_LAYERS` (1 or 0)
+            // over it, for tests
+            let quad_layers = match std::env::var("VPI_XR_QUAD_LAYERS").ok().as_deref() {
+                Some("1") => true,
+                Some("0") => false,
+                _ => settings.get("PlayerVR", "PanelQuadLayers").and_then(crate::settings::vpx_bool).unwrap_or(true),
+            };
             let mut runtime = Runtime::start(options.passthrough, level != Level::Off)?;
             let rec = &runtime.views[0];
             println!(
@@ -486,7 +690,7 @@ mod imp {
                     ((rec.max_image_rect_width as f32 * res_factor) as u32).clamp(1, rec.max_image_rect_width),
                     ((rec.max_image_rect_height as f32 * res_factor) as u32).clamp(1, rec.max_image_rect_height),
                 ),
-                None if options.library => (
+                None if options.library && !quad_layers => (
                     ((rec.recommended_image_rect_width as f32 * LIBRARY_EYE_SCALE) as u32).clamp(1, rec.max_image_rect_width.max(1)),
                     ((rec.recommended_image_rect_height as f32 * LIBRARY_EYE_SCALE) as u32).clamp(1, rec.max_image_rect_height.max(1)),
                 ),
@@ -494,7 +698,7 @@ mod imp {
             };
             let why = if res_factor > 0.1 {
                 format!(" (ResFactor {res_factor})")
-            } else if options.library && options.eye_size.is_none() {
+            } else if options.library && !quad_layers && options.eye_size.is_none() {
                 format!(" ({LIBRARY_EYE_SCALE} times the recommended size, for the library's text)")
             } else {
                 String::new()
@@ -551,20 +755,28 @@ mod imp {
                 }
                 None => None,
             };
-            // the panel and the pause menu drawn into the eyes, unless the runtime's quad layers are asked
-            // for
-            let room = if std::env::var("VPI_XR_QUAD_LAYERS").is_ok_and(|v| v == "1") {
-                println!("VR: the panel and the pause menu as the runtime's quad layers (VPI_XR_QUAD_LAYERS)");
+            // the panel, the pause menu and the laser drawn into the eyes when quad layers aren't asked for
+            let room = if quad_layers {
+                println!("VR: the panel, the pause menu and the laser as the runtime's quad layers");
                 None
             } else {
-                match RoomPictures::new(device, 2) {
-                    Ok(r) => Some(r),
+                match RoomPictures::new(device, 4) {
+                    Ok(r) => {
+                        println!("VR: the panel, the pause menu and the laser drawn into the eyes ([PlayerVR] PanelQuadLayers 0)");
+                        Some(r)
+                    }
                     Err(e) => {
-                        eprintln!("VR: the panel and the pause menu as the runtime's quad layers: {e}");
+                        eprintln!("VR: the panel, the pause menu and the laser as the runtime's quad layers: {e}");
                         None
                     }
                 }
             };
+            // test runs: the right hand pointing at the panel and taking hold of it for a time
+            let test_hand = std::env::var("VPI_XR_TEST_HAND").ok().and_then(|v| {
+                let (span, degrees) = v.split_once(':')?;
+                let (from, to) = span.split_once('-')?;
+                Some((from.trim().parse().ok()?, to.trim().parse().ok()?, degrees.trim().parse().ok()?))
+            });
             let mut vr = Vr {
                 controls,
                 session: Some(session),
@@ -586,9 +798,14 @@ mod imp {
                 recentred: false,
                 panel: None,
                 menu: None,
-                flippers_kept: [false; 4],
+                keys_kept: [false; 6],
                 next_panel_capture: 0,
                 room,
+                laser: None,
+                dot: None,
+                still_pictures: Vec::new(),
+                test_hand,
+                test_way: None,
             };
             vr.place();
             Ok(vr)
@@ -622,6 +839,8 @@ mod imp {
                     placed_focused: false,
                     solid: Vec::new(),
                     broken_kept: 0,
+                    grab: None,
+                    gripped: [false; 2],
                     frames: 0,
                     swapped_at: 0,
                     sent_at: 0,
@@ -673,23 +892,39 @@ mod imp {
 
         /// The pointer on the panel and on the pause menu: where the pointing hand's ray meets it, its
         /// trigger the left button (the other hand's trigger takes the pointer), the right stick the
-        /// wheel.
+        /// wheel; a grip pressed on either takes hold of it to move it, the right stick then sending it
+        /// away or bringing it nearer (`held`). The laser goes from the pointing hand to the panel, else
+        /// to the pause menu.
         fn point(&mut self, frame: &VrFrame) {
-            let (Some(session), Some(controls)) = (self.session.as_ref(), self.controls.as_ref()) else { return };
-            let p = controls.pointing;
-            let space = session.handles().1;
-            let time = frame.frame.display_time;
+            let (aims, p) = {
+                let (Some(session), Some(controls)) = (self.session.as_ref(), self.controls.as_ref()) else { return };
+                let (space, time) = (session.handles().1, frame.frame.display_time);
+                ([0, 1].map(|hand| controls.aim(&self.runtime, space, time, hand)), controls.pointing)
+            };
+            let (aims, grips) = self.tested_hands(frame, aims, p.grip);
+            let reach = if p.stick[1].abs() > 0.2 { (p.stick[1].abs() - 0.2) / 0.8 * GRAB_SPEED * frame.frame.period_ns as f32 / 1e9 * p.stick[1].signum() } else { 0.0 };
+            (self.laser, self.dot) = (None, None);
             if let Some(view) = self.panel.as_mut().filter(|v| v.shown)
                 && let Some(pose) = view.pose
             {
+                let was_held = view.grab.is_some();
+                let pose = held(&mut view.grab, &mut view.gripped, pose, PANEL_METRES, aims, grips, reach);
+                view.pose = Some(pose);
+                match view.grab {
+                    Some(g) => view.hand = g.hand,
+                    None if was_held => println!("panel: moved to {:.2}, {:.2}, {:.2}", pose.position[0], pose.position[1], pose.position[2]),
+                    None => {}
+                }
                 for hand in 0..2 {
                     if p.trigger[hand] > 0.6 && !view.pressed[hand] && hand != view.hand {
                         view.hand = hand;
                     }
                 }
-                let aim = controls.aim(&self.runtime, space, time, view.hand);
+                let aim = aims[view.hand];
                 let (w, h) = (panel::SIZE.0 as f32, panel::SIZE.1 as f32);
-                match aim.and_then(|a| hit(&a, &pose, PANEL_METRES)) {
+                let on = aim.and_then(|a| hit(&a, &pose, PANEL_METRES));
+                self.laser = aim.map(|a| (a, on.map(|uv| on_panel(&pose, PANEL_METRES, uv))));
+                match on {
                     Some((u, v)) => {
                         let at = (u * w, v * h);
                         if view.at != Some(at) {
@@ -714,7 +949,8 @@ mod imp {
                         }
                     }
                 }
-                if p.stick[1].abs() > 0.2
+                if view.grab.is_none()
+                    && p.stick[1].abs() > 0.2
                     && let Some((x, y)) = view.at
                 {
                     // up to 40 px a frame, about 2900 px/s at 72 Hz, with a dead zone
@@ -728,16 +964,27 @@ mod imp {
                 && let Some(pose) = m.pose
             {
                 use crate::pause_menu::point;
+                let size = m.metres();
+                let pose = held(&mut m.grab, &mut m.gripped, pose, size, aims, grips, reach);
+                m.pose = Some(pose);
+                if let Some(g) = m.grab {
+                    m.hand = g.hand;
+                }
                 for hand in 0..2 {
                     if p.trigger[hand] > 0.6 && !m.pressed[hand] && hand != m.hand {
                         m.hand = hand;
                     }
                 }
-                let size = m.metres();
-                let at = controls
-                    .aim(&self.runtime, space, time, m.hand)
-                    .and_then(|a| hit(&a, &pose, size))
-                    .map(|(u, v)| (m.at.0 + u * m.size.0 as f32, m.at.1 + v * m.size.1 as f32));
+                let on = aims[m.hand].and_then(|a| hit(&a, &pose, size));
+                if self.laser.is_none() {
+                    self.laser = aims[m.hand].map(|a| (a, on.map(|uv| on_panel(&pose, size, uv))));
+                    // the dot where it meets the menu, a little before it
+                    self.dot = on.map(|uv| {
+                        let (at, front) = (on_panel(&pose, size, uv), rotate(pose.orientation, [0.0, 0.0, 1.0]));
+                        Pose { position: [0, 1, 2].map(|i| at[i] + front[i] * DOT_BEFORE), orientation: pose.orientation }
+                    });
+                }
+                let at = on.map(|(u, v)| (m.at.0 + u * m.size.0 as f32, m.at.1 + v * m.size.1 as f32));
                 m.aiming = at.is_some();
                 let rows = m.layout.rows.len();
                 if let Some(row) = m.dragging {
@@ -771,7 +1018,7 @@ mod imp {
                     }
                 }
                 // the stick scrolls the rules and the controls: up to 12 notches a second
-                if p.stick[1].abs() > 0.2 && at.is_some() {
+                if m.grab.is_none() && p.stick[1].abs() > 0.2 && at.is_some() {
                     m.wheel += (p.stick[1].abs() - 0.2) / 0.8 * 12.0 / 72.0 * p.stick[1].signum();
                     while m.wheel.abs() >= 1.0 {
                         point(Pointer::Wheel(m.wheel.signum() as i32));
@@ -826,16 +1073,77 @@ mod imp {
             Some(Quad { pose: m.pose?, size: m.metres(), rect: m.size })
         }
 
-        /// The quads over the eyes this frame: the panel, then the pause menu.
+        /// The quads over the eyes this frame: the panel, then the pause menu, then the laser and the
+        /// pointer's dot over them.
         fn quads(&mut self, frame: &VrFrame) -> Result<Vec<(Layer, Quad)>, String> {
-            let mut quads = Vec::with_capacity(2);
+            let mut quads = Vec::with_capacity(4);
             if let Some(q) = self.panel_quad(frame)? {
                 quads.push((Layer::Panel, q));
             }
             if let Some(q) = self.menu_quad(frame) {
                 quads.push((Layer::Menu, q));
             }
+            if let Some(q) = self.laser_quad(frame)? {
+                quads.push((Layer::Laser, q));
+            }
+            if let Some(pose) = self.dot.filter(|_| frame.frame.located) {
+                self.still_picture(Layer::Dot, DOT_PICTURE, dot_picture)?;
+                quads.push((Layer::Dot, Quad { pose, size: (DOT_WIDTH, DOT_WIDTH), rect: DOT_PICTURE }));
+            }
             Ok(quads)
+        }
+
+        /// The laser this frame (`beam`), as the pointing hand aims.
+        fn laser_quad(&mut self, frame: &VrFrame) -> Result<Option<Quad>, String> {
+            let f = &frame.frame;
+            let Some((aim, to)) = self.laser.filter(|_| f.located) else { return Ok(None) };
+            let Some((pose, size)) = beam(&aim, to, Pose::middle(&f.views[0], &f.views[1]).position) else { return Ok(None) };
+            self.still_picture(Layer::Laser, LASER_PICTURE, laser_picture)?;
+            Ok(Some(Quad { pose, size, rect: LASER_PICTURE }))
+        }
+
+        /// A picture that never changes (`size`, RGBA with straight alpha, made by `pixels`), uploaded for
+        /// `layer` the first time it's wanted: into the room's drawing, or the quad layer's swapchain.
+        fn still_picture(&mut self, layer: Layer, (w, h): (u32, u32), pixels: fn() -> Vec<u8>) -> Result<(), String> {
+            if self.still_pictures.contains(&layer) {
+                return Ok(());
+            }
+            let Some(session) = self.session.as_mut() else { return Ok(()) };
+            let pixels = pixels();
+            match self.room.as_mut() {
+                Some(room) => room.set(slot(layer), &pixels, w, h, false, true)?,
+                None => {
+                    // SAFETY: on the thread that draws, the session running
+                    unsafe { session.make_quad(&self.runtime, layer, w, h)? };
+                    session.quad_picture(&self.runtime, layer, &pixels, w, h, false, true)?;
+                }
+            }
+            self.still_pictures.push(layer);
+            Ok(())
+        }
+
+        /// Test runs (`VPI_XR_TEST_HAND`): the right hand held 0.2 m right, 0.3 m below and 0.25 m before
+        /// the head, pointing at the middle of the panel (of the pause menu, with no panel) as first found,
+        /// its grip held from `from` to `to` ms into VR as it turns `degrees` to the left about the
+        /// vertical, carrying what it holds round. Otherwise the hands as the controllers have them.
+        fn tested_hands(&mut self, frame: &VrFrame, mut aims: [Option<Pose>; 2], mut grips: [bool; 2]) -> ([Option<Pose>; 2], [bool; 2]) {
+            let Some((from, to, degrees)) = self.test_hand.filter(|_| frame.frame.located) else { return (aims, grips) };
+            let head = Pose::middle(&frame.frame.views[0], &frame.frame.views[1]).position;
+            let hand = [head[0] + 0.2, head[1] - 0.3, head[2] - 0.25];
+            if self.test_way.is_none()
+                && let Some(t) = self.panel.as_ref().filter(|v| v.shown).and_then(|v| v.pose).or_else(|| self.menu.as_ref().filter(|m| m.shown).and_then(|m| m.pose))
+            {
+                let d = [0, 1, 2].map(|i| t.position[i] - hand[i]);
+                let n = dot(d, d).sqrt().max(1e-6);
+                self.test_way = Some(d.map(|c| c / n));
+            }
+            let Some(way) = self.test_way else { return (aims, grips) };
+            let ms = self.started.elapsed().as_millis() as u64;
+            let share = (ms.saturating_sub(from) as f32 / to.saturating_sub(from).max(1) as f32).clamp(0.0, 1.0);
+            let angle = (degrees * share).to_radians();
+            aims[1] = Some(Pose { position: hand, orientation: look(rotate([0.0, (angle / 2.0).sin(), 0.0, (angle / 2.0).cos()], way)) });
+            grips[1] = (from..to).contains(&ms);
+            (aims, grips)
         }
 
         /// The panel this frame: placed when it opened, its newest picture uploaded; none while it's away.
@@ -1065,12 +1373,12 @@ mod imp {
         /// actions by their keys, as the keyboard's), the table recentred when its button is pressed.
         pub fn read_controls(&mut self, frame: &VrFrame, mut key: impl FnMut(u8, bool)) {
             // a trigger pulled at the pause menu chooses on it: its flipper press, which changes the row
-            // picked there, is kept from the game, and so is its release
-            let aiming = self.menu.as_ref().is_some_and(|m| m.shown && m.aiming);
-            let kept = &mut self.flippers_kept;
+            // picked there, is kept from the game, and so is its release; so is a grip taking hold of it
+            let aiming = self.menu.as_ref().is_some_and(|m| m.shown && (m.aiming || m.grab.is_some()));
+            let kept = &mut self.keys_kept;
             let (Some(session), Some(controls)) = (self.session.as_ref(), self.controls.as_mut()) else { return };
             let recentre = controls.sync(&self.runtime, session.handles().0, session.focused, |dik, down| {
-                if let Some(i) = FLIPPER_KEYS.iter().position(|&k| k == dik) {
+                if let Some(i) = KEPT_KEYS.iter().position(|&k| k == dik) {
                     if down && aiming {
                         kept[i] = true;
                         return;
@@ -1086,6 +1394,8 @@ mod imp {
             }
             if self.panel_shown() || self.menu.as_ref().is_some_and(|m| m.shown) {
                 self.point(frame);
+            } else {
+                (self.laser, self.dot) = (None, None);
             }
         }
 
@@ -1256,6 +1566,106 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn near(a: [f32; 3], b: [f32; 3]) -> bool {
+            (0..3).all(|i| (a[i] - b[i]).abs() < 1e-4)
+        }
+
+        /// A turn of `degrees` about `axis` (a unit vector).
+        fn about(axis: [f32; 3], degrees: f32) -> [f32; 4] {
+            let h = degrees.to_radians() / 2.0;
+            [axis[0] * h.sin(), axis[1] * h.sin(), axis[2] * h.sin(), h.cos()]
+        }
+
+        #[test]
+        fn a_pose_taken_into_a_frame_and_back_is_as_it_was() {
+            let frame = Pose { position: [0.3, 1.2, -0.4], orientation: turned(about([0.0, 1.0, 0.0], 40.0), about([1.0, 0.0, 0.0], -25.0)) };
+            let pose = Pose { position: [-0.5, 1.4, -1.6], orientation: about([0.0, 0.0, 1.0], 15.0) };
+            let back = in_room(&frame, &in_frame(&frame, &pose));
+            assert!(near(back.position, pose.position), "{back:?}");
+            let v = [0.2, -0.7, 0.4];
+            assert!(near(rotate(back.orientation, v), rotate(pose.orientation, v)), "{back:?}");
+        }
+
+        #[test]
+        fn axes_make_the_turn_that_takes_the_rooms_to_them() {
+            for q in [about([0.0, 1.0, 0.0], 170.0), about([1.0, 0.0, 0.0], -120.0), turned(about([0.0, 0.0, 1.0], 95.0), about([0.0, 1.0, 0.0], 60.0))] {
+                let axes = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]].map(|a| rotate(q, a));
+                let made = from_axes(axes[0], axes[1], axes[2]);
+                for (a, want) in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]].iter().zip(axes) {
+                    assert!(near(rotate(made, *a), want), "{q:?} -> {made:?}");
+                }
+            }
+        }
+
+        #[test]
+        fn the_laser_runs_from_the_hand_to_the_panel_facing_the_head() {
+            // a hand below and right of the head, aiming at a point ahead
+            let head = [0.0, 1.6, 0.0];
+            let start = [0.2, 1.3, -0.25];
+            let to = [-0.1, 1.5, -1.5];
+            let d = [0, 1, 2].map(|i| to[i] - start[i]);
+            let n = dot(d, d).sqrt();
+            let aim = Pose { position: start, orientation: look(d.map(|c| c / n)) };
+            let (pose, size) = beam(&aim, Some(to), head).expect("a beam");
+            assert!((size.1 - n).abs() < 1e-4 && size.0 == LASER_WIDTH, "{size:?}");
+            // its top edge's middle at the panel, its bottom's at the hand
+            let top = [0, 1, 2].map(|i| pose.position[i] + rotate(pose.orientation, [0.0, size.1 / 2.0, 0.0])[i]);
+            let bottom = [0, 1, 2].map(|i| pose.position[i] + rotate(pose.orientation, [0.0, -size.1 / 2.0, 0.0])[i]);
+            assert!(near(top, to) && near(bottom, start), "{top:?} {bottom:?}");
+            // its face square to the line of sight across it
+            let x = rotate(pose.orientation, [1.0, 0.0, 0.0]);
+            let sight = [0, 1, 2].map(|i| head[i] - pose.position[i]);
+            assert!(dot(x, sight).abs() < 1e-4, "{x:?}");
+            // meeting nothing, it reaches LASER_MISS
+            let (_, missed) = beam(&aim, None, head).expect("a beam");
+            assert!((missed.1 - LASER_MISS).abs() < 1e-4);
+        }
+
+        #[test]
+        fn the_dot_is_light_in_a_dark_rim_and_clear_beyond() {
+            let (w, _) = DOT_PICTURE;
+            let p = dot_picture();
+            let at = |x: u32, y: u32| &p[((y * w + x) * 4) as usize..][..4];
+            let middle = at(w / 2, w / 2);
+            assert!(middle[0] > 230 && middle[3] == 255, "{middle:?}");
+            // a quarter of the way in from the edge: the rim, dark and nearly opaque
+            let rim = at(w / 2, w / 2 - (w as f32 * 0.38) as u32);
+            assert!(rim[0] < 30 && rim[3] > 200, "{rim:?}");
+            assert_eq!(at(0, 0)[3], 0);
+        }
+
+        #[test]
+        fn a_gripped_panel_follows_the_hand_and_stays_where_let_go() {
+            let size = (1.7, 1.0625);
+            let panel = Pose { position: [0.0, 1.45, -1.5], orientation: [0.0, 0.0, 0.0, 1.0] };
+            let hand = [0.2, 1.3, -0.25];
+            let way = |degrees: f32| {
+                let d = [0, 1, 2].map(|i| panel.position[i] - hand[i]);
+                let n = dot(d, d).sqrt();
+                Pose { position: hand, orientation: look(rotate(about([0.0, 1.0, 0.0], degrees), d.map(|c| c / n))) }
+            };
+            let (mut grab, mut gripped) = (None, [false; 2]);
+            // a grip pressed off the panel takes nothing
+            let away = Pose { position: hand, orientation: look([0.0, 0.0, 1.0]) };
+            let p = held(&mut grab, &mut gripped, panel, size, [None, Some(away)], [false, true], 0.0);
+            assert!(grab.is_none() && p == panel);
+            // let go, then pressed on it: it's held, and turns round the hand with it
+            held(&mut grab, &mut gripped, panel, size, [None, Some(way(0.0))], [false, false], 0.0);
+            held(&mut grab, &mut gripped, panel, size, [None, Some(way(0.0))], [false, true], 0.0);
+            assert!(grab.is_some());
+            let turned_round = held(&mut grab, &mut gripped, panel, size, [None, Some(way(30.0))], [false, true], 0.0);
+            let from_hand = |p: [f32; 3]| [0, 1, 2].map(|i| p[i] - hand[i]);
+            let want = rotate(about([0.0, 1.0, 0.0], 30.0), from_hand(panel.position));
+            assert!(near(from_hand(turned_round.position), want), "{turned_round:?}");
+            // the stick sends it away along the hand's line to it, no farther than GRAB_FARTHEST
+            let farther = held(&mut grab, &mut gripped, turned_round, size, [None, Some(way(30.0))], [false, true], 100.0);
+            let reach = dot(from_hand(farther.position), from_hand(farther.position)).sqrt();
+            assert!((reach - GRAB_FARTHEST).abs() < 1e-3, "{reach}");
+            // let go: it stays
+            let kept = held(&mut grab, &mut gripped, farther, size, [None, Some(way(60.0))], [false, false], 0.0);
+            assert!(grab.is_none() && kept == farther);
+        }
 
         #[test]
         fn a_kept_placement_reads_back_as_it_was() {

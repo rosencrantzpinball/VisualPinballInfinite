@@ -530,11 +530,14 @@ struct Swapchain {
 }
 
 /// The quad layers over the eyes': the headset's panel (the app's screens, `crate::panel`) and the
-/// pause menu, each a panel in the room.
+/// pause menu, each a panel in the room, and over them the laser from the pointing hand and the dot
+/// where it meets the pause menu.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Layer {
     Panel,
     Menu,
+    Laser,
+    Dot,
 }
 
 impl Layer {
@@ -542,6 +545,8 @@ impl Layer {
         match self {
             Layer::Panel => "panel",
             Layer::Menu => "pause menu",
+            Layer::Laser => "laser",
+            Layer::Dot => "pointer's dot",
         }
     }
 }
@@ -604,6 +609,8 @@ pub struct Session {
     eye_tracked_state: Option<xr::pfn::GetFoveationEyeTrackedStateMETA>,
     panel: Option<QuadChain>,
     menu: Option<QuadChain>,
+    laser: Option<QuadChain>,
+    dot: Option<QuadChain>,
 }
 
 /// The swapchain formats the renderer can draw into, preferred first: sRGB, so the linear picture is
@@ -655,6 +662,8 @@ impl Session {
                 eye_tracked_state: None,
                 panel: None,
                 menu: None,
+                laser: None,
+                dot: None,
             };
             s.make_space(rt)?;
             s.make_swapchains(rt, size)?;
@@ -968,9 +977,10 @@ impl Session {
                 .filter_map(|&(which, q)| {
                     let c = self.quad(which).filter(|c| c.shown && frame.should_render)?;
                     let chain = &c.chains[c.front];
-                    // the pause menu's picture has straight alpha, its corners see through; the panel is whole
+                    // the pause menu's picture, the laser's and the dot's have straight alpha, the menu's
+                    // corners and the others' edges seeing through; the panel is whole
                     let layer_flags = match which {
-                        Layer::Menu => xr::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA | xr::CompositionLayerFlags::UNPREMULTIPLIED_ALPHA,
+                        Layer::Menu | Layer::Laser | Layer::Dot => xr::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA | xr::CompositionLayerFlags::UNPREMULTIPLIED_ALPHA,
                         Layer::Panel => xr::CompositionLayerFlags::EMPTY,
                     };
                     Some(xr::CompositionLayerQuad {
@@ -1039,7 +1049,7 @@ impl Session {
                 }
                 (rt.f.destroy_swapchain)(chain.handle);
             }
-            for quad in [self.panel.take(), self.menu.take()].into_iter().flatten() {
+            for quad in [self.panel.take(), self.menu.take(), self.laser.take(), self.dot.take()].into_iter().flatten() {
                 self.release_quad(rt, quad);
             }
             if self.space != xr::Space::NULL {
@@ -1061,6 +1071,8 @@ impl Session {
         match which {
             Layer::Panel => self.panel.as_ref(),
             Layer::Menu => self.menu.as_ref(),
+            Layer::Laser => self.laser.as_ref(),
+            Layer::Dot => self.dot.as_ref(),
         }
     }
 
@@ -1068,6 +1080,8 @@ impl Session {
         match which {
             Layer::Panel => &mut self.panel,
             Layer::Menu => &mut self.menu,
+            Layer::Laser => &mut self.laser,
+            Layer::Dot => &mut self.dot,
         }
     }
 
