@@ -1,8 +1,8 @@
 //! The headset's panel (PLAN decision 20): `vpi-panel`, the process that draws the app's screens with
 //! CEF, started beside the player with a link of its own (`panel-link`), which the player makes and
 //! names. The panel's pictures come through the link as it draws them, the player's pointer and keys go
-//! back through it, and so do the panel's requests: play a table, close the panel, quit. `vr` shows it as
-//! a quad layer in the room. Its output goes to the player's own. Ours.
+//! back through it, and so do the panel's requests: play a table, close the panel, quit. `vr` draws it
+//! into the eyes, standing in the room. Its output goes to the player's own. Ours.
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -21,11 +21,19 @@ pub struct Panel {
     started: Instant,
 }
 
-/// Valve's Vulkan layers that Steam loads into games on the Steam Frame (`VK_INSTANCE_LAYERS`) and that
-/// rewrite what a game draws: its Renderpass Optimizer and its FDM injection. Chromium draws the panel's
-/// pages through ANGLE, GLX and zink, on Vulkan, and with them in its way the owner saw parts of a page
-/// drawn in the wrong places, and blocks (2026-10-31); the panel starts without them, the player and its
-/// tables keeping them (`VPI_PANEL_KEEP_LAYERS=1` keeps them for the panel too, for tests).
+/// Chromium draws the panel's pages through ANGLE, GLX and zink, on Vulkan, and the panel starts without
+/// what the game's environment asks of Vulkan for the tables' sake (`VPI_PANEL_KEEP_ENV=1` keeps it, for
+/// tests); the player and its tables keep it all:
+///
+/// - Turnip's autotune by profiling (`TU_AUTOTUNE_ALGO=profiled`, run.sh's): with it, Chromium's repaints
+///   of the library's left column (a layer of its own, repainted in place under the pointer) came out in
+///   blocks of noise with parts of the column drawn again in the wrong places, at 7 of 14 rows hovered,
+///   and never without it (`hover-tune-1`, `hover-plain-1`, 2026-10-31): what the owner saw in the headset.
+///   Turnip makes its own choice for the panel.
+/// - Valve's Vulkan layers that Steam loads into games on the Steam Frame (`VK_INSTANCE_LAYERS`) and that
+///   rewrite what a game draws, its Renderpass Optimizer and its FDM injection, at the owner's word: a
+///   page needs neither.
+const AUTOTUNE: &str = "TU_AUTOTUNE_ALGO";
 const REWRITING_LAYERS: [&str; 2] = ["VK_LAYER_VALVE_rpo", "VK_LAYER_VALVE_fdm_injection"];
 
 /// The instance layers asked for (`VK_INSTANCE_LAYERS`, `:` between them) without `REWRITING_LAYERS`;
@@ -66,18 +74,22 @@ impl Panel {
                 command.arg("--ui").arg(built);
             }
         }
-        // Chromium kept from the layers that rewrite a game's drawing
-        if let Ok(asked) = std::env::var("VK_INSTANCE_LAYERS")
-            && std::env::var_os("VPI_PANEL_KEEP_LAYERS").is_none()
-        {
-            let kept = layers_kept(&asked);
-            if kept.as_deref() != Some(asked.as_str()) {
-                println!("panel: started without the Vulkan layers {asked} asks for, keeping {}", kept.as_deref().unwrap_or("none"));
+        // Chromium kept from what Vulkan is asked for the tables' sake
+        if std::env::var_os("VPI_PANEL_KEEP_ENV").is_none() {
+            if let Ok(algo) = std::env::var(AUTOTUNE) {
+                println!("panel: started without {AUTOTUNE}={algo}, Turnip choosing for itself");
+                command.env_remove(AUTOTUNE);
             }
-            match kept {
-                Some(kept) => command.env("VK_INSTANCE_LAYERS", kept),
-                None => command.env_remove("VK_INSTANCE_LAYERS"),
-            };
+            if let Ok(asked) = std::env::var("VK_INSTANCE_LAYERS") {
+                let kept = layers_kept(&asked);
+                if kept.as_deref() != Some(asked.as_str()) {
+                    println!("panel: started without the Vulkan layers {}, keeping {}", REWRITING_LAYERS.join(" and "), kept.as_deref().unwrap_or("none"));
+                }
+                match kept {
+                    Some(kept) => command.env("VK_INSTANCE_LAYERS", kept),
+                    None => command.env_remove("VK_INSTANCE_LAYERS"),
+                };
+            }
         }
         let child = command.spawn().map_err(|e| format!("{}: {e}", program.display()))?;
         println!("panel: {} started on {}", program.display(), library.display());
