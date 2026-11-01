@@ -119,8 +119,15 @@ panel in the room (it draws flat over each eye), an analog plunger (the stick's 
   "All tables" drawn again down the column at 7 of 14 rows hovered with it, at none without it (`hover-tune-1`,
   `hover-plain-1`). The panel now starts without it, Turnip choosing for itself (721b50f, installed); the player
   and its tables keep it. The owner's worn try (21:45): clean. So the blocks were Chromium's own drawing all along,
-  never SteamVR's quads (the 15:50 recording caught none, by chance); the panel stays drawn into the eyes, the
-  quad layers kept behind `VPI_XR_QUAD_LAYERS=1`.
+  never SteamVR's quads (the 15:50 recording caught none, by chance). The owner asked next (22:00) for the quad
+  layers again, a laser, moving panels with the grip as SteamVR does, a sharper panel and a dot on the pause
+  menu: the panel, the pause menu, the laser and the menu's dot are quad layers by default (`[PlayerVR]`
+  `PanelQuadLayers`), a grip takes hold of a panel pointed at (the right stick sending it away or nearer), and
+  the panel is drawn at 2560×1600 (200 %). At that size Turnip's tiled rendering drew Chromium's page wrong even
+  with its own choice (the toolbar twice, `hover2x-plain-1`), so the panel's Chromium renders directly
+  (`TU_DEBUG=sysmem`, `hover2x-sysmem-1`): tiled rendering through zink caused the panel's blocks all along, the
+  profiled autotune only made them frequent. Checked on the Frame unworn and installed: 548e542. Next: the owner's
+  worn try.
 
 ## Playing it on the Frame
 
@@ -440,3 +447,11 @@ the headset is unworn. GPU = SteamVR's own count (`/perfmetrics_meta/app/gpu_fra
 | 10-31 21:36 | the same | `hover-tune-1`, `hover-plain-1`: the panel alone on X11 (`frame.sh panel`, Steam's gamescope WSI and VRAM report limit set), the pointer stopping on 14 rows of the left column a second each, then on a table's tile; pictures 0.7 s into each stop, each compared with the one before any hover, away from the pointer's row (`tools/steam-frame/hover-check.py`); with `TU_AUTOTUNE_ALGO=profiled`, then without | With it: 7 of 14 stops with 150,000–200,000 pixels changed across the column away from the pointer, and 5,000–7,000 elsewhere: noise, "All tables" drawn again twice down the column. Without it: none at any stop. The column came back whole once the pointer left it |
 | 10-31 21:40 | 721b50f, installed (`frame.sh install`) | `fix-steam-1`: through the Steam client, stopped after 30 s | The panel's GPU process without `TU_AUTOTUNE_ALGO` and without Valve's two layers, the player with all three; the library 0.5 s into VR |
 | 10-31 21:45 | 721b50f, installed | The owner, worn, through Steam: the library, the pointer over the left column | Clean, as far as the owner can tell |
+| 10-31 22:06 | 2432b5f + the laser, the grip and the panel at 2× (staged) | `quad2x-sweep-1`: the library on quad layers, the panel at 2560×1600, Steam's Vulkan layers set, the pointer swept down the left column (`VPI_PANEL_SWEEP=8000-38000:240,300:240,1040:1500`) | 72 fps, 36 pictures a second; CPU a frame 0.6–1.3 ms p50, 2–4.4 at p90 (at 1600×1000: 0.6 and 0.9–1.1); 7 of 3,226 frames over 8 ms (the first, four as the first pictures came, the two captures) |
+| 10-31 22:07 | the same | `quad2x-grab-1`, `eyes2x-grab-1`: the test hand (`VPI_XR_TEST_HAND=8000-10000:25`) pointing at the panel and gripping it from 8 to 10 s as it turns 25°, on quad layers, then drawn into the eyes | The laser's quad layer (16×256) made; the panel moved to -0.51, 1.20, -1.05 both times; in the eyes the laser from the hand to the tile pointed at, the panel carried round. Chromium's own pictures there: the library's toolbar drawn twice, over the filter row |
+| 10-31 22:09, 22:10 | the same | `hover2x-plain-1`, `hover2x-sysmem-1`: the panel alone at 2560×1600 (`--size 2560x1600 --scale 200`) in the environment the player gives it, then with `TU_DEBUG=sysmem` too; the pointer stopping on 14 rows | Plain: the toolbar drawn twice from the first picture on (the hover check, against that picture, saw nothing more); rendering directly: every picture right |
+| 10-31 22:14, 22:15 | + `TU_DEBUG=sysmem` for the panel (staged) | `quad2x-sweep-2`, `eyes2x-grab-2`: as `quad2x-sweep-1` and `eyes2x-grab-1` | The page right in every picture taken (3 to 25 s); 72 fps, 36 pictures a second; the moved panel sharp in the eyes |
+| 10-31 22:16 | the same | `menu-grab-eyes-1`, `menu-grab-quad-1`: Symphony IX 1.0.2, the pause menu opened at 5 s (`--keys`), the test hand gripping it from 9 to 11 s as it turns 20° | The menu carried round with the hand, the laser on its picked row (the menu's pointing hand the left till the right gripped it); on quad layers the menu's and the laser's swapchains made, no error |
+| 10-31 22:19 | the same, installed | `fix-steam-2`: through the Steam client, stopped after 30 s | The panel's GPU process with `TU_DEBUG=sysmem`, without the autotune setting and Valve's two layers; the player with all; quad layers, the panel 2560×1600 |
+| 10-31 22:22 | + the pause menu's dot (staged) | `menu-dot-eyes-1`, `menu-dot-quad-1`: as `menu-grab-*` | The dot where the laser meets the menu, over the beam's end; its quad layer (64×64) made; then made 1.8 cm across from 1.4 |
+| 10-31 22:25 | 548e542, installed (`frame.sh install`) | `final-steam-1`: through the Steam client, stopped after 30 s | Quad layers, the panel at 2560×1600, its first picture 0.6 s into VR, the panel's GPU process with `TU_DEBUG=sysmem`; CPU 58 °C |
