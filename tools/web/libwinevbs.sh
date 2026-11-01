@@ -10,7 +10,7 @@ set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
-WORK=${VPI_FRAME_WORK:-/Volumes/storage/personal/vpi-frame}
+WORK=${VPI_FRAME_WORK:-$(dirname "$ROOT")}
 SRC=$ROOT/vpx-build/wasm32/libwinevbs
 COMMIT=e8f15a759c345f8ff535bacf2fe6045cc59f5f8c # atl: return typeinfo from GetClassInfo (0.10.2, Wine 11.20's code)
 export PATH=/usr/lib/llvm-19/bin:$PATH WASI_SYSROOT=$WORK/build/wasi-libc/sysroot

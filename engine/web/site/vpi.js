@@ -2,13 +2,24 @@
 // one table and drives it. It fetches the table's files (manifest.json lists them) into the program's
 // files, which WASI's calls reach: /table, read only, and /data, the player's settings and what the
 // table keeps (its high scores), kept in this browser's local storage. Each animation frame it hands
-// the program the keys, mouse and gamepads, asks for a frame, and plays the sound that comes.
+// the program the keys, mouse, gamepads and touches, asks for a frame, and plays the sound that comes.
+// On a phone or tablet the screen's halves are the flippers; its Report button (Test report before
+// play) shows what the browser has and does, to copy and send.
 
 import { Gpu } from './gpu.js';
 
 const $ = (id) => document.getElementById(id);
 const status = (text) => ($('status').textContent = text);
 const log = (text) => console.log(text);
+const params = new URLSearchParams(location.search);
+// a phone or tablet (`?touch` or `?touch=0` to say otherwise): touch controls, fewer pixels, the upright view
+const touchDevice = params.has('touch') ? params.get('touch') !== '0' : matchMedia('(pointer: coarse)').matches || navigator.maxTouchPoints > 1;
+// the player's last lines, for the report
+const lines = [];
+const keep = (line) => {
+  lines.push(line);
+  if (lines.length > 80) lines.shift();
+};
 
 // ---- the program's files (WASI's preview 1, enough for the player) ----
 
@@ -559,11 +570,100 @@ async function main() {
   document.title = manifest.title;
   $('title').textContent = manifest.title;
   if (manifest.byline) $('byline').textContent = manifest.byline;
+  if (manifest.source) {
+    $('source-link').hidden = false;
+    $('source-link').querySelector('a').href = manifest.source;
+  }
+
+  // where the last visit got to: a phone's browser out of memory reloads the page without a word
+  const lastKey = `vpi:${manifest.id}:last-visit`;
+  let lastVisit = null;
+  try {
+    lastVisit = JSON.parse(localStorage.getItem(lastKey) || 'null');
+  } catch {}
+  const reached = (stage, extra = {}) => {
+    try {
+      localStorage.setItem(lastKey, JSON.stringify({ stage, at: new Date().toISOString(), ...extra }));
+    } catch {}
+  };
+  if (lastVisit && lastVisit.stage !== 'closed' && Date.now() - Date.parse(lastVisit.at) < 3600e3) {
+    $('notice').hidden = false;
+    $('notice').textContent = `The last visit ended ${lastVisit.stage}${lastVisit.memoryMB ? `, the program holding ${lastVisit.memoryMB} MB` : ''}, without closing: the browser may have run out of memory for it.`;
+  }
+
+  // what the page has and does, for the report: filled in as it starts
+  const live = {};
+  const report = () => {
+    let st = null;
+    try {
+      st = live.state?.();
+    } catch {}
+    const a = live.adapter;
+    return {
+      build: manifest.build ?? null,
+      when: new Date().toISOString(),
+      userAgent: navigator.userAgent,
+      touch: { device: touchDevice, points: navigator.maxTouchPoints, standalone: navigator.standalone === true || matchMedia('(display-mode: standalone)').matches },
+      screen: { width: screen.width, height: screen.height, pixelRatio: devicePixelRatio, window: [innerWidth, innerHeight], canvas: live.canvas ? [live.canvas.width, live.canvas.height] : null, view: live.view ?? null },
+      webgpu: !navigator.gpu ? 'none' : {
+        adapter: a ? { vendor: a.info?.vendor, architecture: a.info?.architecture, description: a.info?.description } : live.adapterTried ? 'none' : null,
+        features: live.device ? [...live.device.features] : [],
+        maxTextureDimension2D: a?.limits.maxTextureDimension2D,
+        maxBufferSize: a?.limits.maxBufferSize,
+        lost: live.lost ?? null,
+        errors: live.gpu ? [...live.gpu.errorLog.entries()].map(([message, count]) => ({ count, message })) : [],
+      },
+      memoryMB: live.x ? Math.round(live.x.memory.buffer.byteLength / 1048576) : null,
+      fetch: live.fetch ?? null,
+      startSeconds: live.startSeconds ?? null,
+      state: st,
+      frames: live.stats?.summary() ?? null,
+      sound: live.sound ? { state: live.sound.ctx.state, baseLatency: live.sound.ctx.baseLatency, outputLatency: live.sound.ctx.outputLatency, aheadMs: Math.round(live.sound.ahead * 1000) } : null,
+      lastVisit,
+      lines: lines.slice(-40),
+    };
+  };
+  const panel = $('panel');
+  let panelTimer = 0;
+  const showReport = () => ($('report').textContent = JSON.stringify(report(), null, 1));
+  const openPanel = () => {
+    live.pause?.();
+    panel.hidden = false;
+    showReport();
+    clearInterval(panelTimer);
+    panelTimer = setInterval(showReport, 1000);
+  };
+  $('close').onclick = () => {
+    panel.hidden = true;
+    clearInterval(panelTimer);
+    $('copied').textContent = '';
+  };
+  $('copy').onclick = async () => {
+    const text = JSON.stringify(report(), null, 1);
+    try {
+      await navigator.clipboard.writeText(text);
+      $('copied').textContent = 'Copied: paste it into a message.';
+    } catch {
+      getSelection().selectAllChildren($('report'));
+      $('copied').textContent = 'Selected: copy it from the menu.';
+    }
+  };
+  $('overlay-report').onclick = openPanel;
+  $('touch-report').onclick = openPanel;
+  if (touchDevice) {
+    document.body.classList.add('touch');
+    $('keys').hidden = true;
+    $('touch-keys').hidden = false;
+    if (!document.fullscreenEnabled && !report().touch.standalone && /iPhone|iPod/.test(navigator.userAgent)) $('home-hint').hidden = false;
+  }
+
   if (!navigator.gpu) {
-    status('This browser has no WebGPU: Visual Pinball Infinite needs a recent Chrome, Edge, Safari or Firefox.');
+    status('This browser has no WebGPU: Visual Pinball Infinite needs a recent Chrome, Edge, Safari (iOS 26 on an iPhone or iPad) or Firefox.');
     return;
   }
+  live.adapterTried = true;
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  live.adapter = adapter;
   if (!adapter) {
     // a browser turns WebGPU off for a while after a graphics card error, its own or another page's
     status('WebGPU found no graphics card it can use here. If it played here a moment ago, the browser has switched WebGPU off after a graphics error: quit the browser and open it again.');
@@ -579,11 +679,13 @@ async function main() {
     if (adapter.limits[k] !== undefined) limits[k] = adapter.limits[k];
   }
   const device = await adapter.requestDevice({ requiredFeatures: wanted, requiredLimits: limits });
+  live.device = device;
   let lost = false;
   const pageStarted = performance.now();
   device.lost.then((info) => {
     lost = true;
     if (info.reason === 'destroyed') return;
+    live.lost = `${info.reason}: ${info.message}`;
     console.error(`WebGPU device lost (${info.reason}): ${info.message}`);
     // lost while starting (macOS's GPU recovering from the page before this one, as a reload can
     // make it): one more try on its own
@@ -604,9 +706,13 @@ async function main() {
   // read back too, for vpi.capture
   context.configure({ device, format, alphaMode: 'opaque', viewFormats: [`${format}-srgb`], usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
   const gpu = new Gpu(device, canvas, context, format, log);
+  live.gpu = gpu;
+  live.canvas = canvas;
 
-  // the canvas at the screen's pixels (twice the page's at most), as its box changes; the player
-  // starts once it has its size, so its first pictures are drawn at it
+  // the canvas at the screen's pixels (twice the page's at most, one and a half on a phone or tablet:
+  // `?dpr=` to choose), as its box changes; the player starts once it has its size, so its first
+  // pictures are drawn at it
+  const maxDpr = +(params.get('dpr') ?? (touchDevice ? 1.5 : 2)) || 2;
   const maxSide = Math.min(device.limits.maxTextureDimension2D, 3840);
   let resized = null;
   let sized;
@@ -629,48 +735,94 @@ async function main() {
   if (!fixed) new ResizeObserver((entries) => {
     const e = entries[0];
     const box = e.devicePixelContentBoxSize?.[0];
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const dpr = Math.min(window.devicePixelRatio || 1, maxDpr);
     if (box && dpr === (window.devicePixelRatio || 1)) fit(box.inlineSize, box.blockSize);
     else fit(e.contentRect.width * dpr, e.contentRect.height * dpr);
   }).observe(canvas);
 
-  // the table's files, fetched with their progress
+  // the table's files, fetched with their progress: a big one in its pieces (package.sh cuts them, for
+  // hosts that cap a file's size), three at a time; each kept in the browser's cache by its contents,
+  // so the next visit has them at once and a new version fetches what changed
+  reached('while fetching the table');
   const files = new Files(`vpi:${manifest.id}:data`);
   files.mkdir('/data/table-settings');
   files.load();
   const total = manifest.files.reduce((n, f) => n + f.size, 0);
-  let got = 0;
+  let got = 0, fromCache = 0, shown = 0;
   const bar = $('progress');
-  const fetchFile = async (f) => {
-    const res = await fetch(f.url);
-    if (!res.ok) throw new Error(`${f.url}: ${res.status}`);
-    const data = new Uint8Array(f.size);
+  const cache = await globalThis.caches?.open(`vpi:${manifest.id}`).catch(() => null);
+  const kept = new Set();
+  const fetchStarted = performance.now();
+  const piece = async (url, size, sha, into, at) => {
+    const key = sha ? new URL(`${url}?v=${sha}`, location.href).href : null;
+    if (key) kept.add(key);
+    let res = key && cache ? await cache.match(key).catch(() => null) : null;
+    const hit = !!res;
+    res ??= await fetch(url);
+    if (!res.ok) throw new Error(`${url}: ${res.status}`);
     const reader = res.body.getReader();
-    let at = 0;
+    let n = 0;
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      if (at + value.length > data.length) throw new Error(`${f.url}: bigger than the manifest says`);
-      data.set(value, at);
-      at += value.length;
+      if (n + value.length > size) throw new Error(`${url}: bigger than the manifest says`);
+      into.set(value, at + n);
+      n += value.length;
       got += value.length;
       bar.value = got / total;
+      if (performance.now() - shown > 200) {
+        shown = performance.now();
+        status(`Fetching the table: ${Math.round(got / 1e6)} of ${Math.round(total / 1e6)} MB…`);
+      }
     }
-    files.put(f.path, at === f.size ? data : data.subarray(0, at), false);
+    if (n !== size) throw new Error(`${url}: ${n} bytes, not the ${size} the manifest says`);
+    if (hit) fromCache += size;
+    else if (key && cache) await cache.put(key, new Response(into.slice(at, at + size))).catch(() => {});
+  };
+  // `jobs`, `n` at a time
+  const inTurn = async (jobs, n) => {
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(n, jobs.length) }, async () => {
+      while (next < jobs.length) await jobs[next++]();
+    }));
+  };
+  const fetchFile = async (f) => {
+    const data = new Uint8Array(f.size);
+    if (f.parts) {
+      let at = 0;
+      await inTurn(f.parts.map((p) => {
+        const from = at;
+        at += p.size;
+        return () => piece(p.url, p.size, p.sha256, data, from);
+      }), 3);
+    } else await piece(f.url, f.size, f.sha256, data, 0);
+    files.put(f.path, data, false);
   };
   // the small files eight at a time, the big ones (the table) after, one by one
-  const small = manifest.files.filter((f) => f.size < 4 << 20);
-  for (let k = 0; k < small.length; k += 8) await Promise.all(small.slice(k, k + 8).map(fetchFile));
-  for (const f of manifest.files.filter((f) => f.size >= 4 << 20)) {
-    status(`Fetching ${decodeURIComponent(f.url.split('/').pop())} (${Math.round(f.size / 1e6)} MB)…`);
-    await fetchFile(f);
-  }
+  const big = (f) => f.parts || f.size >= 4 << 20;
+  await inTurn(manifest.files.filter((f) => !big(f)).map((f) => () => fetchFile(f)), 8);
+  for (const f of manifest.files.filter(big)) await fetchFile(f);
+  // what an earlier version left in the cache
+  if (cache) for (const req of await cache.keys().catch(() => [])) if (!kept.has(req.url)) cache.delete(req).catch(() => {});
+  live.fetch = { seconds: +((performance.now() - fetchStarted) / 1000).toFixed(1), totalMB: Math.round(total / 1e6), fromCacheMB: Math.round(fromCache / 1e6) };
+  reached('while starting the player');
   status('Starting the player…');
   // compiled as it arrives; whole, where the host doesn't serve it as application/wasm
-  const wasm = await WebAssembly.compileStreaming(fetch('vpi.wasm')).catch(async () => WebAssembly.compile(await (await fetch('vpi.wasm')).arrayBuffer()));
+  const wasmUrl = manifest.program ? `${manifest.program.url}?v=${manifest.program.sha256}` : 'vpi.wasm';
+  const wasm = await WebAssembly.compileStreaming(fetch(wasmUrl)).catch(async () => WebAssembly.compile(await (await fetch(wasmUrl)).arrayBuffer()));
+  // the table's view: the settings' (the desktop view, which held upright fills a phone's height), or
+  // `?view=fss` (the table's full single screen view) or `?view=desktop`
+  const view = params.get('view');
+  live.view = view ?? 'settings';
   const env = { VPI_TABLE: manifest.table, VPI_DATA: '/data', VPI_TABLE_SETTINGS: '/data/table-settings', HOME: '/data' };
-  const wasi = new Wasi(files, env, (fd, line) => (fd === 2 ? console.warn(line) : console.log(line)));
+  if (view) env.VPI_VIEW = view;
+  const wasi = new Wasi(files, env, (fd, line) => {
+    keep(line);
+    if (fd === 2) console.warn(line);
+    else console.log(line);
+  });
   const sound = new Sound();
+  live.sound = sound;
   const page = {
     page_pixel_density: () => canvas.width / Math.max(1, canvas.clientWidth),
     page_screen_size: (wp, hp) => {
@@ -688,7 +840,9 @@ async function main() {
   };
   const instance = await WebAssembly.instantiate(wasm, { wasi_snapshot_preview1: wasi.imports(), vpi_gpu: gpu.imports(), vpi_page: page });
   const x = instance.exports;
+  live.x = x;
   const memory = () => x.memory;
+  const memoryMB = () => Math.round(x.memory.buffer.byteLength / 1048576);
   wasi.memory = x.memory;
   gpu.memory = x.memory;
   x.vpi_web_init();
@@ -700,15 +854,18 @@ async function main() {
   status('Loading the table… (a big table takes a while)');
   await firstSize;
   await new Promise((r) => setTimeout(r, 30));
+  reached('while loading the table', { memoryMB: memoryMB() });
   const t0 = performance.now();
   if (!x.vpi_web_start(refresh)) {
-    status('The table could not start: the browser’s console says why.');
+    status('The table could not start: its Test report says why.');
     return;
   }
   // the graphics card done with the table's start (its pictures uploaded, its environment's light
   // worked out) before any frame adds to it
   await device.queue.onSubmittedWorkDone();
-  log(`the table started in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+  live.startSeconds = +((performance.now() - t0) / 1000).toFixed(1);
+  log(`the table started in ${live.startSeconds} s`);
+  reached('waiting for Play', { memoryMB: memoryMB() });
   setTimeout(() => sessionStorage.removeItem('vpi-retried'), 30000);
   resized = (w, h) => x.vpi_web_resized(w, h);
 
@@ -718,38 +875,68 @@ async function main() {
   const overlay = $('overlay');
   status('');
   $('play').hidden = false;
+
+  // touches: each holds a key down (a flipper, or a button of the bar) until it lifts
+  const holding = new Map(); // a key's scancode: how many touches hold it
+  const touches = new Map(); // a touch's pointerId: what it does
+  const hold = (code, down) => {
+    const was = holding.get(code) ?? 0;
+    const n = Math.max(0, was + (down ? 1 : -1));
+    holding.set(code, n);
+    if (!was && n) x.vpi_web_key(code, 1, 0);
+    if (was && !n) x.vpi_web_key(code, 0, 0);
+  };
+  // every touch let go: one the browser takes over never lifts
+  const letGo = () => {
+    for (const [code, n] of holding) if (n) x.vpi_web_key(code, 0, 0);
+    holding.clear();
+    touches.clear();
+    document.querySelectorAll('#touch .down').forEach((p) => p.classList.remove('down'));
+  };
+  let hinted = false;
   const go = async () => {
     overlay.hidden = true;
     canvas.focus();
     playing = true;
     x.vpi_web_focus(1);
+    document.body.classList.add('playing');
+    if (touchDevice) {
+      $('touch').hidden = false;
+      if (!hinted) {
+        hinted = true;
+        setTimeout(() => document.querySelectorAll('#touch .hint').forEach((h) => h.classList.add('gone')), 6000);
+      }
+    }
     // the browser lets sound start only after a press of its own choosing (a gamepad's may not
-    // count): until it does, the next click or key starts it
+    // count, and a phone's only when the finger lifts): until it does, the next click, key or touch starts it
     await sound.ctx.resume().catch(() => {});
     if (sound.ctx.state !== 'running') {
+      const kinds = ['pointerdown', 'pointerup', 'touchend', 'keydown'];
       const unlock = () => sound.ctx.resume().then(() => {
-        if (sound.ctx.state === 'running') ['pointerdown', 'keydown'].forEach((k) => window.removeEventListener(k, unlock, true));
+        if (sound.ctx.state === 'running') kinds.forEach((k) => window.removeEventListener(k, unlock, true));
       });
-      ['pointerdown', 'keydown'].forEach((k) => window.addEventListener(k, unlock, true));
+      kinds.forEach((k) => window.addEventListener(k, unlock, true));
     }
   };
+  const pause = () => {
+    if (!playing) return;
+    playing = false;
+    letGo();
+    x.vpi_web_focus(0);
+  };
+  live.pause = pause;
   $('play').onclick = go;
   canvas.addEventListener('pointerdown', () => {
-    if (!playing && overlay.hidden) go();
+    if (!playing && overlay.hidden && panel.hidden) go();
   });
-  window.addEventListener('blur', () => {
-    if (playing) {
-      playing = false;
-      x.vpi_web_focus(0);
-    }
-  });
+  window.addEventListener('blur', pause);
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden && playing) {
-      playing = false;
-      x.vpi_web_focus(0);
-    }
+    if (!document.hidden) return;
+    pause();
+    reached('in the background', { memoryMB: memoryMB() });
   });
   window.addEventListener('pagehide', () => {
+    reached('closed');
     files.save();
     // the graphics card's memory let go at once, not when the browser gets round to it
     device.destroy();
@@ -772,15 +959,86 @@ async function main() {
     const r = canvas.getBoundingClientRect();
     return [e.clientX - r.left, e.clientY - r.top];
   };
-  canvas.addEventListener('pointermove', (e) => x.vpi_web_mouse_move(...at(e)));
-  canvas.addEventListener('pointerdown', (e) => playing && x.vpi_web_mouse_button([1, 2, 3, 4, 5][e.button] ?? 1, 1, ...at(e)));
-  canvas.addEventListener('pointerup', (e) => playing && x.vpi_web_mouse_button([1, 2, 3, 4, 5][e.button] ?? 1, 0, ...at(e)));
+  canvas.addEventListener('pointermove', (e) => e.pointerType !== 'touch' && x.vpi_web_mouse_move(...at(e)));
+  canvas.addEventListener('pointerdown', (e) => playing && e.pointerType !== 'touch' && x.vpi_web_mouse_button([1, 2, 3, 4, 5][e.button] ?? 1, 1, ...at(e)));
+  canvas.addEventListener('pointerup', (e) => playing && e.pointerType !== 'touch' && x.vpi_web_mouse_button([1, 2, 3, 4, 5][e.button] ?? 1, 0, ...at(e)));
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
   canvas.addEventListener('wheel', (e) => {
     e.preventDefault();
     x.vpi_web_mouse_wheel(-Math.sign(e.deltaY));
   }, { passive: false });
-  $('fullscreen').onclick = async () => {
+
+  // touch on the table: the left half holds the left flipper, the right half the right; with the pause
+  // menu up, the menu's mouse instead: a tap chooses, a drag up or down scrolls, a drag sideways moves a bar
+  const menuShows = () => {
+    try {
+      return state().menu;
+    } catch {
+      return false;
+    }
+  };
+  canvas.addEventListener('pointerdown', (e) => {
+    if (e.pointerType !== 'touch' || !playing) return;
+    canvas.setPointerCapture(e.pointerId);
+    const [px, py] = at(e);
+    if (menuShows()) {
+      x.vpi_web_mouse_move(px, py);
+      touches.set(e.pointerId, { menu: true, x0: px, y0: py, y: py, mode: null });
+    } else {
+      const code = px < canvas.clientWidth / 2 ? SCANCODES.ShiftLeft : SCANCODES.ShiftRight;
+      touches.set(e.pointerId, { code });
+      hold(code, true);
+    }
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    const t = touches.get(e.pointerId);
+    if (!t?.menu) return;
+    const [px, py] = at(e);
+    if (!t.mode && Math.hypot(px - t.x0, py - t.y0) > 12) {
+      t.mode = Math.abs(px - t.x0) > Math.abs(py - t.y0) ? 'drag' : 'scroll';
+      if (t.mode === 'drag') x.vpi_web_mouse_button(1, 1, t.x0, t.y0);
+    }
+    if (t.mode === 'drag') x.vpi_web_mouse_move(px, py);
+    // a finger moving up brings what's below into view, as a wheel turned down does
+    while (t.mode === 'scroll' && Math.abs(py - t.y) >= 40) {
+      const dir = Math.sign(py - t.y);
+      x.vpi_web_mouse_wheel(dir);
+      t.y += dir * 40;
+    }
+  });
+  const lift = (e) => {
+    const t = touches.get(e.pointerId);
+    if (!t) return;
+    touches.delete(e.pointerId);
+    if (t.code !== undefined) hold(t.code, false);
+    else if (t.mode === 'drag') x.vpi_web_mouse_button(1, 0, ...at(e));
+    else if (!t.mode && e.type === 'pointerup') {
+      x.vpi_web_mouse_button(1, 1, t.x0, t.y0);
+      x.vpi_web_mouse_button(1, 0, t.x0, t.y0);
+    }
+  };
+  canvas.addEventListener('pointerup', lift);
+  canvas.addEventListener('pointercancel', lift);
+  // the bar's buttons and Launch: their keys, held as long as the touch
+  for (const pad of document.querySelectorAll('#touch .pad[data-key]')) {
+    const code = SCANCODES[pad.dataset.key];
+    const up = () => {
+      if (!pad.classList.contains('down')) return;
+      pad.classList.remove('down');
+      hold(code, false);
+    };
+    pad.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      pad.setPointerCapture(e.pointerId);
+      if (!playing) go();
+      pad.classList.add('down');
+      hold(code, true);
+    });
+    pad.addEventListener('pointerup', up);
+    pad.addEventListener('pointercancel', up);
+  }
+
+  const fullscreen = async () => {
     if (document.fullscreenElement) await document.exitFullscreen();
     else {
       await document.documentElement.requestFullscreen();
@@ -789,6 +1047,10 @@ async function main() {
     }
     canvas.focus();
   };
+  $('fullscreen').onclick = fullscreen;
+  // an iPad has full screen, an iPhone doesn't (its home screen does instead)
+  $('touch-full').hidden = !document.fullscreenEnabled;
+  $('touch-full').onclick = fullscreen;
 
   let ended = false;
   // gamepads: each frame, every pad's state to the player
@@ -829,10 +1091,12 @@ async function main() {
       return { frames: t.length, median_ms: at(0.5), p90_ms: at(0.9), max_ms: at(1), refresh_hz: refresh.toFixed(1) };
     },
   };
+  live.stats = stats;
   const state = () => {
     const n = x.vpi_web_state();
     return JSON.parse(new TextDecoder().decode(new Uint8Array(x.memory.buffer, x.vpi_web_scratch(0), n)));
   };
+  live.state = state;
   // the frame drawn now, as the canvas holds it, saved by the page's server (tools/web/serve.py --captures)
   const capture = async (name) => {
     x.vpi_web_frame();
@@ -868,7 +1132,7 @@ async function main() {
   window.vpi = { exports: x, gpu, sound, files, stats, device, state, capture };
 
   // the frames
-  let last = 0;
+  let last = 0, lastReached = 0;
   const frame = (t) => {
     if (ended || lost) return;
     if (last) {
@@ -898,9 +1162,17 @@ async function main() {
     gpu.presented();
     sound.pump(x, x.memory);
     stats.add(performance.now() - began);
+    if (t - lastReached > 5000) {
+      lastReached = t;
+      reached(playing ? 'while playing' : 'waiting for Play', { memoryMB: memoryMB() });
+    }
     if (r <= 0) {
       ended = true;
+      reached('closed');
       files.save();
+      letGo();
+      document.body.classList.remove('playing');
+      $('touch').hidden = true;
       overlay.hidden = false;
       $('play').hidden = false;
       $('play').textContent = 'Play again';

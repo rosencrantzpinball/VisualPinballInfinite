@@ -7,8 +7,8 @@ Progress, test recipes and run logs are in [PROGRESS.md](PROGRESS.md).
 
 | # | Decision | Notes |
 |---|---|---|
-| 1 | Branch `steam-frame` from upstream `main` at `3cd170b` (0.1.1); local commits only, nothing pushed or posted | Workspace `/Volumes/storage/personal/vpi-frame` (`vpi/`, `ref/`, `src/` third-party sources, `build/`, `target/`, `cargo/`, `runs/`) |
-| 2 | Target `aarch64-unknown-linux-gnu`, built in the image `vpi-steamrt4-arm64` | Derived from the local `vpinball-steamrt4-arm64:latest` (Steam Runtime 4 SDK, arm64); adds rustup with Rust 1.98, DXC v1.9.2609 built from source, and Mesa's lavapipe for Xvfb runs. Sources, `CARGO_HOME`, the target dir and every build output stay on `/Volumes/storage`, bind-mounted (`tools/steam-frame/`) |
+| 1 | Branch `steam-frame` from upstream `main` at `3cd170b` (0.1.1); local commits only, nothing pushed or posted | Workspace: the folder holding the checkout (`vpi/`, `ref/`, `src/` third-party sources, `build/`, `target/`, `cargo/`, `runs/`) |
+| 2 | Target `aarch64-unknown-linux-gnu`, built in the image `vpi-steamrt4-arm64` | Derived from the local `vpinball-steamrt4-arm64:latest` (Steam Runtime 4 SDK, arm64); adds rustup with Rust 1.98, DXC v1.9.2609 built from source, and Mesa's lavapipe for Xvfb runs. Sources, `CARGO_HOME`, the target dir and every build output stay on the Mac's data disk, bind-mounted (`tools/steam-frame/`) |
 | 3 | On the Frame: the player and a small launch script, not the Tauri app | Off on Linux at first, behind `cfg`: DOF, PinUP/FFmpeg, DMDDevice, HDR10, the updater, VPIDB/Discord, online achievements. No npm |
 | 4 | SDL_GPU's Vulkan backend; HLSL compiled to SPIR-V at build time by DXC | SDL's SPIR-V binding layout from the existing `register(…, spaceN)` declarations (combined image samplers). Windows keeps FXC at run time |
 | 5 | OpenXR of our own through `XR_KHR_vulkan_enable2`: SDL 3.4.18 has no XR support | Three small additions to the vendored SDL, marked like the existing ones: Vulkan instance/device creation hooks, the native handles as device properties, and a texture wrapping an existing `VkImage` (the swapchain images). Rust side with `openxr-sys` types and the Khronos loader (OpenXR-SDK `release-1.1.65`, built from source) loaded at run time |
@@ -67,4 +67,4 @@ Progress, test recipes and run logs are in [PROGRESS.md](PROGRESS.md).
 | Drawing each eye separately doubles the CPU's draw submission | Measure on the Frame; multiview later if needed |
 | The player's cost at 1920–2160² per eye with no foveation before M4 | Start below native (the runtime's recommended size), then M4 |
 | Remote VR runs: the dashboard at launch, `shouldRender` false unworn, sleep | Forced rendering in test mode, timeouts, logs of the session state |
-| The Mac's system disk (≈16 GB free) holds OrbStack's images | One lean image; everything else on `/Volumes/storage`; check `df -h /` before big steps, stop under 5 GB |
+| The Mac's system disk (≈16 GB free) holds OrbStack's images | One lean image; everything else on the data disk; check `df -h /` before big steps, stop under 5 GB |

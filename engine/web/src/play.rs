@@ -115,7 +115,12 @@ impl Play {
         if let Some(path) = &settings.path {
             println!("settings: {}", path.display());
         }
-        let view = settings.view().filter(|v| *v == View::Desktop || *v == View::SingleScreen).unwrap_or(View::Desktop);
+        // the page's choice (`VPI_VIEW`, from its address's `?view=`), else the settings'
+        let view = match std::env::var("VPI_VIEW").as_deref() {
+            Ok("fss") => View::SingleScreen,
+            Ok("desktop") => View::Desktop,
+            _ => settings.view().filter(|v| *v == View::Desktop || *v == View::SingleScreen).unwrap_or(View::Desktop),
+        };
         let options = Options::from_settings(&settings);
         player::scoreview::set_profiles(player::vpx_settings::dmd_profiles(&settings));
         player::segments::set_profiles(player::vpx_settings::segment_profiles(&settings));

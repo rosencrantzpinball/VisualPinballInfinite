@@ -5,7 +5,8 @@
 # prebuilt tools); compiler-rt isn't fetched either: an empty stand-in for it, which only wasi-libc's shared
 # libraries and tests would need. The program links Rust's own copy of the same library.
 set -euo pipefail
-WORK=${VPI_FRAME_WORK:-/Volumes/storage/personal/vpi-frame}
+ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+WORK=${VPI_FRAME_WORK:-$(dirname "$ROOT")}
 SRC=$WORK/src/wasi-libc
 OUT=$WORK/build/wasi-libc
 TAG=wasi-sdk-28 # d181bdd429f0067c92d817909b01e4970ad7d70a

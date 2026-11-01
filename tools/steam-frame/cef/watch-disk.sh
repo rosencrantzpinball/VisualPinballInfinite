@@ -7,7 +7,7 @@
 set -uo pipefail
 container=$1
 limit=${2:-6}
-log=${VPI_CEF_WORK:-/Volumes/storage/personal/vpi-frame/cef}/logs/watch-disk.log
+log=${VPI_CEF_WORK:-$(cd "$(dirname "$0")/../../../.." && pwd)/cef}/logs/watch-disk.log
 lowest=999999
 # the container may take a moment to start
 for _ in $(seq 60); do

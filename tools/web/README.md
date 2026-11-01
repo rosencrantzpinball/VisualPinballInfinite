@@ -15,6 +15,10 @@ What plays in the browser:
   triggers flip, the staged flippers past two thirds, A launches, B starts, Y coins, Back the menu, the left stick
   nudges, the right stick is the plunger) and rumble where the browser has it. The settings' `[Input]` mappings count
   as on the desktop.
+- **Touch, on a phone or tablet:** the left and right halves of the screen hold the flippers; Launch (bottom right)
+  pulls the plunger back while held and lets it go; the bar along the top has Menu, Coin, Start and Nudge. With the
+  pause menu up, a tap chooses, a drag up or down scrolls, a drag sideways moves a bar. Held upright, the desktop view
+  fills the phone's height, on one and a half of the screen's pixels to each of the page's.
 - **The options:** the pause menu's settings and the table's own options are kept in the browser's local storage (the
   player's `Settings.ini` and the table's settings file, in its data folder `/data`), as are the scores the table saves.
   They stay with that browser on that site.
@@ -32,9 +36,11 @@ Everything is built from source in the build image (`tools/steam-frame/in-image.
 2. `tools/steam-frame/in-image.sh tools/web/libwinevbs.sh`: libwinevbs for WebAssembly, the same commit and patches as
    the desktop's (`tools/libwinevbs`), and `patches/` here (Wine's headers given a WebAssembly CPU).
 3. `tools/web/package.sh <table folder or .vpx> <out folder> [--title "Name"] [--byline "by ..."] [--with-backglass]`
-   builds the program (`engine/web`, the `web` profile) and lays the site out: `index.html`, `vpi.js`, `gpu.js`,
-   `vpi.wasm`, `manifest.json`, `scripts/` (VPX's shared scripts) and `table/` (the table's folder, without its
-   `.directb2s` backglass unless asked).
+   builds the program (`engine/web`, the `web` profile, the build machine's folders left out of it) and lays the site
+   out: `index.html`, `vpi.js`, `gpu.js`, `vpi.wasm`, `manifest.json`, `scripts/` (VPX's shared scripts), `table/` (the
+   table's folder, without its `.directb2s` backglass unless asked; a file over 24 MiB in pieces of 24 MiB, which the
+   page fetches three at a time and joins), `source/` (the program's source as built, unless `--no-source`) and
+   `.nojekyll` (GitHub Pages serves the files as they are).
 
 To try it here: `python3 tools/web/serve.py <out folder>`, then open <http://localhost:8765>.
 
@@ -45,16 +51,29 @@ For testing, the page takes options in its address (several together, joined by 
   read in the console with `vpi.gpu.profile()`;
 - `?manual`: no frames of the page's own, only those `vpi.step(n)` asks for;
 - `?plain`: none of WebGPU's optional features, as a browser without them has it;
+- `?touch` or `?touch=0`: the touch controls, or none, whatever the device; `?dpr=2`: that many of the canvas's pixels
+  to each of the page's at most (2, or 1.5 on a phone or tablet); `?view=fss` or `?view=desktop`: the table's full
+  single screen view or its desktop view, whatever the settings say;
 - `?autotest=<name>&seconds=4`: plays that long by itself, then saves `<name>.png` (what WebGPU drew) and `<name>.json`
   (the browser, its WebGPU features, every WebGPU error, the frame times) through `serve.py --captures <folder>`;
   `vpi.capture(name)` in the console saves a picture likewise. Opening one such address in each browser gives
   pictures to compare with the player's own (`tools/steam-frame/flat.sh ... --shot`).
 
+On a phone, where there's no console, **Test report** (before play) or **Report** (in the bar) shows the same and
+more: the browser and screen, WebGPU's adapter and errors, the program's memory, the fetch and start times, the frame
+times, the sound, the player's last lines. **Copy report** copies it to paste into a message. A phone's browser that
+runs out of memory reloads the page without a word: the page keeps where it got to in local storage, and the next
+visit says where the last one ended.
+
 ## Hosting
 
-The out folder goes on the host as it is. The host needs nothing special:
+The out folder goes on the host as it is (on GitHub Pages: the folder's files as a branch's whole tree, Pages
+set to deploy from that branch). The host needs nothing special:
 
 - `.wasm` served as `application/wasm` (most hosts do; the page falls back to compiling it whole if not);
+- files of 24 MiB at most, which the table's pieces keep to: Cloudflare Pages takes 25 MiB a file, GitHub 100 MB;
+- HTTPS (or `localhost`): browsers give WebGPU only to secure pages, so a phone can't try it from a computer on the same
+  network by its address;
 - compression (gzip or Brotli) if the host offers it: the program is 12 MB, about 6 MB compressed; the table is the big
   download (Symphony IX's 147 MB, which compresses little).
 - No cross-origin isolation headers: the program uses no shared memory or threads.
@@ -72,7 +91,8 @@ with a header of what it binds; sound from SDL's audio callbacks, pulled each fr
 browser's gamepads as SDL's joysticks; SDL_ttf's part the pause menu uses drawn by ab_glyph. The game runs on the
 page's thread, a frame each animation frame: the input, the physics up to the moment (1000 steps a second), VPX's frame
 preparation, the picture (`engine/web/src/play.rs`). The page's files are WASI's, kept in memory (`site/vpi.js`): the
-table's, read only, and `/data`, saved to local storage.
+table's, read only, and `/data`, saved to local storage. The table's files come from the browser's cache when an
+earlier visit fetched the same contents (Cache Storage, by each piece's hash in `manifest.json`).
 
 The graphics card's work is kept in short pieces: macOS stops a browser's GPU work that holds the display too
 long ("Impacting Interactivity"), and Chrome then loses its WebGPU device and, after a few such losses, switches
