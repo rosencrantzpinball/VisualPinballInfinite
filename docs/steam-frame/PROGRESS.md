@@ -11,7 +11,7 @@ The plan and its decisions: [PLAN.md](PLAN.md).
 | M2 VR | Done 2026-10-29: both eyes at VPX's placement through OpenXR, controllers, passthrough; under Monado and on the Frame |
 | M3 on the Frame | Done 2026-10-29: installed as its own devkit game, started by Steam or by the test harness, VR and headless runs pass |
 | M4 quality and speed | Done 2026-10-29: eye-tracked foveation, dynamic resolution (a change of size now costs nothing), specular AA, per-eye culling, per-table `[PlayerVR]`, the perf line; GPU time at or under the fork's (Symphony IX 1920 px, FXAA: 14.4–14.9 ms this morning, 8.6 now, the fork 8.7–8.8; STAR FOX 1728 px: 29.8 → 20.3 ms, the fork 21.2). The gaze following is the owner's to check in the headset |
-| M5 beyond Symphony IX | In progress: the Frame's other tables play, chosen from the pause menu in the headset; PinMAME's host and libpinmame built for Linux and running on the Frame (its 2904 games listed). A ROM game waits for ROMs: the Frame's `pinmame/roms` is empty |
+| M5 beyond Symphony IX | In progress: the Frame's other tables play, chosen from the pause menu in the headset; PinMAME's host and libpinmame built for Linux and running on the Frame (its 2904 games listed). The first ROM game played (10-31): Call of Duty Zombie Edition 2025 VR on Peyper's Wolf Man ROM (`wolfman`), which the owner supplied and had put in the Frame's `Tables/pinmame/roms` |
 
 ## What works
 
@@ -64,8 +64,8 @@ panel in the room (it draws flat over each eye), an analog plunger (the stick's 
 - Heavy tables (STAR FOX: 36 fps, half rate, like the fork): single-pass stereo, as the fork draws (two instances a
   draw, each into its eye's layer), would save the per-draw work once more; a second instance costs VPI about 75 %
   of the first (below), so it would gain less than the clip distance did.
-- M5 waits for ROMs: the PinMAME host on Linux and the shared ROM folder; then the backglass in VR and a table
-  picker in the headset.
+- M5: a ROM game plays on the Frame (Call of Duty Zombie Edition 2025 VR on `wolfman`, 10-31); more as the owner
+  supplies ROMs, then the backglass in VR.
 - The library in the headset (PLAN decision 19): CEF 154 is built from source for the Frame (`tools/steam-frame/cef/`,
   2026-10-30: some 58,000 build steps natively on arm64, H.264 and AAC by FFmpeg, HEVC by V4L2) and packaged for
   the `cef` crate (`build.sh distrib`: `CEF_PATH=$WORK/cef/dist/cef_linux_aarch64`, with `CEF_DOWNLOAD_URL`
@@ -98,7 +98,15 @@ panel in the room (it draws flat over each eye), an analog plunger (the stick's 
   waiting for its own copy behind Chromium's GPU work. The panel now has two swapchains: one shown while the next
   picture is written into the other, swapped once the GPU has written it, the frame waiting for nothing (up to 36
   pictures a second); pictures with blocks of solid black or white are logged and kept (`panel-checks`). Checked
-  unworn and installed: b10b8b8. Next: the owner's worn try of the left column.
+  unworn and installed: b10b8b8. The owner's third worn try (20:29): blocks still, though the frames came on time
+  and no picture had solid blocks. Steam starts a game with Valve's Vulkan layers (`VK_LAYER_VALVE_rpo`, its
+  "Renderpass Optimizer", on; FDM injection off), which runs started over ssh never had, and SteamVR shows each quad
+  as an overlay of its own (`openxr_quadlayer_0`, `SetOverlayTextureXR`), drawn apart from what it records. So the
+  player now draws the panel and the pause menu into the eyes itself, as pictures standing in the room
+  (`render::room`: each uploaded with its mipmaps, sampled trilinear with anisotropy, its edges smoothed by their
+  coverage), and hands SteamVR no quad layers (`VPI_XR_QUAD_LAYERS=1` brings them back); the library's eyes are 1.25
+  times the recommended size (2160 px on the Frame, its screens' own) for the text. Checked under Monado (`room-1`,
+  `room-2`: the panel upright and readable, its edges smooth). Next: unworn on the Frame, then the owner's worn try.
 
 ## Playing it on the Frame
 
@@ -409,3 +417,4 @@ the headset is unworn. GPU = SteamVR's own count (`/perfmetrics_meta/app/gpu_fra
 | 10-31 16:52 | 039564c-dirty (b10b8b8's change), staged | `flip-1`: as `sweep-0`, the panel on two swapchains, swapped once its copy is done | 36 pictures a second, each shown the frame after it was sent; CPU a frame 0.6 ms median (0.9–1.1 at p90) against 10.5; 72 fps, the wait for the headset 13.2 ms; no picture with solid blocks. CPU 48 °C |
 | 10-31 16:54 | the same | `menu-flip-1`: Symphony IX 1.0.2, the pause menu by scripted keys as in `menu-vr-1` | The menu's two swapchains of 1280×1597; its pictures at 8.9, 11.9, 13.9 and 22.9 s; a frame as it opens or changes 14–25 ms CPU, 16–28 ms GPU, as before; 72 fps otherwise |
 | 10-31 16:56 | b10b8b8, installed (`frame.sh install`) | `lib-steam-4`: through the Steam client, stopped after 30 s | The library on its two swapchains, its first picture 0.5 s into VR; ended on the stop with its panel and Steam's launch; the owner's older log kept in `before/` |
+| 10-31 20:29–20:35 | b10b8b8, installed | The owner, worn, through Steam: the library, then Call of Duty Zombie Edition 2025 VR from it; logs in `worn-2030` | Blocks under the pointer still (the owner's words). 72 fps, CPU a frame 0.3–0.8 ms p50, up to 179 pictures put up in 5 s, each shown the frame after it was sent; no picture with solid blocks; SteamVR's count 24,262 presents, 6 dropped, 4 reprojected. Each panel image 6,483,968 bytes, 1600 × 1008 rows and a 32 KB flag buffer: compressed (UBWC). Steam's environment: `VK_INSTANCE_LAYERS=VK_LAYER_VALVE_rpo:VK_LAYER_VALVE_fdm_injection`, `DISABLE_VULKAN_FDM_INJECTION_LAYER=1`; both layers in the player, neither in the compositor. The owner's Wolf Man ROM (`wolfman.zip`, its three chips matching PinMAME's CRCs) went into `Tables/pinmame/roms` at 20:34 at the owner's word; the table at 20:35 loaded it (`wolfman running`) |

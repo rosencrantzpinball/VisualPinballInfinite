@@ -13,6 +13,9 @@ mod menu;
 mod mips;
 mod post;
 mod pup;
+/// Pictures standing in the room, drawn into the headset's eyes (VR, as `xr`).
+#[cfg(not(windows))]
+pub mod room;
 mod segments;
 #[cfg(not(windows))]
 mod spirv;
@@ -244,6 +247,29 @@ fn check(ok: bool, what: &str) -> Result<(), String> {
 
 fn non_null<T>(pointer: *mut T, what: &str) -> Result<*mut T, String> {
     if pointer.is_null() { Err(format!("{what}: {}", sdl_error())) } else { Ok(pointer) }
+}
+
+/// `entry` of `source` as a shader on `device` (`target`: FXC's shader model, Windows), taking
+/// `samplers` and `uniforms` uniform buffers.
+fn device_shader(device: *mut SDL_GPUDevice, source: &str, entry: &CStr, target: &CStr, stage: SDL_GPUShaderStage, samplers: u32, uniforms: u32) -> Result<*mut SDL_GPUShader, String> {
+    #[cfg(windows)]
+    let (code, format) = (fxc::compile(source, entry, target)?, SDL_GPU_SHADERFORMAT_DXBC);
+    #[cfg(not(windows))]
+    let (code, format) = {
+        let _ = target; // DXC's shader models are chosen when the player is built
+        (spirv::compiled(source, entry)?, SDL_GPU_SHADERFORMAT_SPIRV)
+    };
+    unsafe {
+        let mut info: SDL_GPUShaderCreateInfo = zeroed();
+        info.code_size = code.len();
+        info.code = code.as_ptr();
+        info.entrypoint = entry.as_ptr();
+        info.format = format;
+        info.stage = stage;
+        info.num_samplers = samplers;
+        info.num_uniform_buffers = uniforms;
+        non_null(SDL_CreateGPUShader(device, &info), "create shader")
+    }
 }
 
 /// The GPU device, on Direct3D 12: the graphics card Windows ranks for high performance, or with
@@ -1726,24 +1752,7 @@ impl Renderer {
     }
 
     fn shader(&self, source: &str, entry: &CStr, target: &CStr, stage: SDL_GPUShaderStage, samplers: u32, uniforms: u32) -> Result<*mut SDL_GPUShader, String> {
-        #[cfg(windows)]
-        let (code, format) = (fxc::compile(source, entry, target)?, SDL_GPU_SHADERFORMAT_DXBC);
-        #[cfg(not(windows))]
-        let (code, format) = {
-            let _ = target; // DXC's shader models are chosen when the player is built
-            (spirv::compiled(source, entry)?, SDL_GPU_SHADERFORMAT_SPIRV)
-        };
-        unsafe {
-            let mut info: SDL_GPUShaderCreateInfo = zeroed();
-            info.code_size = code.len();
-            info.code = code.as_ptr();
-            info.entrypoint = entry.as_ptr();
-            info.format = format;
-            info.stage = stage;
-            info.num_samplers = samplers;
-            info.num_uniform_buffers = uniforms;
-            non_null(SDL_CreateGPUShader(self.device, &info), "create shader")
-        }
+        device_shader(self.device, source, entry, target, stage, samplers, uniforms)
     }
 
     /// A pipeline for parts' meshes drawing both faces, and its two twins dropping the faces VPX's

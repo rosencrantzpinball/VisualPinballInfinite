@@ -21,6 +21,9 @@ pub struct VrOptions {
     pub timings: Option<PathBuf>,
     /// Each eye's picture this size, in place of the runtime's recommended one (test runs).
     pub eye_size: Option<(u32, u32)>,
+    /// The library's panel alone (`--library`): each eye drawn larger than the runtime recommends, for
+    /// the panel's text (`LIBRARY_EYE_SCALE`).
+    pub library: bool,
 }
 
 /// The table's own measures VPX's placement reads.
@@ -130,6 +133,7 @@ mod imp {
     use crate::panel::{self, Input, Panel, Request};
     use crate::pause_menu::{Layout, Pointer, Spot};
     use crate::render::MenuPicture;
+    use crate::render::room::{RoomPictures, RoomQuad};
     use crate::xr::{Frame, Layer, Quad, Runtime, Session};
 
     /// The headset: the OpenXR runtime, its session and the GPU device it made, which the renderer
@@ -163,6 +167,34 @@ mod imp {
         flippers_kept: [bool; 4],
         /// The next capture time's index for the panel's pictures (test runs, `--vr-capture`).
         next_panel_capture: usize,
+        /// The panel and the pause menu drawn into the eyes (`render::room`), by their `slot`s; none
+        /// with them as the runtime's quad layers (`VPI_XR_QUAD_LAYERS=1`), which SteamVR showed broken.
+        room: Option<RoomPictures>,
+    }
+
+    /// The panel's and the pause menu's pictures in the room's drawing.
+    fn slot(layer: Layer) -> usize {
+        match layer {
+            Layer::Panel => 0,
+            Layer::Menu => 1,
+        }
+    }
+
+    /// The library's eyes, against the runtime's recommended size: SteamVR recommends 0.8 of the Steam
+    /// Frame's screens (0.64 of their pixels), and the panel's text wants their own.
+    const LIBRARY_EYE_SCALE: f32 = 1.25;
+    /// The room's near and far planes, metres, for the pictures standing in it.
+    const ROOM_NEAR: f32 = 0.05;
+    const ROOM_FAR: f32 = 100.0;
+
+    /// Each eye's view of the room this frame: the room into that eye's clip space.
+    fn room_eyes(f: &Frame) -> [Mat4; 2] {
+        [0, 1].map(|eye| f.views[eye].view_matrix() * place::projection(f.fov[eye], ROOM_NEAR, ROOM_FAR))
+    }
+
+    /// The quads as the room draws them.
+    fn room_quads(quads: &[(Layer, Quad)]) -> Vec<RoomQuad> {
+        quads.iter().map(|&(layer, q)| RoomQuad { picture: slot(layer), position: q.pose.position, orientation: q.pose.orientation, size: q.size }).collect()
     }
 
     /// The panel's width and height in the room, metres: 1.7 by 1.06, 1.5 m away, the size of a large
@@ -454,9 +486,20 @@ mod imp {
                     ((rec.max_image_rect_width as f32 * res_factor) as u32).clamp(1, rec.max_image_rect_width),
                     ((rec.max_image_rect_height as f32 * res_factor) as u32).clamp(1, rec.max_image_rect_height),
                 ),
+                None if options.library => (
+                    ((rec.recommended_image_rect_width as f32 * LIBRARY_EYE_SCALE) as u32).clamp(1, rec.max_image_rect_width.max(1)),
+                    ((rec.recommended_image_rect_height as f32 * LIBRARY_EYE_SCALE) as u32).clamp(1, rec.max_image_rect_height.max(1)),
+                ),
                 None => (rec.recommended_image_rect_width.max(1), rec.recommended_image_rect_height.max(1)),
             };
-            println!("VR: each eye drawn {}x{}{}", size.0, size.1, if res_factor > 0.1 { format!(" (ResFactor {res_factor})") } else { String::new() });
+            let why = if res_factor > 0.1 {
+                format!(" (ResFactor {res_factor})")
+            } else if options.library && options.eye_size.is_none() {
+                format!(" ({LIBRARY_EYE_SCALE} times the recommended size, for the library's text)")
+            } else {
+                String::new()
+            };
+            println!("VR: each eye drawn {}x{}{why}", size.0, size.1);
             // SAFETY: SDL's video is started, on this thread; the runtime is boxed and lives as long
             // as the device (dropped after it, below)
             let device = unsafe { runtime.create_device()? };
@@ -508,6 +551,20 @@ mod imp {
                 }
                 None => None,
             };
+            // the panel and the pause menu drawn into the eyes, unless the runtime's quad layers are asked
+            // for (SteamVR showed those in blocks of black and white wherever their pictures changed)
+            let room = if std::env::var("VPI_XR_QUAD_LAYERS").is_ok_and(|v| v == "1") {
+                println!("VR: the panel and the pause menu as the runtime's quad layers (VPI_XR_QUAD_LAYERS)");
+                None
+            } else {
+                match RoomPictures::new(device, 2) {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        eprintln!("VR: the panel and the pause menu as the runtime's quad layers: {e}");
+                        None
+                    }
+                }
+            };
             let mut vr = Vr {
                 controls,
                 session: Some(session),
@@ -531,6 +588,7 @@ mod imp {
                 menu: None,
                 flippers_kept: [false; 4],
                 next_panel_capture: 0,
+                room,
             };
             vr.place();
             Ok(vr)
@@ -540,7 +598,7 @@ mod imp {
         pub fn start_alone(settings: &crate::settings::Settings, options: VrOptions) -> Result<Vr, String> {
             // a table of VPX's size, never drawn: the placement's sums only
             let measures = TableMeasures { left: 0.0, top: 0.0, right: 952.0, bottom: 2162.0, glass_bottom: 210.0, slope_deg: 6.0 };
-            Vr::start(settings, options, measures, (Vec3::new(0.0, 0.0, 0.0), Vec3::new(952.0, 2162.0, 400.0)))
+            Vr::start(settings, VrOptions { library: true, ..options }, measures, (Vec3::new(0.0, 0.0, 0.0), Vec3::new(952.0, 2162.0, 400.0)))
         }
 
         /// Opens the panel on the library under `library`, the process started the first time (its "Back
@@ -548,8 +606,10 @@ mod imp {
         pub fn open_panel(&mut self, library: &std::path::Path, back: Option<&std::path::Path>) -> Result<(), String> {
             let Some(session) = self.session.as_mut() else { return Err("no VR session".into()) };
             if self.panel.is_none() {
-                // SAFETY: on the thread that draws, the session running
-                unsafe { session.make_quad(&self.runtime, Layer::Panel, panel::SIZE.0, panel::SIZE.1)? };
+                if self.room.is_none() {
+                    // SAFETY: on the thread that draws, the session running
+                    unsafe { session.make_quad(&self.runtime, Layer::Panel, panel::SIZE.0, panel::SIZE.1)? };
+                }
                 self.panel = Some(PanelView {
                     panel: Panel::start(library, back)?,
                     pose: None,
@@ -737,9 +797,14 @@ mod imp {
             if picture.width == 0 || picture.height == 0 {
                 return Ok(());
             }
-            // SAFETY: on the thread that draws, the session running
-            unsafe { session.make_quad(&self.runtime, Layer::Menu, picture.width, picture.height)? };
-            session.quad_picture(&self.runtime, Layer::Menu, &picture.pixels, picture.width, picture.height, false, true)?;
+            match self.room.as_mut() {
+                Some(room) => room.set(slot(Layer::Menu), &picture.pixels, picture.width, picture.height, false, true)?,
+                None => {
+                    // SAFETY: on the thread that draws, the session running
+                    unsafe { session.make_quad(&self.runtime, Layer::Menu, picture.width, picture.height)? };
+                    session.quad_picture(&self.runtime, Layer::Menu, &picture.pixels, picture.width, picture.height, false, true)?;
+                }
+            }
             let m = self.menu.get_or_insert_with(MenuView::default);
             (m.size, m.at, m.screen_height, m.layout, m.shown) = ((picture.width, picture.height), picture.at, screen.1 as f32, layout.clone(), true);
             // test runs: each picture of the menu's as it came
@@ -793,33 +858,42 @@ mod imp {
             }
             let elapsed_ms = self.started.elapsed().as_millis() as u64;
             let capturing = self.options.capture.is_some() && self.next_panel_capture < self.options.capture_at.len();
-            // the picture sent last shown from this frame on, once the GPU has written it (the panel's two
-            // swapchains change places: `xr::QuadChain`)
+            // as a quad layer, the picture sent last shown from this frame on, once the GPU has written it
+            // (the panel's two swapchains change places: `xr::QuadChain`)
             view.frames += 1;
-            if session.quad_settle(&self.runtime, Layer::Panel, false)? {
+            let layered = self.room.is_none();
+            if layered && session.quad_settle(&self.runtime, Layer::Panel, false)? {
                 view.slowest = view.slowest.max(view.frames - view.sent_at);
                 view.swapped_at = view.frames;
             }
             if view.frames % 360 == 0 && view.put_up > 0 {
-                println!(
-                    "panel: {} pictures put up in 5 s, each shown within {} frames of being sent, the runtime giving each image within {:.1} ms",
-                    view.put_up,
-                    view.slowest,
-                    view.longest_wait.as_secs_f64() * 1000.0
-                );
+                if layered {
+                    println!(
+                        "panel: {} pictures put up in 5 s, each shown within {} frames of being sent, the runtime giving each image within {:.1} ms",
+                        view.put_up,
+                        view.slowest,
+                        view.longest_wait.as_secs_f64() * 1000.0
+                    );
+                } else {
+                    println!("panel: {} pictures in 5 s, drawn into the eyes", view.put_up);
+                }
                 (view.put_up, view.slowest, view.longest_wait) = (0, 0, std::time::Duration::ZERO);
             }
-            // the next picture written into the swapchain not shown, a frame after they last changed
-            // places at the soonest, as SteamVR may still show the other till then; meanwhile the panel's
-            // newest picture waits in the link
-            if !session.quad_writing(Layer::Panel)
-                && view.frames > view.swapped_at
+            // drawn into the eyes, its newest picture each frame; as a quad layer, the next picture
+            // written into the swapchain not shown, a frame after they last changed places at the soonest,
+            // as SteamVR may still show the other till then, the panel's newest picture waiting meanwhile
+            if (!layered || (!session.quad_writing(Layer::Panel) && view.frames > view.swapped_at))
                 && let Some(picture) = view.panel.picture()
             {
-                let waited = session.quad_picture(&self.runtime, Layer::Panel, picture.pixels, picture.width, picture.height, true, false)?;
-                view.sent_at = view.frames;
+                match self.room.as_mut() {
+                    Some(room) => room.set(slot(Layer::Panel), picture.pixels, picture.width, picture.height, true, false)?,
+                    None => {
+                        let waited = session.quad_picture(&self.runtime, Layer::Panel, picture.pixels, picture.width, picture.height, true, false)?;
+                        view.sent_at = view.frames;
+                        view.longest_wait = view.longest_wait.max(waited);
+                    }
+                }
                 view.put_up += 1;
-                view.longest_wait = view.longest_wait.max(waited);
                 view.pictures += 1;
                 if view.pictures == 1 {
                     println!("panel: its first picture, {}x{}, {elapsed_ms} ms into VR", picture.width, picture.height);
@@ -875,16 +949,40 @@ mod imp {
             Ok(view.pose.map(|pose| Quad { pose, size: PANEL_METRES, rect: panel::SIZE }))
         }
 
-        /// Hands a frame over with nothing but the panel (`--library`): over a projection layer of near
-        /// black, as compositors expect one, or of the room itself with passthrough.
+        /// Hands a frame over with nothing but the panel (`--library`): drawn into the eyes over near
+        /// black, or over the room itself with passthrough; as the runtime's quad layer, over a projection
+        /// layer of that alone, as compositors expect one. Test runs save the eyes' pictures at the
+        /// capture times.
         pub fn end_frame_alone(&mut self, frame: VrFrame) -> Result<(), String> {
             let elapsed_ms = self.started.elapsed().as_millis() as u64;
             let quads = self.quads(&frame)?;
             let colour = if self.passthrough() { SDL_FColor { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } } else { LIBRARY_DARK };
             let Some(session) = self.session.as_mut() else { return Ok(()) };
             let f = &frame.frame;
-            let rect = if f.should_render && f.located { session.clear_eyes(&self.runtime, colour)? } else { (0, 0) };
-            session.end_frame(&self.runtime, f, rect != (0, 0), rect, &quads)?;
+            let rect = if !(f.should_render && f.located) {
+                (0, 0)
+            } else if let Some(room) = self.room.as_mut() {
+                let targets = [session.eye_texture(&self.runtime, 0)?, session.eye_texture(&self.runtime, 1)?];
+                let size = session.eye_size();
+                room.draw(targets, session.format, size, Some(colour), room_eyes(f), &room_quads(&quads))?;
+                if let (Some(dir), Some(&at)) = (&self.options.capture, self.options.capture_at.get(self.next_capture))
+                    && elapsed_ms >= at
+                {
+                    self.next_capture += 1;
+                    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+                    for (eye, name) in [(0, "left"), (1, "right")] {
+                        let rgba = crate::render::room::read_back(self.device, targets[eye], size, session.format)?;
+                        let path = dir.join(format!("eye-{at}-{name}.png"));
+                        image::save_buffer(&path, &rgba, size.0, size.1, image::ExtendedColorType::Rgba8).map_err(|e| format!("save {}: {e}", path.display()))?;
+                        println!("saved {} ({}x{}, frame {})", path.display(), size.0, size.1, self.frames);
+                    }
+                }
+                size
+            } else {
+                session.clear_eyes(&self.runtime, colour)?
+            };
+            let layers: &[(Layer, Quad)] = if self.room.is_some() { &[] } else { &quads };
+            session.end_frame(&self.runtime, f, rect != (0, 0), rect, layers)?;
             let (gpu_ms, size) = (session.gpu_ms(), session.eye_size());
             self.count_frame(&frame, elapsed_ms, rect != (0, 0), size, gpu_ms);
             Ok(())
@@ -1004,9 +1102,10 @@ mod imp {
             }))
         }
 
-        /// Draws the frame into the headset's images (when `inputs` has both eyes) and hands it over;
-        /// saves the eyes' pictures when a capture is due.
+        /// Draws the frame into the headset's images (when `inputs` has both eyes), the pause menu over
+        /// it, and hands it over; saves the eyes' pictures when a capture is due.
         pub fn end_frame(&mut self, frame: VrFrame, renderer: &mut Renderer, inputs: Option<[&FrameInput; 2]>) -> Result<(), String> {
+            let quads = self.quads(&frame)?;
             let Some(session) = self.session.as_mut() else { return Ok(()) };
             // the part of each eye's image drawn this frame (dynamic resolution), which the runtime shows
             let (w, h) = self.resolution.size(session.eye_size());
@@ -1026,6 +1125,9 @@ mod imp {
                     self.stats.fovea(self.foveation.source);
                 }
                 renderer.draw_eyes(inputs, targets, w, h, session.eye_size(), fovea)?;
+                if let Some(room) = self.room.as_mut().filter(|_| !quads.is_empty()) {
+                    room.draw(targets, session.format, (w, h), None, room_eyes(f), &room_quads(&quads))?;
+                }
                 self.stats.triangles = renderer.triangles.get();
                 drawn = true;
                 if let (Some(dir), Some(&at)) = (&self.options.capture, self.options.capture_at.get(self.next_capture))
@@ -1041,9 +1143,8 @@ mod imp {
                     }
                 }
             }
-            let quads = self.quads(&frame)?;
-            let Some(session) = self.session.as_mut() else { return Ok(()) };
-            session.end_frame(&self.runtime, &frame.frame, drawn, (w, h), &quads)?;
+            let layers: &[(Layer, Quad)] = if self.room.is_some() { &[] } else { &quads };
+            session.end_frame(&self.runtime, &frame.frame, drawn, (w, h), layers)?;
             let gpu_ms = session.gpu_ms();
             let period_ms = self.count_frame(&frame, elapsed_ms, drawn, (w, h), gpu_ms);
             // the sizes it went through are in the perf line every 5 s
@@ -1195,6 +1296,8 @@ mod imp {
             if let Some(mut s) = self.session.take() {
                 s.close(&self.runtime);
             }
+            // the room's pictures on the device, released before it
+            drop(self.room.take());
             // SAFETY: the renderer that borrowed it is gone, the session too; the runtime goes after
             unsafe { SDL_DestroyGPUDevice(self.device) };
         }

@@ -72,6 +72,7 @@ const SOURCES: &[(&[Part], &[&str])] = &[
     (&[File("effects.hlsl")], &["effect_vs", "ao_fs", "ao_apply_fs", "motion_blur_fs"]),
     (&[File("still.hlsl")], &["still_vs", "still_accumulate_fs", "still_restore_fs", "still_restore_color_fs"]),
     (&[File("menu.hlsl")], &["menu_vs", "menu_fs"]),
+    (&[File("room.hlsl")], &["room_vs", "room_fs"]),
     (
         &[File("post_common.hlsl"), File("post.hlsl")],
         &["post_vs", "fxaa1_fs", "fxaa2_fs", "fxaa3_fs", "faaa_fs", "nfaa_fs", "dlaa_edge_fs", "dlaa_fs", "cas_fs", "bilateral_cas_fs", "environment_alpha_fs"],
