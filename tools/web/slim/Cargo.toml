@@ -1,0 +1,22 @@
+[package]
+name = "vpx-slim"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-or-later"
+description = "A table made smaller to fetch for the browser: WebP pictures, Ogg Vorbis sounds"
+
+[dependencies]
+vpin = "=0.38.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
+# libwebp and libvorbis (with aoTuV's tuning), both built from their C sources
+webp = "0.3"
+libwebp-sys = "0.9"
+vorbis_rs = { version = "0.5", default-features = false }
+md-5 = "0.10"
+
+[profile.release]
+codegen-units = 4
+
+# a tool of its own, outside the player's workspace
+[workspace]

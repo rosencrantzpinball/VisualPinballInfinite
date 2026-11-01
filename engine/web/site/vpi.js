@@ -537,6 +537,14 @@ class Sound {
     this.sent = 0;
     this.start = 0;
     this.ahead = 0.05; // seconds queued ahead of what plays
+    this.late = 0; // times the page fell behind and sound ran out
+    this.mixMs = []; // what each frame's mixing took the page, lately
+  }
+  // what mixing takes each frame (the sounds decoded as they play among it), and how often sound ran out
+  summary() {
+    const t = [...this.mixMs].sort((a, b) => a - b);
+    const at = (q) => t[Math.min(t.length - 1, Math.floor(q * t.length))]?.toFixed(2);
+    return { state: this.ctx.state, late: this.late, aheadMs: Math.round(this.ahead * 1000), mix_median_ms: at(0.5), mix_p99_ms: at(0.99), mix_max_ms: at(1), baseLatency: this.ctx.baseLatency, outputLatency: this.ctx.outputLatency };
   }
   async ready() {
     const url = URL.createObjectURL(new Blob([WORKLET], { type: 'text/javascript' }));
@@ -553,14 +561,38 @@ class Sound {
       // the page was too slow: what's late is lost, and more is kept ahead from now on
       this.sent = played;
       this.ahead = Math.min(0.15, this.ahead + 0.01);
+      this.late++;
     }
     const want = Math.ceil((played + this.ahead * 48000 - this.sent) / 128) * 128;
     if (want <= 0) return;
+    const began = performance.now();
     const p = exports.vpi_web_audio(want);
+    this.mixMs.push(performance.now() - began);
+    if (this.mixMs.length > 3600) this.mixMs.shift();
     const chunk = new Float32Array(memory.buffer, p, want * 2).slice();
     this.node.port.postMessage(chunk, [chunk.buffer]);
     this.sent += want;
   }
+}
+
+// a response's bytes, gunzipped when they're gzip's (package.sh gzips what that shrinks; a host may have
+// unzipped them already, or kept a copy in the browser's cache as they came)
+async function unzipped(res) {
+  const reader = res.body.getReader();
+  const first = await reader.read();
+  const body = new ReadableStream({
+    start(c) {
+      if (first.done) c.close();
+      else c.enqueue(first.value);
+    },
+    async pull(c) {
+      const { done, value } = await reader.read();
+      if (done) c.close();
+      else c.enqueue(value);
+    },
+  });
+  const gzip = !first.done && first.value.length > 1 && first.value[0] === 0x1f && first.value[1] === 0x8b;
+  return gzip ? body.pipeThrough(new DecompressionStream('gzip')) : body;
 }
 
 // ---- the page ----
@@ -614,11 +646,12 @@ async function main() {
         errors: live.gpu ? [...live.gpu.errorLog.entries()].map(([message, count]) => ({ count, message })) : [],
       },
       memoryMB: live.x ? Math.round(live.x.memory.buffer.byteLength / 1048576) : null,
+      streamSoundsOver: live.stream ?? null,
       fetch: live.fetch ?? null,
       startSeconds: live.startSeconds ?? null,
       state: st,
       frames: live.stats?.summary() ?? null,
-      sound: live.sound ? { state: live.sound.ctx.state, baseLatency: live.sound.ctx.baseLatency, outputLatency: live.sound.ctx.outputLatency, aheadMs: Math.round(live.sound.ahead * 1000) } : null,
+      sound: live.sound?.summary() ?? null,
       lastVisit,
       lines: lines.slice(-40),
     };
@@ -760,7 +793,7 @@ async function main() {
     const hit = !!res;
     res ??= await fetch(url);
     if (!res.ok) throw new Error(`${url}: ${res.status}`);
-    const reader = res.body.getReader();
+    const reader = (await unzipped(res)).getReader();
     let n = 0;
     for (;;) {
       const { done, value } = await reader.read();
@@ -809,13 +842,20 @@ async function main() {
   status('Starting the player…');
   // compiled as it arrives; whole, where the host doesn't serve it as application/wasm
   const wasmUrl = manifest.program ? `${manifest.program.url}?v=${manifest.program.sha256}` : 'vpi.wasm';
-  const wasm = await WebAssembly.compileStreaming(fetch(wasmUrl)).catch(async () => WebAssembly.compile(await (await fetch(wasmUrl)).arrayBuffer()));
+  const program = async () => new Response(await unzipped(await fetch(wasmUrl)), { headers: { 'Content-Type': 'application/wasm' } });
+  const wasm = await WebAssembly.compileStreaming(program()).catch(async () => WebAssembly.compile(await (await program()).arrayBuffer()));
   // the table's view: the settings' (the desktop view, which held upright fills a phone's height), or
   // `?view=fss` (the table's full single screen view) or `?view=desktop`
   const view = params.get('view');
   live.view = view ?? 'settings';
   const env = { VPI_TABLE: manifest.table, VPI_DATA: '/data', VPI_TABLE_SETTINGS: '/data/table-settings', HOME: '/data' };
   if (view) env.VPI_VIEW = view;
+  // `?pictures=program`: the table's pictures decoded by the program, not the browser
+  if (params.get('pictures') === 'program') env.VPI_PICTURES = 'program';
+  // sounds longer than this many seconds kept as their files and decoded as they play (music, mostly), the
+  // shorter ones decoded as the table loads: `?stream=0` decodes them all at once
+  env.VPI_STREAM_SOUNDS = params.get('stream') ?? String(manifest.streamSounds ?? 0);
+  live.stream = env.VPI_STREAM_SOUNDS;
   const wasi = new Wasi(files, env, (fd, line) => {
     keep(line);
     if (fd === 2) console.warn(line);
@@ -860,6 +900,9 @@ async function main() {
     status('The table could not start: its Test report says why.');
     return;
   }
+  // its pictures, decoded by the browser as the table asked for them
+  status('Decoding the pictures…');
+  await gpu.pictures();
   // the graphics card done with the table's start (its pictures uploaded, its environment's light
   // worked out) before any frame adds to it
   await device.queue.onSubmittedWorkDone();
@@ -1129,7 +1172,7 @@ async function main() {
     const res = await fetch(`capture?name=${encodeURIComponent(name)}`, { method: 'POST', body: png });
     return { name, width: w, height: h, saved: res.ok };
   };
-  window.vpi = { exports: x, gpu, sound, files, stats, device, state, capture };
+  window.vpi = { exports: x, gpu, sound, files, stats, device, state, capture, report };
 
   // the frames
   let last = 0, lastReached = 0;
@@ -1200,18 +1243,8 @@ async function main() {
     const seconds = +(new URLSearchParams(location.search).get('seconds') ?? 4);
     await new Promise((r) => setTimeout(r, seconds * 1000));
     const picture = await capture(`${autotest}.png`);
-    const report = {
-      userAgent: navigator.userAgent,
-      adapter: { vendor: adapter.info?.vendor, architecture: adapter.info?.architecture, description: adapter.info?.description },
-      canvasFormat: format,
-      features: [...device.features],
-      errors: [...gpu.errorLog.entries()].map(([message, count]) => ({ count, message })),
-      state: window.vpi.state(),
-      stats: stats.summary(),
-      profile: gpu.profiling ? gpu.profile() : null,
-      picture,
-    };
-    await fetch(`capture?name=${encodeURIComponent(autotest)}.json`, { method: 'POST', body: JSON.stringify(report, null, 1) });
+    const result = { ...report(), canvasFormat: format, profile: gpu.profiling ? gpu.profile() : null, picture };
+    await fetch(`capture?name=${encodeURIComponent(autotest)}.json`, { method: 'POST', body: JSON.stringify(result, null, 1) });
     // done: no more frames, the graphics card let go
     ended = true;
     device.destroy();

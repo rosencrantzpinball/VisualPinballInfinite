@@ -2,17 +2,20 @@
 # Builds the browser's player and lays out one table as a site to put anywhere static files are served:
 #
 #   tools/web/package.sh <table folder or .vpx> <out folder> [--title "Name"] [--byline "by ..."] [--with-backglass]
-#                        [--no-source]
+#                        [--no-source] [--slim] [--stream-sounds seconds]
 #
 # The out folder gets the page (index.html, vpi.js, gpu.js), the program (vpi.wasm), manifest.json, VPX's shared
 # scripts (scripts/, core.vbs and the rest, as the Frame's package carries them), and table/: the table's folder as it
 # is (the score display's fonts beside it, its physics file, its own settings file), but for its backglass files
 # (.directb2s: the browser shows the playfield alone) unless --with-backglass. A file over 24 MiB goes in pieces of
 # 24 MiB (name.000, name.001, ...) that the page joins: static hosts cap a file's size (Cloudflare Pages at 25 MiB,
-# GitHub at 100 MB). source/ holds the program's source as built (the repository's tracked files, uncommitted
+# GitHub at 100 MB), and a file that gzip shrinks by a twentieth or more is gzipped (the page unzips it). source/ holds the program's source as built (the repository's tracked files, uncommitted
 # changes included), which a site serving GPL software has to offer, unless --no-source; .nojekyll keeps GitHub
-# Pages from running its site builder over it all. The program is built in the image
-# (tools/steam-frame/in-image.sh), after tools/web/wasi-libc.sh and tools/web/libwinevbs.sh.
+# Pages from running its site builder over it all. --slim puts a smaller copy of the table in place of the table itself
+# (tools/web/slim: its pictures WebP, lossy where that still matches by SSIM, its uncompressed sounds Ogg Vorbis);
+# --stream-sounds has the page keep sounds longer than that many seconds as their files and decode them as they play
+# (0, the default: all decoded as the table loads). The program is built in the image (tools/steam-frame/in-image.sh),
+# after tools/web/wasi-libc.sh and tools/web/libwinevbs.sh; the table and the out folder are under the work folder.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -20,13 +23,15 @@ source "$ROOT/tools/steam-frame/env.sh"
 SRC=$1
 OUT=$2
 shift 2
-TITLE= BYLINE= BACKGLASS=0 SOURCE=1
+TITLE= BYLINE= BACKGLASS=0 SOURCE=1 SLIM=0 STREAM=0
 while [[ $# -gt 0 ]]; do
    case $1 in
       --title) TITLE=$2; shift 2 ;;
       --byline) BYLINE=$2; shift 2 ;;
       --with-backglass) BACKGLASS=1; shift ;;
       --no-source) SOURCE=0; shift ;;
+      --slim) SLIM=1; shift ;;
+      --stream-sounds) STREAM=$2; shift 2 ;;
       *) echo "unknown option $1" >&2; exit 2 ;;
    esac
 done
@@ -44,6 +49,10 @@ EXCLUDE=(--exclude '.DS_Store')
 [[ $BACKGLASS == 1 ]] || EXCLUDE+=(--exclude '*.directb2s')
 rsync -a --delete --prune-empty-dirs "${EXCLUDE[@]}" "$TABLE_DIR/" "$OUT/table/"
 rsync -a --delete "$ROOT/vpx-build/vpinball-5436/scripts/" "$OUT/scripts/"
+if [[ $SLIM == 1 ]]; then
+   in_image cargo build --release --manifest-path tools/web/slim/Cargo.toml --target-dir target/slim
+   in_image target/slim/release/vpx-slim "$TABLE_DIR/$VPX" "$OUT/table/$VPX"
+fi
 
 BUILD=$(git -C "$ROOT" rev-parse --short=12 HEAD)
 SOURCE_FILE=
@@ -70,11 +79,19 @@ The table in table/ is its author's, under the author's terms.
 EOF
 fi
 
-python3 -I - "$OUT" "$VPX" "$TITLE" "$BYLINE" "$BUILD" "$SOURCE_FILE" <<'PY'
-import hashlib, json, os, re, sys, urllib.parse
-out, vpx, title, byline, build, source = sys.argv[1:7]
+python3 -I - "$OUT" "$VPX" "$TITLE" "$BYLINE" "$BUILD" "$SOURCE_FILE" "$STREAM" <<'PY'
+import gzip, hashlib, json, os, re, sys, urllib.parse
+out, vpx, title, byline, build, source, stream = sys.argv[1:8]
 PIECE = 24 << 20
 digest = lambda data: hashlib.sha256(data).hexdigest()[:16]
+# a file gzipped where that saves a twentieth or more (the page unzips it; hosts don't all compress), its bytes as served
+def served(path, data):
+    z = gzip.compress(data, compresslevel=9, mtime=0)
+    if len(z) < len(data) * 0.95:
+        open(path, 'wb').write(z)
+        return z, True
+    open(path, 'wb').write(data)
+    return data, False
 files = []
 for root, _, names in [w for top in ('table', 'scripts') for w in os.walk(os.path.join(out, top))]:
     for n in sorted(names):
@@ -86,12 +103,15 @@ for root, _, names in [w for top in ('table', 'scripts') for w in os.walk(os.pat
             entry['parts'] = []
             for k, at in enumerate(range(0, len(data), PIECE)):
                 piece = data[at:at + PIECE]
-                open(f'{full}.{k:03d}', 'wb').write(piece)
-                entry['parts'].append({'url': urllib.parse.quote(f'{rel}.{k:03d}'), 'size': len(piece), 'sha256': digest(piece)})
+                bytes_, gz = served(f'{full}.{k:03d}', piece)
+                entry['parts'].append({'url': urllib.parse.quote(f'{rel}.{k:03d}'), 'size': len(piece), 'sha256': digest(bytes_), **({'gzip': True} if gz else {})})
             os.remove(full)
         else:
-            entry.update(url=urllib.parse.quote(rel), sha256=digest(data))
+            bytes_, gz = served(full, data)
+            entry.update(url=urllib.parse.quote(rel), sha256=digest(bytes_), **({'gzip': True} if gz else {}))
         files.append(entry)
+program_bytes, program_gz = served(os.path.join(out, 'vpi.wasm'), open(os.path.join(out, 'vpi.wasm'), 'rb').read())
+program = {'url': 'vpi.wasm', 'sha256': digest(program_bytes), **({'gzip': True} if program_gz else {})}
 stem = os.path.splitext(vpx)[0]
 manifest = {
     'title': title or stem,
@@ -99,12 +119,13 @@ manifest = {
     'id': re.sub(r'[^a-z0-9]+', '-', stem.lower()).strip('-'),
     'table': '/table/' + vpx,
     'build': build,
-    'program': {'url': 'vpi.wasm', 'sha256': digest(open(os.path.join(out, 'vpi.wasm'), 'rb').read())},
+    'program': program,
     'source': source,
+    'streamSounds': float(stream),
     'files': files,
 }
 json.dump(manifest, open(os.path.join(out, 'manifest.json'), 'w'), indent=1)
-total = sum(f['size'] for f in files) + os.path.getsize(os.path.join(out, 'vpi.wasm'))
+total = sum(os.path.getsize(os.path.join(r, n)) for r, _, ns in os.walk(out) for n in ns if not os.path.relpath(r, out).startswith('source'))
 biggest = max(os.path.getsize(os.path.join(r, n)) for r, _, ns in os.walk(out) for n in ns)
-print(f"{out}: {len(files)} files, {total / 1e6:.0f} MB in all, the biggest {biggest / 1e6:.1f} MB")
+print(f"{out}: {len(files)} files, {total / 1e6:.0f} MB to fetch, the biggest file {biggest / 1e6:.1f} MB")
 PY

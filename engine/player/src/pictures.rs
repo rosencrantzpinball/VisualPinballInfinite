@@ -62,6 +62,63 @@ pub fn reader<'a>(data: &'a [u8], name: &str) -> Option<ImageReader<Cursor<&'a [
     reader.format().is_some().then_some(reader)
 }
 
+/// A picture a browser decodes to the texels the image library does, as the browser's page has it
+/// decode the table's pictures (`render::set_host_pictures`): its width, height and whether it has
+/// transparency, all from its header. A JPEG has none, nor does a PNG without an alpha channel or a
+/// transparent colour; a WebP says (its lossless bitstream's alpha hint, its extended header's alpha
+/// flag, as libwebp sets them from the texels). None for the rest: a PNG that may be transparent
+/// (only its texels say), a JPEG with EXIF data (whose orientation a browser applies and the image
+/// library doesn't), an animated WebP, any other format.
+pub fn browser_header(d: &[u8]) -> Option<(u32, u32, bool)> {
+    if d.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        let mut at = 2;
+        while at + 4 <= d.len() && d[at] == 0xFF && !matches!(d[at + 1], 0xDA | 0xD9) {
+            let len = usize::from(u16::from_be_bytes([d[at + 2], d[at + 3]]));
+            if d[at + 1] == 0xE1 && d.get(at + 4..at + 10) == Some(b"Exif\0\0") {
+                return None;
+            }
+            at += 2 + len;
+        }
+        let (w, h) = ImageReader::with_format(Cursor::new(d), image::ImageFormat::Jpeg).into_dimensions().ok()?;
+        return Some((w, h, false));
+    }
+    if d.starts_with(b"\x89PNG\r\n\x1a\n") && d.len() > 33 {
+        // grey, colour or a palette without a transparent entry (a tRNS chunk before the texels)
+        if matches!(d[25], 4 | 6) {
+            return None;
+        }
+        let mut at = 8;
+        while at + 8 <= d.len() {
+            let len = u32::from_be_bytes([d[at], d[at + 1], d[at + 2], d[at + 3]]) as usize;
+            match &d[at + 4..at + 8] {
+                b"tRNS" => return None,
+                b"IDAT" => break,
+                _ => at += 12 + len,
+            }
+        }
+        let size = |at: usize| u32::from_be_bytes([d[at], d[at + 1], d[at + 2], d[at + 3]]);
+        return Some((size(16), size(20), false));
+    }
+    if d.len() < 30 || &d[0..4] != b"RIFF" || &d[8..12] != b"WEBP" {
+        return None;
+    }
+    match &d[12..16] {
+        b"VP8 " if d[23..26] == [0x9d, 0x01, 0x2a] => {
+            let size = |at: usize| u32::from(u16::from_le_bytes([d[at], d[at + 1]]) & 0x3fff);
+            Some((size(26), size(28), false))
+        }
+        b"VP8L" if d[20] == 0x2f => {
+            let bits = u32::from_le_bytes([d[21], d[22], d[23], d[24]]);
+            Some(((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1, (bits >> 28) & 1 == 1))
+        }
+        b"VP8X" if d[20] & 0x02 == 0 => {
+            let size = |at: usize| u32::from_le_bytes([d[at], d[at + 1], d[at + 2], 0]) + 1;
+            Some((size(24), size(27), d[20] & 0x10 != 0))
+        }
+        _ => None,
+    }
+}
+
 /// Whether a TGA file's header holds together: a colour map of none or one, its entries making
 /// sense when there's one, a size, and one of the image kinds and depths TGA has (FreeImage's
 /// check, `PluginTARGA.cpp`'s `Validate`, which a TGA 2.0 footer passes too).

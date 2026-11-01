@@ -34,6 +34,30 @@ unsafe extern "C" {
     fn gpu_set_canvas_srgb(srgb: u32);
     /// Whether WebGPU has a feature: 0 clip distances, 1 filtering of 32-bit floats, 2 unclipped depth.
     fn gpu_has_feature(feature: u32) -> u32;
+    /// The page decodes a picture's file (`len` bytes at `file`, copied during the call) into texture
+    /// `texture`, with the browser's own decoder, and makes VPX's mipmaps of it; 0 when it can't.
+    fn gpu_picture(texture: u32, file: *const u8, len: usize) -> u32;
+}
+
+/// A picture the page decodes (`player::render::set_host_pictures`): a texture of its size, sRGB, all
+/// its levels, which the page fills from the picture's file before the first frame (its own decoder,
+/// then VPX's mipmaps on the graphics card); null if it can't.
+pub fn host_picture(_device: *mut SDL_GPUDevice, file: &[u8], width: u32, height: u32) -> *mut SDL_GPUTexture {
+    let levels = 32 - width.max(height).max(1).leading_zeros();
+    let json = format!(
+        r#"{{"format":"rgba8unorm-srgb","kind":"2d","width":{width},"height":{height},"layers":1,"levels":{levels},"samples":1,"sampled":true,"target":false,"picture":true}}"#
+    );
+    let id = json_call(&json, gpu_create_texture);
+    if id == 0 {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: the page copies the file's bytes while the call lasts
+    if unsafe { gpu_picture(id, file.as_ptr(), file.len()) } == 0 {
+        // SAFETY: a plain call into the page, for a texture of ours
+        unsafe { gpu_release(0, id) };
+        return std::ptr::null_mut();
+    }
+    boxed(Texture { id, format: SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM_SRGB })
 }
 
 /// What the page knows a texture by: the swapchain's, the canvas's own for this frame.

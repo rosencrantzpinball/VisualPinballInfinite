@@ -176,6 +176,14 @@ impl Play {
             scene.groups.len()
         );
 
+        // the table's pictures decoded by the browser, straight into their textures, but for `?pictures=program`
+        if std::env::var("VPI_PICTURES").as_deref() != Ok("program") {
+            player::render::set_host_pictures(crate::sdl::gpu::host_picture);
+        }
+        // the page's choice (`VPI_STREAM_SOUNDS`, seconds): longer sounds kept as their files, decoded as they play
+        if let Some(seconds) = std::env::var("VPI_STREAM_SOUNDS").ok().and_then(|s| s.parse::<f32>().ok()) {
+            player::audio::stream_sounds_over(seconds);
+        }
         let mut sounds = player::audio::Sounds::load(&vpx);
         // the sounds decoded, their files' bytes go: in the browser the program's memory is all it
         // has, and nothing reads them again

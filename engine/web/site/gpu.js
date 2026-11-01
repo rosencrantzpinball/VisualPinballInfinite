@@ -50,6 +50,11 @@ export class Gpu {
     this.uniformSize = 0;
     this.uniformGroups = new Map();
     this.mipPipelines = new Map();
+    this.vpxMipPipeline = null;
+    // the table's pictures this page decodes (gpu.rs's host_picture): waiting, being decoded, done
+    this.pictureJobs = [];
+    this.picturesDecoding = 0;
+    this.picturesDone = null;
     this.mipSampler = device.createSampler({ minFilter: 'linear', magFilter: 'linear' });
     this.nearest = new Map(); // a sampler's non-filtering twin
     this.emptyLayout = device.createBindGroupLayout({ entries: [] });
@@ -99,6 +104,7 @@ export class Gpu {
         this.srgb = on !== 0;
       },
       gpu_has_feature: (f) => [this.clipDistances, this.float32Filterable, this.unclippedDepth][f] ? 1 : 0,
+      gpu_picture: (id, p, n) => this.picture(id, new Uint8Array(this.memory.buffer, p, n).slice()),
     };
   }
 
@@ -135,16 +141,21 @@ export class Gpu {
     if (d.samples > 1) usage &= ~GPUTextureUsage.COPY_SRC & ~GPUTextureUsage.COPY_DST & ~GPUTextureUsage.TEXTURE_BINDING;
     const layers = d.kind === 'cube' ? 6 : d.kind === 'cube-array' ? Math.max(6, d.layers) : d.layers;
     const levels = Math.min(d.levels, Math.floor(Math.log2(Math.max(d.width, d.height, d.kind === '3d' ? d.layers : 1))) + 1);
+    // a picture this page decodes (`picture`): kept as plain RGBA8, which the browser's copy and VPX's
+    // mipmaps write as they are, and sampled as sRGB through a view of that format
+    const stored = d.picture ? 'rgba8unorm' : d.format;
+    if (d.picture) usage |= GPUTextureUsage.RENDER_ATTACHMENT;
     try {
       const texture = this.device.createTexture({
         size: { width: d.width, height: d.height, depthOrArrayLayers: layers },
-        format: d.format,
+        format: stored,
+        viewFormats: d.picture ? [d.format] : [],
         dimension: d.kind === '3d' ? '3d' : '2d',
         mipLevelCount: levels,
         sampleCount: d.samples,
         usage,
       });
-      const view = texture.createView({ dimension: d.kind === '3d' ? '3d' : d.kind === 'cube' ? 'cube' : d.kind === 'cube-array' ? 'cube-array' : layers > 1 ? '2d-array' : '2d' });
+      const view = texture.createView({ format: d.format, dimension: d.kind === '3d' ? '3d' : d.kind === 'cube' ? 'cube' : d.kind === 'cube-array' ? 'cube-array' : layers > 1 ? '2d-array' : '2d' });
       const unfilterable = depth || INTEGER.has(d.format) || (FLOAT32.has(d.format) && !this.float32Filterable);
       return this.slot(0, this.textures, { texture, view, format: d.format, levels, layers, kind: d.kind, depth, unfilterable, views: new Map(), serial: ++Gpu.serial });
     } catch (e) {
@@ -311,6 +322,107 @@ export class Gpu {
       t.views.set(key, v);
     }
     return v;
+  }
+
+  // a table's picture (its file's bytes) into texture `id`: decoded by the browser, a few at a time, then VPX's
+  // mipmaps made of it; `pictures()` waits for them all
+  picture(id, bytes) {
+    const t = this.textures[id];
+    if (!t) return 0;
+    this.pictureJobs.push(async () => {
+      const bitmap = await createImageBitmap(new Blob([bytes]), { premultiplyAlpha: 'none', colorSpaceConversion: 'none' });
+      // let go before it was decoded
+      if (this.textures[id] !== t) return bitmap.close();
+      const [w, h] = [Math.min(bitmap.width, t.texture.width), Math.min(bitmap.height, t.texture.height)];
+      if (w !== t.texture.width || h !== t.texture.height) this.log(`a picture of ${bitmap.width} × ${bitmap.height} for a texture of ${t.texture.width} × ${t.texture.height}`);
+      this.device.queue.copyExternalImageToTexture({ source: bitmap }, { texture: t.texture, premultipliedAlpha: false }, [w, h]);
+      bitmap.close();
+      this.vpxMipmaps(t);
+    });
+    this.decodePictures();
+    return 1;
+  }
+
+  decodePictures() {
+    while (this.picturesDecoding < 4 && this.pictureJobs.length) {
+      const job = this.pictureJobs.shift();
+      this.picturesDecoding++;
+      job()
+        .catch((e) => this.log(`a picture: ${e.message ?? e}`))
+        .finally(() => {
+          this.picturesDecoding--;
+          this.decodePictures();
+          if (!this.picturesDecoding && !this.pictureJobs.length) this.picturesDone?.();
+        });
+    }
+  }
+
+  // every picture asked for decoded and in its texture
+  pictures() {
+    if (!this.picturesDecoding && !this.pictureJobs.length) return Promise.resolve();
+    return new Promise((r) => (this.picturesDone = r));
+  }
+
+  // VPX's mipmaps (render/mips.rs, VPX's cs_mipmap_srgba8): each level from the one before at half its
+  // size, every texel VPX's 4 × 4 Kaiser kernel around the 2 × 2 it covers, weighed over the texels inside the
+  // picture in linear light, stored in 8 bits before the next level is made
+  vpxMipmaps(t) {
+    if (t.levels <= 1) return;
+    if (!this.vpxMipPipeline) {
+      const module = this.device.createShaderModule({
+        code: `
+          @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+            let uv = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+            return vec4f(uv * vec2f(2, -2) + vec2f(-1, 1), 0, 1);
+          }
+          @group(0) @binding(0) var src: texture_2d<f32>;
+          fn linear(s: f32) -> f32 {
+            if (s <= 0.04045) { return s * (1.0 / 12.92); }
+            return pow(s * (1.0 / 1.055) + (0.055 / 1.055), 2.4);
+          }
+          // linear light as the 8-bit sRGB value whose band holds it (mips.rs's SrgbEncoder), over 255
+          fn srgb8(v: f32) -> f32 {
+            if (!(v > 0.0)) { return 0.0; }
+            if (v >= 1.0) { return 1.0; }
+            var k = round(select(1.055 * pow(v, 1.0 / 2.4) - 0.055, v * 12.92, v <= 0.0031308) * 255.0);
+            if (k > 0.0 && v < linear((k - 0.5) / 255.0)) { k -= 1.0; } else if (k < 255.0 && v >= linear((k + 0.5) / 255.0)) { k += 1.0; }
+            return k / 255.0;
+          }
+          @fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
+            var kaiser = array<f32, 16>(0.000099, 0.004880, 0.004880, 0.000099, 0.004880, 0.240141, 0.240141, 0.004880,
+                                        0.004880, 0.240141, 0.240141, 0.004880, 0.000099, 0.004880, 0.004880, 0.000099);
+            let at = vec2i(p.xy) * 2 - vec2i(1, 1);
+            let size = vec2i(textureDimensions(src));
+            var c = vec4f(0.0);
+            var weight = 0.0;
+            for (var dy = 0; dy < 4; dy++) {
+              for (var dx = 0; dx < 4; dx++) {
+                let s = at + vec2i(dx, dy);
+                if (s.x < 0 || s.y < 0 || s.x >= size.x || s.y >= size.y) { continue; }
+                let t = textureLoad(src, s, 0);
+                let k = kaiser[dx * 4 + dy];
+                c += k * vec4f(linear(t.r), linear(t.g), linear(t.b), t.a);
+                weight += k;
+              }
+            }
+            let m = c / weight;
+            return vec4f(srgb8(m.r), srgb8(m.g), srgb8(m.b), m.a);
+          }`,
+      });
+      this.vpxMipPipeline = this.device.createRenderPipeline({ layout: 'auto', vertex: { module, entryPoint: 'vs' }, fragment: { module, entryPoint: 'fs', targets: [{ format: 'rgba8unorm' }] }, primitive: { topology: 'triangle-list' } });
+    }
+    const pipe = this.vpxMipPipeline;
+    const encoder = this.device.createCommandEncoder();
+    for (let level = 1; level < t.levels; level++) {
+      const src = t.texture.createView({ format: 'rgba8unorm', baseMipLevel: level - 1, mipLevelCount: 1, dimension: '2d' });
+      const group = this.device.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: src }] });
+      const pass = encoder.beginRenderPass({ colorAttachments: [{ view: this.viewOf(t, level, 0, 'rgba8unorm'), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 0] }] });
+      pass.setPipeline(pipe);
+      pass.setBindGroup(0, group);
+      pass.draw(3);
+      pass.end();
+    }
+    this.device.queue.submit([encoder.finish()]);
   }
 
   // the mipmaps of a texture, each level drawn from the one before

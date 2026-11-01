@@ -61,6 +61,19 @@ const UPLOAD_BATCH: usize = 256 << 20;
 /// 1.5 s longer (two 8192 × 8192 light maps no longer decoded side by side).
 const DECODE_BUDGET: usize = 1536 << 20;
 
+/// A host that decodes pictures itself (`set_host_pictures`): handed a picture's file, its width and
+/// height, it gives back a texture it fills, VPX's mipmaps too, before the first frame; or null.
+pub type HostPictures = fn(*mut SDL_GPUDevice, &[u8], u32, u32) -> *mut SDL_GPUTexture;
+
+static HOST_PICTURES: std::sync::OnceLock<HostPictures> = std::sync::OnceLock::new();
+
+/// From now on `host` decodes the table's pictures it can (`pictures::browser_header`), the rest
+/// decoded here: the browser's page, with the browser's own decoders, each picture straight into its
+/// texture and its mipmaps made on the graphics card, none of it in the program's memory.
+pub fn set_host_pictures(host: HostPictures) {
+    let _ = HOST_PICTURES.set(host);
+}
+
 /// Copies a picture from `transfer` (at `at`) into `texture`'s top level.
 unsafe fn upload_texture(copy: *mut SDL_GPUCopyPass, transfer: *mut SDL_GPUTransferBuffer, texture: *mut SDL_GPUTexture, at: u32, w: u32, h: u32) {
     unsafe {
@@ -2733,6 +2746,9 @@ impl Renderer {
         if crate::threads() <= 1 {
             let mut since_wait = 0usize;
             for (((t, how), slots), cost) in groups.iter().zip(&costs) {
+                if self.host_picture(slots, sources.get(*t)) {
+                    continue;
+                }
                 let image = sources.get(*t).and_then(|s| crate::scene::Image::decode(s, *how));
                 let chain = image.as_ref().map(image_chain).unwrap_or_default();
                 self.upload_decoded(slots, image.as_ref(), &chain, sources.get(*t))?;
@@ -2798,6 +2814,25 @@ impl Renderer {
         });
         unsafe { SDL_WaitForGPUIdle(self.device) };
         failure.map_or(Ok(()), Err)
+    }
+
+    /// A picture the host decodes (`HOST_PICTURES`): a texture of its for each slot, the picture's
+    /// transparency as its file's header tells it; false to decode it here.
+    fn host_picture(&mut self, slots: &[usize], source: Option<&vpin::vpx::image::ImageData>) -> bool {
+        let Some(host) = HOST_PICTURES.get() else { return false };
+        let Some(file) = source.and_then(|s| s.jpeg.as_ref()) else { return false };
+        let Some((w, h, alpha)) = crate::pictures::browser_header(&file.data) else { return false };
+        for &n in slots {
+            let texture = host(self.device, &file.data, w, h);
+            if texture.is_null() {
+                return false;
+            }
+            self.textures[n] = texture;
+            if let Some(a) = self.scene.image_has_alpha.get_mut(n) {
+                *a = alpha;
+            }
+        }
+        true
     }
 
     /// One decoded picture's textures, a slot each (white for one that
