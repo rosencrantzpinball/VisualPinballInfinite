@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! vpi-player <table.vpx> [--vsync | --present immediate|mailbox|vsync|paced] [--max-fps 240] [--view desktop|cabinet|fss] [--size 1600x900] [--fullscreen]
-//!            [--look classic|vpx] [--msaa off|4|8] [--aa-factor 0.5-2] [--ball-move vpx|intended] [--ao off|static|dynamic] [--motion-blur on|off] [--hdr on|off] [--hdr-dmd on|off] [--post-aa off|fxaa-fast|fxaa|fxaa-quality|nfaa|dlaa|smaa|faaa] [--sharpen off|cas|bilateral-cas] [--still-parts once|every-frame] [--shapes own|export] [--no-script] [--dmd-window X,Y,W,H] [--backglass-window X,Y,W,H] [--topper-window X,Y,W,H]
+//!            [--look classic|vpx] [--msaa off|4|8] [--aa-factor 0.5-2] [--ball-move vpx|intended] [--ao off|static|dynamic] [--motion-blur on|off] [--hdr on|off] [--hdr-dmd on|off] [--post-aa off|fxaa-fast|fxaa|fxaa-quality|nfaa|dlaa|smaa|faaa] [--sharpen off|cas|bilateral-cas] [--still-parts once|every-frame] [--stream-sounds seconds] [--shapes own|export] [--no-script] [--dmd-window X,Y,W,H] [--backglass-window X,Y,W,H] [--topper-window X,Y,W,H]
 //!            [--score-panel auto|no-dmd|off|X,Y,W,H] [--backglass-dmd off|auto|X,Y,W,H] [--show-grill] [--prefer-pup] [--volume 0-100]
 //!            [--shot picture.png [--at 1000] [--keys 500:1:d,600:1:u,...] [--video preview.mp4 [--seconds 10] [--video-sound]] [--crop playfield]] [--quit-after ms]
 //! ```
@@ -201,7 +201,7 @@ struct Options {
     library: bool,
 }
 
-const USAGE: &str = "usage: vpi-player <table.vpx> [--vsync | --present immediate|mailbox|vsync|paced] [--max-fps 240] [--view desktop|cabinet|fss] [--size 1600x900] [--fullscreen] [--look classic|vpx] [--msaa off|4|8] [--aa-factor 0.5-2] [--ball-move vpx|intended] [--ao off|static|dynamic] [--motion-blur on|off] [--hdr on|off] [--hdr-dmd on|off] [--post-aa off|fxaa-fast|fxaa|fxaa-quality|nfaa|dlaa|smaa|faaa] [--sharpen off|cas|bilateral-cas] [--still-parts once|every-frame] [--shapes own|export] [--no-script] [--no-readout] [--one-screen] [--dmd-window X,Y,W,H] [--backglass-window X,Y,W,H] [--topper-window X,Y,W,H] [--score-panel auto|no-dmd|off|X,Y,W,H] [--backglass-dmd off|auto|X,Y,W,H] [--show-grill] [--prefer-pup] [--volume 0-100] [--shot picture.png [--at 1000] [--keys 500:1:d,600:1:u] [--video preview.mp4 [--seconds 10] [--video-sound]] [--crop playfield]] [--quit-after ms] [--record game.vpireplay] [--vr [--vr-opaque] [--vr-pin-eyes] [--vr-eye-size WxH] [--vr-capture folder [--vr-capture-at 5000,...]] [--vr-timings frames.csv]]\n       vpi-player --displays [--json]\n       vpi-player --sound-outputs [--json]\n       vpi-player --input-test\n       vpi-player --library [--vr-passthrough]: VR with the library on the headset's panel";
+const USAGE: &str = "usage: vpi-player <table.vpx> [--vsync | --present immediate|mailbox|vsync|paced] [--max-fps 240] [--view desktop|cabinet|fss] [--size 1600x900] [--fullscreen] [--look classic|vpx] [--msaa off|4|8] [--aa-factor 0.5-2] [--ball-move vpx|intended] [--ao off|static|dynamic] [--motion-blur on|off] [--hdr on|off] [--hdr-dmd on|off] [--post-aa off|fxaa-fast|fxaa|fxaa-quality|nfaa|dlaa|smaa|faaa] [--sharpen off|cas|bilateral-cas] [--still-parts once|every-frame] [--stream-sounds seconds] [--shapes own|export] [--no-script] [--no-readout] [--one-screen] [--dmd-window X,Y,W,H] [--backglass-window X,Y,W,H] [--topper-window X,Y,W,H] [--score-panel auto|no-dmd|off|X,Y,W,H] [--backglass-dmd off|auto|X,Y,W,H] [--show-grill] [--prefer-pup] [--volume 0-100] [--shot picture.png [--at 1000] [--keys 500:1:d,600:1:u] [--video preview.mp4 [--seconds 10] [--video-sound]] [--crop playfield]] [--quit-after ms] [--record game.vpireplay] [--vr [--vr-opaque] [--vr-pin-eyes] [--vr-eye-size WxH] [--vr-capture folder [--vr-capture-at 5000,...]] [--vr-timings frames.csv]]\n       vpi-player --displays [--json]\n       vpi-player --sound-outputs [--json]\n       vpi-player --input-test\n       vpi-player --library [--vr-passthrough]: VR with the library on the headset's panel";
 
 /// The frame-rate limit unless `--max-fps` says otherwise: above the 60–165 Hz of cabinets' and
 /// desktops' screens.
@@ -538,6 +538,10 @@ fn parse_args() -> Result<Options, String> {
                     Some("every-frame") => false,
                     _ => return Err(format!("--still-parts takes once or every-frame\n{USAGE}")),
                 }
+            }
+            "--stream-sounds" => {
+                let seconds = args.next().and_then(|s| s.parse::<f32>().ok()).ok_or_else(|| format!("--stream-sounds takes seconds\n{USAGE}"))?;
+                player::audio::stream_sounds_over(seconds);
             }
             "--no-script" => o.script = false,
             // pictures that compare equal from run to run (tools/render-check)

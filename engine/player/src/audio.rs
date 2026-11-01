@@ -51,12 +51,38 @@ pub struct Sound {
     /// The stored sound's channel count: mixing to mono averages the
     /// channels, and VPX multiplies the loudness back by their number.
     pub mono_compensation: f32,
+    /// A long sound kept as its file and decoded as it plays (`stream_sounds_over`), its `samples`
+    /// left empty.
+    pub file: Option<SoundFile>,
+}
+
+/// A long sound's file, decoded a packet at a time by each copy of it playing (`Streamed`).
+pub struct SoundFile {
+    bytes: Arc<[u8]>,
+    /// The extension that names its format (`"ogg"`, `"mp3"`).
+    ext: String,
+    /// Its frames as the file counts them: the decoding finds the exact end as it gets there.
+    frames: usize,
 }
 
 impl Sound {
     fn frames(&self) -> usize {
-        self.samples.len() / usize::from(self.channels.max(1))
+        match &self.file {
+            Some(file) => file.frames,
+            None => self.samples.len() / usize::from(self.channels.max(1)),
+        }
     }
+}
+
+/// Sounds longer than this, in milliseconds, are kept as their files and decoded as they play, a
+/// packet at a time: music, mostly, that would otherwise sit decoded in memory, 32-bit samples for
+/// every minute of it. 0 (the player's own default) decodes every sound as the table loads.
+static STREAM_OVER_MS: AtomicU32 = AtomicU32::new(0);
+
+/// Sounds longer than `seconds` decoded as they play from now on (the player's `--stream-sounds`,
+/// the browser's page); 0 to decode every one as the table loads.
+pub fn stream_sounds_over(seconds: f32) {
+    STREAM_OVER_MS.store((seconds.max(0.0) * 1000.0) as u32, Ordering::Relaxed);
 }
 
 /// VPX's `dequantizeSignedPercent`: -100..100 percent to -1..1. vpin keeps
@@ -98,6 +124,9 @@ fn wav_samples(s: &vpin::vpx::sound::SoundData) -> Option<(u32, u16, Vec<f32>)> 
 /// with miniaudio.
 fn decode(s: &vpin::vpx::sound::SoundData) -> Option<Sound> {
     let ext = extension(&s.path);
+    if let Some(streamed) = ext.as_deref().and_then(|ext| streamed(s, ext)) {
+        return Some(streamed);
+    }
     let (rate, channels, interleaved) = match ext.as_deref() {
         None | Some("wav") => wav_samples(s)?,
         Some(ext) => {
@@ -126,6 +155,36 @@ fn decode(s: &vpin::vpx::sound::SoundData) -> Option<Sound> {
         fade: signed_percent(s.fade),
         backglass,
         mono_compensation: if backglass { 1.0 } else { f32::from(channels) },
+        file: None,
+    })
+}
+
+/// A sound in a compressed format (not WAV) longer than `STREAM_OVER_MS`, by its file's own count,
+/// kept as its file to be decoded as it plays; None to decode it now (a short one, or one whose
+/// file doesn't say how long it is).
+fn streamed(s: &vpin::vpx::sound::SoundData, ext: &str) -> Option<Sound> {
+    let over = STREAM_OVER_MS.load(Ordering::Relaxed);
+    if over == 0 || ext == "wav" {
+        return None;
+    }
+    let bytes: Arc<[u8]> = s.data.as_slice().into();
+    let reader = crate::decode::Reader::open(Box::new(std::io::Cursor::new(bytes.clone())), Some(ext)).ok()?;
+    let frames = reader.frames.filter(|&f| f > 0)?;
+    if reader.rate == 0 || reader.channels == 0 || frames * 1000 <= u64::from(over) * u64::from(reader.rate) {
+        return None;
+    }
+    let backglass = matches!(s.output_target, vpin::vpx::sound::OutputTarget::Backglass);
+    Some(Sound {
+        name: s.name.clone(),
+        rate: reader.rate,
+        channels: if backglass { 2 } else { 1 },
+        samples: Vec::new(),
+        volume: signed_percent(s.volume),
+        balance: signed_percent(s.balance),
+        fade: signed_percent(s.fade),
+        backglass,
+        mono_compensation: if backglass { 1.0 } else { reader.channels as f32 },
+        file: Some(SoundFile { bytes, ext: ext.to_string(), frames: usize::try_from(frames).ok()? }),
     })
 }
 
@@ -765,6 +824,81 @@ struct Voice {
     volume: f32,
     pan: f32,
     fade: f32,
+    /// A long sound's decoding as this copy plays it (`SoundFile`), begun as it's first mixed.
+    stream: Option<Box<Streamed>>,
+}
+
+/// A copy of a long sound playing, decoded from its file as it goes (`Sound::file`): the frames from
+/// `start` on, in the sound's own layout (one channel or two, as `Sound::channels`, made from the
+/// file's as `decode` makes them), its file read on as the copy moves on, and from its start again
+/// when it loops. The samples it mixes are those the sound decoded whole would give.
+#[derive(Default)]
+struct Streamed {
+    reader: Option<crate::decode::Reader>,
+    frames: Vec<f32>,
+    start: usize,
+    /// The sound's length in frames, once its file has been read to the end.
+    end: Option<usize>,
+    /// Its first frame, for the step from its last frame back to it as it loops.
+    first: [f32; 2],
+}
+
+impl Streamed {
+    /// Decodes on until frame `to` is in hand or the file ends; from the file's start again when
+    /// `to` is behind what's kept (the sound looped). What's well behind is let go.
+    fn fill(&mut self, sound: &Sound, file: &SoundFile, to: usize) {
+        let ch = usize::from(sound.channels.max(1));
+        if to < self.start {
+            (self.reader, self.start) = (None, 0);
+            self.frames.clear();
+        }
+        let behind = to.saturating_sub(2).saturating_sub(self.start);
+        if behind > 8192 {
+            self.frames.drain(..behind * ch);
+            self.start += behind;
+        }
+        while self.start + self.frames.len() / ch <= to {
+            if self.end.is_some_and(|end| self.start + self.frames.len() / ch >= end) {
+                return;
+            }
+            if self.reader.is_none() {
+                match crate::decode::Reader::open(Box::new(std::io::Cursor::new(file.bytes.clone())), Some(&file.ext)) {
+                    Ok(r) => self.reader = Some(r),
+                    Err(_) => {
+                        self.end = Some(self.start + self.frames.len() / ch);
+                        return;
+                    }
+                }
+            }
+            let first = self.start == 0 && self.frames.is_empty();
+            match self.reader.as_mut().map(crate::decode::Reader::next) {
+                Some(Ok(Some((_, source, samples)))) => {
+                    // as `decode` lays it out: a backglass sound's first two channels, a playfield
+                    // sound's channels averaged
+                    for f in samples.chunks_exact(source) {
+                        if sound.backglass {
+                            self.frames.extend_from_slice(&[f[0], f[if source > 1 { 1 } else { 0 }]]);
+                        } else {
+                            self.frames.push(f.iter().sum::<f32>() / source as f32);
+                        }
+                    }
+                    if first && self.frames.len() >= ch {
+                        self.first = [self.frames[0], self.frames[ch - 1]];
+                    }
+                }
+                _ => {
+                    self.end = Some(self.start + self.frames.len() / ch);
+                    self.reader = None;
+                }
+            }
+        }
+    }
+
+    /// Frame `k` (in hand), both sides: a one-channel sound's twice.
+    fn frame(&self, k: usize, ch: usize) -> [f32; 2] {
+        let i = (k - self.start) * ch;
+        [self.frames[i], self.frames[i + ch - 1]]
+    }
 }
 
 /// The audio thread's side.
@@ -900,7 +1034,7 @@ impl Mixer {
                     let existing = if use_same { self.voices.iter_mut().find(|v| v.sound == sound) } else { None };
                     match existing {
                         Some(v) => (v.gains, v.step, v.loops, v.volume, v.pan, v.fade) = (gains, step, loops, volume, pan, fade),
-                        None => self.voices.push(Voice { sound, at: 0.0, step, gains, loops, volume, pan, fade }),
+                        None => self.voices.push(Voice { sound, at: 0.0, step, gains, loops, volume, pan, fade, stream: None }),
                     }
                 }
                 Command::Stop { sound } => self.voices.retain(|v| v.sound != sound),
@@ -976,30 +1110,17 @@ impl Mixer {
                 return true;
             }
             let s = &sounds[v.sound];
-            let n = s.frames();
-            if n == 0 {
+            if s.frames() == 0 {
                 return false;
             }
-            let sch = usize::from(s.channels);
             for f in 0..frames {
-                if v.at >= n as f64 {
-                    match &mut v.loops {
-                        Some(0) => return false,
-                        Some(left) => *left -= 1,
-                        None => {}
-                    }
-                    v.at -= n as f64;
-                }
                 // linear interpolation between neighbouring frames
-                let i = v.at as usize;
-                let t = (v.at - i as f64) as f32;
-                let j = if i + 1 < n { i + 1 } else if v.loops != Some(0) { 0 } else { i };
-                let sample = |frame: usize, c: usize| s.samples[frame * sch + c.min(sch - 1)];
-                let l = sample(i, 0) + (sample(j, 0) - sample(i, 0)) * t;
+                let Some((a, b, t)) = neighbours(s, v) else { return false };
+                let l = a[0] + (b[0] - a[0]) * t;
                 let out = &mut self.buffer[f * ch..f * ch + ch];
                 if s.backglass {
                     // stereo: each side to its channel, both halves together on one
-                    let r = sample(i, 1) + (sample(j, 1) - sample(i, 1)) * t;
+                    let r = a[1] + (b[1] - a[1]) * t;
                     if ch == 1 {
                         out[0] += (l + r) * v.gains[0];
                     } else {
@@ -1046,6 +1167,54 @@ impl Mixer {
             *x = x.clamp(-1.0, 1.0);
         }
     }
+}
+
+/// The frame a copy of a sound is at and the one after it (its first again as it loops, its last
+/// again at its end), both sides (`Streamed::frame`), and how far it is between them; the copy moved
+/// on past the sound's end as it loops; None once it has played its last repeat.
+fn neighbours(s: &Sound, v: &mut Voice) -> Option<([f32; 2], [f32; 2], f32)> {
+    let ch = usize::from(s.channels.max(1));
+    let Some(file) = &s.file else {
+        let n = s.frames();
+        if v.at >= n as f64 {
+            match &mut v.loops {
+                Some(0) => return None,
+                Some(left) => *left -= 1,
+                None => {}
+            }
+            v.at -= n as f64;
+        }
+        let i = v.at as usize;
+        let t = (v.at - i as f64) as f32;
+        let j = if i + 1 < n { i + 1 } else if v.loops != Some(0) { 0 } else { i };
+        let frame = |k: usize| [s.samples[k * ch], s.samples[k * ch + ch - 1]];
+        return Some((frame(i), frame(j), t));
+    };
+    // decoded on as it goes: where it ends is known once its file has been read to the end
+    let st = v.stream.get_or_insert_with(Box::default);
+    st.fill(s, file, v.at as usize + 1);
+    if let Some(n) = st.end
+        && v.at >= n as f64
+    {
+        match &mut v.loops {
+            _ if n == 0 => return None,
+            Some(0) => return None,
+            Some(left) => *left -= 1,
+            None => {}
+        }
+        v.at -= n as f64;
+        st.fill(s, file, v.at as usize + 1);
+    }
+    let i = v.at as usize;
+    let t = (v.at - i as f64) as f32;
+    let next = if st.end.is_none_or(|n| i + 1 < n) {
+        st.frame(i + 1, ch)
+    } else if v.loops != Some(0) {
+        st.first
+    } else {
+        st.frame(i, ch)
+    };
+    Some((st.frame(i, ch), next, t))
 }
 
 /// The rate the mixer plays at, in frames a second.
@@ -1327,6 +1496,84 @@ impl Drop for Audio {
 mod tests {
     use super::*;
 
+    /// A WAV file of 16-bit stereo, `frames` long at `rate`: each side a sawtooth of its own.
+    fn stereo_wav(rate: u32, frames: u32) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&(36 + frames * 4).to_le_bytes());
+        b.extend_from_slice(b"WAVEfmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&2u16.to_le_bytes());
+        b.extend_from_slice(&rate.to_le_bytes());
+        b.extend_from_slice(&(rate * 4).to_le_bytes());
+        b.extend_from_slice(&4u16.to_le_bytes());
+        b.extend_from_slice(&16u16.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&(frames * 4).to_le_bytes());
+        for i in 0..frames {
+            b.extend_from_slice(&((((i * 37) % 2000) as i16 - 1000) * 16).to_le_bytes());
+            b.extend_from_slice(&((((i * 11) % 3001) as i16 - 1500) * 9).to_le_bytes());
+        }
+        b
+    }
+
+    /// A sound kept as its file and decoded as it plays mixes the very samples it does decoded
+    /// whole: copies played once, repeated and looping, at three pitches, in mixes of every size,
+    /// on the playfield (mixed to one channel) and the backglass (two).
+    fn streamed_mixes_as_decoded(file: &[u8], ext: &str) {
+        let pcm = crate::decode::decode_all(file.to_vec(), Some(ext)).expect("decodes");
+        let source = pcm.channels;
+        for backglass in [false, true] {
+            let sound = |samples: Vec<f32>, file: Option<SoundFile>| Sound {
+                name: "s".into(),
+                rate: pcm.rate,
+                channels: if backglass { 2 } else { 1 },
+                samples,
+                volume: 0.0,
+                balance: 0.0,
+                fade: 0.0,
+                backglass,
+                mono_compensation: if backglass { 1.0 } else { source as f32 },
+                file,
+            };
+            // laid out as `decode` lays it out
+            let samples = pcm.samples.chunks_exact(source).flat_map(|f| if backglass { vec![f[0], f[if source > 1 { 1 } else { 0 }]] } else { vec![f.iter().sum::<f32>() / source as f32] });
+            let whole = sound(samples.collect(), None);
+            // the file's own count of its frames is a guess here: the decoding finds the end
+            let streamed = sound(Vec::new(), Some(SoundFile { bytes: file.into(), ext: ext.into(), frames: pcm.samples.len() / source + 17 }));
+            let (whole_tx, whole_rx) = channel();
+            let (streamed_tx, streamed_rx) = channel();
+            let mut a = Mixer::new(vec![Arc::new(whole)], whole_rx, 1.0, 1.0);
+            let mut b = Mixer::new(vec![Arc::new(streamed)], streamed_rx, 1.0, 1.0);
+            for tx in [&whole_tx, &streamed_tx] {
+                for (volume, pan, rate, loops) in [(1.0, 0.3, 1.0, Some(2)), (0.5, -0.2, 1.37, None), (0.8, 0.0, 0.61, Some(0))] {
+                    tx.send(Command::Play { sound: 0, volume, pan, fade: 0.0, rate, loops, use_same: false, restart: false }).expect("sent");
+                }
+            }
+            for frames in [512, 1000, 4096, 777, 30_000, 30_000, 2048, 30_000, 96_000] {
+                a.mix(frames);
+                b.mix(frames);
+                assert!(a.buffer == b.buffer, "backglass {backglass}: the mixes part after {frames} more frames");
+            }
+            assert_eq!(a.voices.len(), b.voices.len());
+        }
+    }
+
+    #[test]
+    fn a_streamed_sound_mixes_as_the_decoded_one() {
+        streamed_mixes_as_decoded(&stereo_wav(22_050, 30_000), "wav");
+    }
+
+    /// The same for a sound file (`VPI_TEST_SOUND`: a table's Ogg Vorbis or MP3 file), run by hand.
+    #[test]
+    #[ignore]
+    fn a_streamed_file_mixes_as_the_decoded_one() {
+        let path = std::env::var("VPI_TEST_SOUND").expect("VPI_TEST_SOUND: a sound file");
+        let ext = path.rsplit('.').next().unwrap_or("ogg").to_lowercase();
+        streamed_mixes_as_decoded(&std::fs::read(&path).expect("reads"), &ext);
+    }
+
     /// A WAV file of `seconds` of a 16-bit mono tone at 48 kHz.
     fn tone_wav(seconds: f32) -> Vec<u8> {
         let n = (48_000.0 * seconds) as u32;
@@ -1481,6 +1728,7 @@ mod tests {
             fade: 0.0,
             backglass: false,
             mono_compensation: 1.0,
+            file: None,
         })
     }
 
@@ -1546,6 +1794,7 @@ mod tests {
             fade: 0.0,
             backglass: true,
             mono_compensation: 1.0,
+            file: None,
         });
         let mut sounds = Sounds {
             sounds: vec![test_sound(1), backglass_sound],
