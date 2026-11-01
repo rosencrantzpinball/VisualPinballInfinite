@@ -1,0 +1,590 @@
+{
+ "title": "Symphony IX: The Machine of Joy",
+ "byline": "An original pinball table \u00b7 Visual Pinball Infinite in the browser",
+ "id": "symphony-ix-the-machine-of-joy-original-2026",
+ "table": "/table/Symphony IX - The Machine of Joy (Original 2026).vpx",
+ "build": "d0d0534e18f7",
+ "program": {
+  "url": "vpi.wasm",
+  "sha256": "7f6b29146ab45a4a",
+  "gzip": true
+ },
+ "source": "source/vpi-d0d0534e18f7.tar.gz",
+ "streamSounds": 2.0,
+ "files": [
+  {
+   "path": "/table/CREDITS.txt",
+   "size": 1812,
+   "url": "table/CREDITS.txt",
+   "sha256": "b9f367875367c465",
+   "gzip": true
+  },
+  {
+   "path": "/table/README.txt",
+   "size": 6615,
+   "url": "table/README.txt",
+   "sha256": "f6df1590d4412b57",
+   "gzip": true
+  },
+  {
+   "path": "/table/Symphony IX - The Machine of Joy (Original 2026).vpx",
+   "size": 70914048,
+   "parts": [
+    {
+     "url": "table/Symphony%20IX%20-%20The%20Machine%20of%20Joy%20%28Original%202026%29.vpx.000",
+     "size": 25165824,
+     "sha256": "7cf5a4441cab4664",
+     "gzip": true
+    },
+    {
+     "url": "table/Symphony%20IX%20-%20The%20Machine%20of%20Joy%20%28Original%202026%29.vpx.001",
+     "size": 25165824,
+     "sha256": "93cb9840e268eeb7",
+     "gzip": true
+    },
+    {
+     "url": "table/Symphony%20IX%20-%20The%20Machine%20of%20Joy%20%28Original%202026%29.vpx.002",
+     "size": 20582400,
+     "sha256": "e9cba92caa9c8511",
+     "gzip": true
+    }
+   ]
+  },
+  {
+   "path": "/table/SymphonyIXDMD/TeenyTinyPixls5.fnt",
+   "size": 11132,
+   "url": "table/SymphonyIXDMD/TeenyTinyPixls5.fnt",
+   "sha256": "17e3bd2545062f26",
+   "gzip": true
+  },
+  {
+   "path": "/table/SymphonyIXDMD/sys80.fnt",
+   "size": 7070,
+   "url": "table/SymphonyIXDMD/sys80.fnt",
+   "sha256": "474e2767f6f11d4f",
+   "gzip": true
+  },
+  {
+   "path": "/table/SymphonyIXDMD/sys80.png",
+   "size": 784,
+   "url": "table/SymphonyIXDMD/sys80.png",
+   "sha256": "28f0f48dfd072a5d"
+  },
+  {
+   "path": "/table/SymphonyIXDMD/sys80_1.fnt",
+   "size": 7072,
+   "url": "table/SymphonyIXDMD/sys80_1.fnt",
+   "sha256": "324545e59caa7d11",
+   "gzip": true
+  },
+  {
+   "path": "/table/SymphonyIXDMD/sys80_1.png",
+   "size": 2660,
+   "url": "table/SymphonyIXDMD/sys80_1.png",
+   "sha256": "434c69e884e313cc"
+  },
+  {
+   "path": "/table/SymphonyIXDMD/teenytinypixls5.png",
+   "size": 784,
+   "url": "table/SymphonyIXDMD/teenytinypixls5.png",
+   "sha256": "a19dbac9a7f06c16"
+  },
+  {
+   "path": "/scripts/6803.vbs",
+   "size": 8788,
+   "url": "scripts/6803.vbs",
+   "sha256": "5b29654e82cde46a",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/ALI.vbs",
+   "size": 4760,
+   "url": "scripts/ALI.vbs",
+   "sha256": "7c0609b3dbdd110b",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/Atari.vbs",
+   "size": 5092,
+   "url": "scripts/Atari.vbs",
+   "sha256": "eb669b600dcbe6de",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/Atari1.vbs",
+   "size": 5196,
+   "url": "scripts/Atari1.vbs",
+   "sha256": "3f452c165ae10293",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/Atari1b.vbs",
+   "size": 5243,
+   "url": "scripts/Atari1b.vbs",
+   "sha256": "e1cab63bf6a318be",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/Atari2.vbs",
+   "size": 4818,
+   "url": "scripts/Atari2.vbs",
+   "sha256": "bff39ff454bcbf87",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/B2B.vbs",
+   "size": 18064,
+   "url": "scripts/B2B.vbs",
+   "sha256": "6f5efdc01ae9286c",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/B2Bcollision.vbs",
+   "size": 15041,
+   "url": "scripts/B2Bcollision.vbs",
+   "sha256": "07a1952c9c4a7643",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/Bally.vbs",
+   "size": 6705,
+   "url": "scripts/Bally.vbs",
+   "sha256": "e7ad5077c7245d89",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/BallyG.vbs",
+   "size": 5096,
+   "url": "scripts/BallyG.vbs",
+   "sha256": "83d233c9164ae086",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/Class1812.vbs",
+   "size": 4865,
+   "url": "scripts/Class1812.vbs",
+   "sha256": "0d4dee3617d722d0",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/FPVPX.vbs",
+   "size": 1079,
+   "url": "scripts/FPVPX.vbs",
+   "sha256": "fb7e71903d6258c1",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/GamePlan.vbs",
+   "size": 6851,
+   "url": "scripts/GamePlan.vbs",
+   "sha256": "b116fc0efa08a639",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/Hankin.vbs",
+   "size": 6805,
+   "url": "scripts/Hankin.vbs",
+   "sha256": "540ac95631222d0e",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/LTD.vbs",
+   "size": 4218,
+   "url": "scripts/LTD.vbs",
+   "sha256": "a1c2826c12751247",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/LTD3.vbs",
+   "size": 2829,
+   "url": "scripts/LTD3.vbs",
+   "sha256": "974241ee64632249",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/LTD4a.vbs",
+   "size": 5475,
+   "url": "scripts/LTD4a.vbs",
+   "sha256": "30acf6de9ef07b25",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/LTDPecmen.vbs",
+   "size": 4930,
+   "url": "scripts/LTDPecmen.vbs",
+   "sha256": "abb2ae5299a6d056",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/PDB.vbs",
+   "size": 5842,
+   "url": "scripts/PDB.vbs",
+   "sha256": "3548a165c1d41ec7",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/Play1.vbs",
+   "size": 6076,
+   "url": "scripts/Play1.vbs",
+   "sha256": "d8291607fbb3a738",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/Play2.vbs",
+   "size": 5627,
+   "url": "scripts/Play2.vbs",
+   "sha256": "d0626b2285b87015",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/Play4.vbs",
+   "size": 4522,
+   "url": "scripts/Play4.vbs",
+   "sha256": "98050778b914dfee",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/UltraDMD_Options.vbs",
+   "size": 20086,
+   "url": "scripts/UltraDMD_Options.vbs",
+   "sha256": "6af7586ba4e184b8",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/VPMKeys.vbs",
+   "size": 6219,
+   "url": "scripts/VPMKeys.vbs",
+   "sha256": "326ad9c403bc02ed",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/WPC.vbs",
+   "size": 8307,
+   "url": "scripts/WPC.vbs",
+   "sha256": "e0de16d72edf3560",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/alving.vbs",
+   "size": 6283,
+   "url": "scripts/alving.vbs",
+   "sha256": "10de196e7e73e51f",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/antar.vbs",
+   "size": 4489,
+   "url": "scripts/antar.vbs",
+   "sha256": "c6c43b741e0ac52f",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/b2s.vbs",
+   "size": 6595,
+   "url": "scripts/b2s.vbs",
+   "sha256": "1f34a1c1597b192e",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/capcom.vbs",
+   "size": 5563,
+   "url": "scripts/capcom.vbs",
+   "sha256": "5f0a96b2882a03cf",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/controller.vbs",
+   "size": 12976,
+   "url": "scripts/controller.vbs",
+   "sha256": "2b6a213f03369fb5",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/core.vbs",
+   "size": 101463,
+   "url": "scripts/core.vbs",
+   "sha256": "57c0e040876b7af4",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/de.vbs",
+   "size": 5664,
+   "url": "scripts/de.vbs",
+   "sha256": "1322d0187766cad4",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/de2.vbs",
+   "size": 5707,
+   "url": "scripts/de2.vbs",
+   "sha256": "9adce919588c020b",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/gts1.vbs",
+   "size": 6240,
+   "url": "scripts/gts1.vbs",
+   "sha256": "8114ce61339925a8",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/gts3.vbs",
+   "size": 6054,
+   "url": "scripts/gts3.vbs",
+   "sha256": "9376c4d3e578e88a",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/idsa.vbs",
+   "size": 4492,
+   "url": "scripts/idsa.vbs",
+   "sha256": "e711aded4b55c01f",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/inder.vbs",
+   "size": 6546,
+   "url": "scripts/inder.vbs",
+   "sha256": "d89e28ec07a0462b",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/inder_atleta.vbs",
+   "size": 5755,
+   "url": "scripts/inder_atleta.vbs",
+   "sha256": "a8bce298f32c19b0",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/inder_centaur.vbs",
+   "size": 6030,
+   "url": "scripts/inder_centaur.vbs",
+   "sha256": "a5a40e9497f5aa52",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/inder_skateboard.vbs",
+   "size": 6479,
+   "url": "scripts/inder_skateboard.vbs",
+   "sha256": "ef5ae0a300d66b20",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/ironballs.vbs",
+   "size": 3409,
+   "url": "scripts/ironballs.vbs",
+   "sha256": "4de0f4e7fd322b3a",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/joctronic.vbs",
+   "size": 5053,
+   "url": "scripts/joctronic.vbs",
+   "sha256": "2c0d8f1b92725cfa",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/juegos.vbs",
+   "size": 4461,
+   "url": "scripts/juegos.vbs",
+   "sha256": "9e0593956bd85887",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/juegos2.vbs",
+   "size": 4459,
+   "url": "scripts/juegos2.vbs",
+   "sha256": "557dcae5f185e2e4",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/jvh.vbs",
+   "size": 5048,
+   "url": "scripts/jvh.vbs",
+   "sha256": "17c564695b4cf48b",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/lancelot.vbs",
+   "size": 4561,
+   "url": "scripts/lancelot.vbs",
+   "sha256": "184d01387fca5d5b",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/mac.vbs",
+   "size": 4509,
+   "url": "scripts/mac.vbs",
+   "sha256": "2131c1fba347f593",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/mrgame.vbs",
+   "size": 4578,
+   "url": "scripts/mrgame.vbs",
+   "sha256": "d44e6e1091be2800",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/nuova.vbs",
+   "size": 5407,
+   "url": "scripts/nuova.vbs",
+   "sha256": "afd4495f1185e5fd",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/peyper.vbs",
+   "size": 4477,
+   "url": "scripts/peyper.vbs",
+   "sha256": "dad66320626cd4ff",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/playbar.vbs",
+   "size": 5482,
+   "url": "scripts/playbar.vbs",
+   "sha256": "e3d176ea31a2ee36",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/s11.vbs",
+   "size": 6417,
+   "url": "scripts/s11.vbs",
+   "sha256": "1455c6e3bcbde8ae",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/s4.vbs",
+   "size": 6817,
+   "url": "scripts/s4.vbs",
+   "sha256": "28f0828fccff68a2",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/s6.vbs",
+   "size": 6978,
+   "url": "scripts/s6.vbs",
+   "sha256": "7412ba99a6291f44",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/s7.vbs",
+   "size": 6852,
+   "url": "scripts/s7.vbs",
+   "sha256": "85234f3a0d6d1ff9",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/s8_StillCrazy.vbs",
+   "size": 4792,
+   "url": "scripts/s8_StillCrazy.vbs",
+   "sha256": "469b5ae0f390d7ba",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/sam.vbs",
+   "size": 11581,
+   "url": "scripts/sam.vbs",
+   "sha256": "06b3c814f63df109",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/sega.vbs",
+   "size": 6739,
+   "url": "scripts/sega.vbs",
+   "sha256": "c2f43e733a3cbf65",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/sega2.vbs",
+   "size": 5213,
+   "url": "scripts/sega2.vbs",
+   "sha256": "99c7618fc93e29de",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/sleic.vbs",
+   "size": 4456,
+   "url": "scripts/sleic.vbs",
+   "sha256": "bc9837a4fef0f8b7",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/solarwars.vbs",
+   "size": 4486,
+   "url": "scripts/solarwars.vbs",
+   "sha256": "0fbf826b197e73c6",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/spinball.vbs",
+   "size": 6400,
+   "url": "scripts/spinball.vbs",
+   "sha256": "11ec8f274cf2f271",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/stern.vbs",
+   "size": 6646,
+   "url": "scripts/stern.vbs",
+   "sha256": "e99c233a108886df",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/sys80.vbs",
+   "size": 6825,
+   "url": "scripts/sys80.vbs",
+   "sha256": "cce0af3dc25baa0c",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/taito.vbs",
+   "size": 6256,
+   "url": "scripts/taito.vbs",
+   "sha256": "4b70ab54d121d711",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/vbsdoc_outdated.html",
+   "size": 419259,
+   "url": "scripts/vbsdoc_outdated.html",
+   "sha256": "2140968e9c1c2312",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/wpc_ph.vbs",
+   "size": 6250,
+   "url": "scripts/wpc_ph.vbs",
+   "sha256": "79fe664899548e3e",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/zac.vbs",
+   "size": 3728,
+   "url": "scripts/zac.vbs",
+   "sha256": "93c8081eee43860c",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/zac1.vbs",
+   "size": 3401,
+   "url": "scripts/zac1.vbs",
+   "sha256": "751bc5708cac5d1e",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/zac2.vbs",
+   "size": 5760,
+   "url": "scripts/zac2.vbs",
+   "sha256": "5ff13f4ea3b35d0d",
+   "gzip": true
+  },
+  {
+   "path": "/scripts/zacproto.vbs",
+   "size": 4044,
+   "url": "scripts/zacproto.vbs",
+   "sha256": "f08b621286081905",
+   "gzip": true
+  }
+ ]
+}
