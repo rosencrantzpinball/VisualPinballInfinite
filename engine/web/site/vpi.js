@@ -613,7 +613,10 @@ async function main() {
   try {
     lastVisit = JSON.parse(localStorage.getItem(lastKey) || 'null');
   } catch {}
+  // once the page is leaving, nothing more: the browser may tell it it's hidden after it said goodbye
+  let leaving = false;
   const reached = (stage, extra = {}) => {
+    if (leaving) return;
     try {
       localStorage.setItem(lastKey, JSON.stringify({ stage, at: new Date().toISOString(), ...extra }));
     } catch {}
@@ -980,6 +983,7 @@ async function main() {
   });
   window.addEventListener('pagehide', () => {
     reached('closed');
+    leaving = true;
     files.save();
     // the graphics card's memory let go at once, not when the browser gets round to it
     device.destroy();
