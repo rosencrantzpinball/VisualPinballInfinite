@@ -14,38 +14,43 @@
  "files": [
   {
    "path": "/table/CREDITS.txt",
-   "size": 1812,
+   "size": 2080,
    "url": "table/CREDITS.txt",
-   "sha256": "b9f367875367c465",
+   "sha256": "e5de646ffcdf167a",
    "gzip": true
   },
   {
    "path": "/table/README.txt",
-   "size": 6615,
+   "size": 9482,
    "url": "table/README.txt",
-   "sha256": "f6df1590d4412b57",
+   "sha256": "1ddf270310d11e96",
    "gzip": true
   },
   {
    "path": "/table/Symphony IX - The Machine of Joy (Original 2026).vpx",
-   "size": 70914048,
+   "size": 89255936,
    "parts": [
     {
      "url": "table/Symphony%20IX%20-%20The%20Machine%20of%20Joy%20%28Original%202026%29.vpx.000",
      "size": 25165824,
-     "sha256": "7cf5a4441cab4664",
+     "sha256": "791c35c28b49526d",
      "gzip": true
     },
     {
      "url": "table/Symphony%20IX%20-%20The%20Machine%20of%20Joy%20%28Original%202026%29.vpx.001",
      "size": 25165824,
-     "sha256": "93cb9840e268eeb7",
+     "sha256": "960449a3bf431bbe",
      "gzip": true
     },
     {
      "url": "table/Symphony%20IX%20-%20The%20Machine%20of%20Joy%20%28Original%202026%29.vpx.002",
-     "size": 20582400,
-     "sha256": "e9cba92caa9c8511",
+     "size": 25165824,
+     "sha256": "8050d362df91a89a"
+    },
+    {
+     "url": "table/Symphony%20IX%20-%20The%20Machine%20of%20Joy%20%28Original%202026%29.vpx.003",
+     "size": 13758464,
+     "sha256": "6b25e7584085c4c9",
      "gzip": true
     }
    ]
