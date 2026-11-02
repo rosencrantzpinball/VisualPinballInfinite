@@ -958,6 +958,7 @@ async function main() {
   // touches: each holds a key down (a flipper, or a button of the bar) until it lifts
   const holding = new Map(); // a key's scancode: how many touches hold it
   const touches = new Map(); // a touch's pointerId: what it does
+  const pressed = new Set(); // the keyboard's keys the player has down
   const hold = (code, down) => {
     const was = holding.get(code) ?? 0;
     const n = Math.max(0, was + (down ? 1 : -1));
@@ -965,11 +966,14 @@ async function main() {
     if (!was && n) x.vpi_web_key(code, 1, 0);
     if (was && !n) x.vpi_web_key(code, 0, 0);
   };
-  // every touch let go: one the browser takes over never lifts
+  // every touch and key let go: a touch the browser takes over never lifts, and a key let go while the
+  // page hasn't the keyboard never comes up (SDL lets the keys go as its window loses the keyboard)
   const letGo = () => {
     for (const [code, n] of holding) if (n) x.vpi_web_key(code, 0, 0);
+    for (const code of pressed) x.vpi_web_key(code, 0, 0);
     holding.clear();
     touches.clear();
+    pressed.clear();
     document.querySelectorAll('#touch .down').forEach((p) => p.classList.remove('down'));
   };
   let hinted = false;
@@ -1022,16 +1026,30 @@ async function main() {
     device.destroy();
   });
 
-  // keys and mouse
+  // keys and mouse. A key reaches the player as SDL hands keys on: pressed while it's down, a repeat
+  // (whatever the browser says); let go while it's up, nothing. Windows sends no key-up for the Shift let
+  // go first while both are held, and the one it sends as the other lifts is the other's: there, as GLFW
+  // does, a Shift let go lets both go (the flipper let go first drops only as the other does)
+  const windows = /^Win/.test(navigator.userAgentData?.platform ?? navigator.platform ?? '');
+  const shifts = [SCANCODES.ShiftLeft, SCANCODES.ShiftRight];
   const key = (e, down) => {
     const code = SCANCODES[e.code];
-    if (code === undefined || e.ctrlKey || e.metaKey) return;
+    // a press with Ctrl or ⌘ held is the browser's (a shortcut), a key let go the player's still
+    if (code === undefined || (down && (e.ctrlKey || e.metaKey))) return;
     if (!playing) {
       if (down && overlay.hidden) go();
       return;
     }
     e.preventDefault();
-    x.vpi_web_key(code, down ? 1 : 0, e.repeat ? 1 : 0);
+    if (down) {
+      x.vpi_web_key(code, 1, pressed.has(code) ? 1 : 0);
+      pressed.add(code);
+    } else if (pressed.delete(code)) {
+      x.vpi_web_key(code, 0, 0);
+      if (windows && shifts.includes(code)) {
+        for (const s of shifts) if (pressed.delete(s)) x.vpi_web_key(s, 0, 0);
+      }
+    }
   };
   window.addEventListener('keydown', (e) => key(e, true));
   window.addEventListener('keyup', (e) => key(e, false));

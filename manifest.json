@@ -3,13 +3,13 @@
  "byline": "An original pinball table \u00b7 Visual Pinball Infinite in the browser",
  "id": "symphony-ix-the-machine-of-joy-original-2026",
  "table": "/table/Symphony IX - The Machine of Joy (Original 2026).vpx",
- "build": "029b31b4b011",
+ "build": "bf0a1b0a9e37",
  "program": {
   "url": "vpi.wasm",
   "sha256": "7f6b29146ab45a4a",
   "gzip": true
  },
- "source": "source/vpi-029b31b4b011.tar.gz",
+ "source": "source/vpi-bf0a1b0a9e37.tar.gz",
  "streamSounds": 2.0,
  "files": [
   {
