@@ -178,12 +178,17 @@ pub unsafe extern "C" fn SDL_GetScancodeName(scancode: SDL_Scancode) -> *const c
         static CACHE: RefCell<Vec<(u32, std::ffi::CString)>> = const { RefCell::new(Vec::new()) };
     }
     let code = scancode.0 as u32;
-    let Some(&(_, name)) = NAMES.iter().find(|(c, _)| *c == code) else { return c"".as_ptr() };
     CACHE.with(|c| {
         let mut c = c.borrow_mut();
         if let Some((_, s)) = c.iter().find(|(k, _)| *k == code) {
             return s.as_ptr();
         }
+        // the page's name for a key it hands on as another (`VPI_KEY_NAMES`, `<scancode>=<name>` split by `;`:
+        // Windows' Caps Lock and Enter, heard as the Shifts), else SDL's
+        let page = std::env::var("VPI_KEY_NAMES").ok().and_then(|names| {
+            names.split(';').find_map(|pair| pair.split_once('=').filter(|(k, _)| k.trim().parse::<u32>().ok() == Some(code)).map(|(_, n)| n.trim().to_string()))
+        });
+        let Some(name) = page.or_else(|| NAMES.iter().find(|(k, _)| *k == code).map(|(_, n)| (*n).to_string())) else { return c"".as_ptr() };
         c.push((code, std::ffi::CString::new(name).unwrap_or_default()));
         c.last().map_or(c"".as_ptr(), |(_, s)| s.as_ptr())
     })

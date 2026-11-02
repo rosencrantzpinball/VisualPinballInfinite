@@ -13,10 +13,12 @@ What plays in the browser:
   IX's site) are kept as their files and decoded as they play, music above all; the shorter ones, a flipper's or a
   bumper's, are decoded as the table loads and start at once.
 - **Keyboard, mouse and gamepads:** the keys as on the desktop (Shift flips, Enter plunges, 1 starts, 5 coins, Z, / and
-  Space nudge, Esc the pause menu); any gamepad the browser knows as a standard one, with VPX's gamepad layout (the
-  triggers flip, the staged flippers past two thirds, A launches, B starts, Y coins, Back the menu, the left stick
-  nudges, the right stick is the plunger) and rumble where the browser has it. The settings' `[Input]` mappings count
-  as on the desktop.
+  Space nudge, Esc the pause menu), but on Windows Caps Lock and Enter flip and Shift plunges: Windows loses a Shift's
+  key-up while the other is held, and asks about Sticky Keys after five Shift presses in a row. Any gamepad the browser
+  knows as a standard one plays with VPX's gamepad layout (the triggers flip, the staged flippers past two thirds, A
+  launches, B starts, Y coins, Back the menu, the left stick nudges, the right stick is the plunger) and rumbles where
+  the browser has it. The settings' `[Input]` mappings count as on the desktop (on Windows, Caps Lock and Enter as the
+  Shifts they stand for, Shift as Enter).
 - **Touch, on a phone or tablet:** the left and right halves of the screen hold the flippers; Launch (bottom right)
   pulls the plunger back while held and lets it go; the bar along the top has Menu, Coin, Start and Nudge. With the
   pause menu up, a tap chooses, a drag up or down scrolls, a drag sideways moves a bar. Held upright, the desktop view

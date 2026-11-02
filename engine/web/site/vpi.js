@@ -494,6 +494,15 @@ const SCANCODES = (() => {
   return m;
 })();
 
+// Windows' keys for the table: Caps Lock and Enter flip, either Shift plunges. Windows loses the key-up of a Shift
+// let go while the other is held (see `key` below), and asks about Sticky Keys after five Shift presses in a row;
+// Caps Lock and Enter sit at the keyboard's edges as the Shifts do. The player hears each as the key it stands for
+// (the Shifts flip there, Enter plunges: its settings, its menu and the table's script as on the desktop) and is told
+// their names (`VPI_KEY_NAMES`, for the pause menu's Controls page)
+const WINDOWS = /^Win/.test(navigator.userAgentData?.platform ?? navigator.platform ?? '');
+const LAYOUT = WINDOWS ? { CapsLock: SCANCODES.ShiftLeft, Enter: SCANCODES.ShiftRight, ShiftLeft: SCANCODES.Enter, ShiftRight: SCANCODES.Enter } : {};
+const LAYOUT_NAMES = WINDOWS ? `${SCANCODES.ShiftLeft}=CapsLock;${SCANCODES.ShiftRight}=Return;${SCANCODES.Enter}=Shift` : '';
+
 // ---- sound: Web Audio, fed each frame from the player's mixer ----
 
 const WORKLET = `
@@ -693,6 +702,10 @@ async function main() {
     $('touch-keys').hidden = false;
     if (!document.fullscreenEnabled && !report().touch.standalone && /iPhone|iPod/.test(navigator.userAgent)) $('home-hint').hidden = false;
   }
+  if (WINDOWS) {
+    $('flip-keys').innerHTML = '<kbd>Caps Lock</kbd> <kbd>Enter</kbd>';
+    $('plunge-keys').innerHTML = '<kbd>Shift</kbd>';
+  }
 
   if (!navigator.gpu) {
     status('This browser has no WebGPU: Visual Pinball Infinite needs a recent Chrome, Edge, Safari (iOS 26 on an iPhone or iPad) or Firefox.');
@@ -886,6 +899,7 @@ async function main() {
   live.view = view ?? 'settings';
   const env = { VPI_TABLE: manifest.table, VPI_DATA: '/data', VPI_TABLE_SETTINGS: '/data/table-settings', HOME: '/data' };
   if (view) env.VPI_VIEW = view;
+  if (LAYOUT_NAMES) env.VPI_KEY_NAMES = LAYOUT_NAMES;
   // `?pictures=program`: the table's pictures decoded by the program, not the browser
   if (params.get('pictures') === 'program') env.VPI_PICTURES = 'program';
   // sounds longer than this many seconds kept as their files and decoded as they play (music, mostly), the
@@ -1029,11 +1043,11 @@ async function main() {
   // keys and mouse. A key reaches the player as SDL hands keys on: pressed while it's down, a repeat
   // (whatever the browser says); let go while it's up, nothing. Windows sends no key-up for the Shift let
   // go first while both are held, and the one it sends as the other lifts is the other's: there, as GLFW
-  // does, a Shift let go lets both go (the flipper let go first drops only as the other does)
-  const windows = /^Win/.test(navigator.userAgentData?.platform ?? navigator.platform ?? '');
-  const shifts = [SCANCODES.ShiftLeft, SCANCODES.ShiftRight];
+  // does, a Shift let go lets both go (what the one let go first holds lets go only as the other does)
+  const shifts = ['ShiftLeft', 'ShiftRight'];
   const key = (e, down) => {
-    const code = SCANCODES[e.code];
+    // the key the player hears for it: Windows' own keys (`LAYOUT`) as the ones they stand for
+    const code = LAYOUT[e.code] ?? SCANCODES[e.code];
     // a press with Ctrl or ⌘ held is the browser's (a shortcut), a key let go the player's still
     if (code === undefined || (down && (e.ctrlKey || e.metaKey))) return;
     if (!playing) {
@@ -1046,8 +1060,11 @@ async function main() {
       pressed.add(code);
     } else if (pressed.delete(code)) {
       x.vpi_web_key(code, 0, 0);
-      if (windows && shifts.includes(code)) {
-        for (const s of shifts) if (pressed.delete(s)) x.vpi_web_key(s, 0, 0);
+      if (WINDOWS && shifts.includes(e.code)) {
+        for (const s of shifts) {
+          const c = LAYOUT[s] ?? SCANCODES[s];
+          if (pressed.delete(c)) x.vpi_web_key(c, 0, 0);
+        }
       }
     }
   };
