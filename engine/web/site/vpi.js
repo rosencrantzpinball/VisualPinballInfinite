@@ -598,7 +598,8 @@ async function unzipped(res) {
 // ---- the page ----
 
 async function main() {
-  const manifest = await (await fetch('manifest.json')).json();
+  // the host's latest, always: the files it names are checked against it as they come
+  const manifest = await (await fetch('manifest.json', { cache: 'no-cache' })).json();
   document.title = manifest.title;
   $('title').textContent = manifest.title;
   if (manifest.byline) $('byline').textContent = manifest.byline;
@@ -789,19 +790,25 @@ async function main() {
   const cache = await globalThis.caches?.open(`vpi:${manifest.id}`).catch(() => null);
   const kept = new Set();
   const fetchStarted = performance.now();
-  const piece = async (url, size, sha, into, at) => {
-    const key = sha ? new URL(`${url}?v=${sha}`, location.href).href : null;
-    if (key) kept.add(key);
-    let res = key && cache ? await cache.match(key).catch(() => null) : null;
-    const hit = !!res;
-    res ??= await fetch(url);
-    if (!res.ok) throw new Error(`${url}: ${res.status}`);
+  // whether the bytes read are those the manifest names (its hash of them), where the browser can hash
+  const named = async (into, at, size, content) => {
+    if (!content || !globalThis.crypto?.subtle) return true;
+    const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', into.subarray(at, at + size)));
+    return [...hash.subarray(0, 8)].map((b) => b.toString(16).padStart(2, '0')).join('') === content;
+  };
+  // reads `res` into `into` at `at`, counted in the progress: how many bytes, or -1 (uncounted) when
+  // it's longer than `size`
+  const fill = async (res, size, into, at) => {
     const reader = (await unzipped(res)).getReader();
     let n = 0;
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      if (n + value.length > size) throw new Error(`${url}: bigger than the manifest says`);
+      if (n + value.length > size) {
+        reader.cancel().catch(() => {});
+        got -= n;
+        return -1;
+      }
       into.set(value, at + n);
       n += value.length;
       got += value.length;
@@ -811,9 +818,35 @@ async function main() {
         status(`Fetching the table: ${Math.round(got / 1e6)} of ${Math.round(total / 1e6)} MB…`);
       }
     }
-    if (n !== size) throw new Error(`${url}: ${n} bytes, not the ${size} the manifest says`);
-    if (hit) fromCache += size;
-    else if (key && cache) await cache.put(key, new Response(into.slice(at, at + size))).catch(() => {});
+    return n;
+  };
+  const piece = async (url, size, sha, content, into, at) => {
+    const key = sha ? new URL(`${url}?v=${sha}`, location.href).href : null;
+    if (key) kept.add(key);
+    // kept from an earlier visit, when it's whole and what the manifest says
+    const keptCopy = key && cache ? await cache.match(key).catch(() => null) : null;
+    if (keptCopy) {
+      const n = await fill(keptCopy, size, into, at);
+      if (n === size && (await named(into, at, size, content))) {
+        fromCache += size;
+        return;
+      }
+      if (n > 0) got -= n;
+      cache.delete(key).catch(() => {});
+    }
+    // else from the host, by this version's own address; and once more, past every cache, when what
+    // came isn't what the manifest says (a cache's older copy, the site having just changed: GitHub
+    // Pages' lets browsers keep a file ten minutes, and its own cache goes by the address without `?v`)
+    for (let attempt = 0; ; attempt++) {
+      const res = await fetch(key ?? url, attempt ? { cache: 'reload' } : {});
+      if (!res.ok) throw new Error(`${url}: ${res.status}`);
+      const n = await fill(res, size, into, at);
+      if (n === size && (await named(into, at, size, content))) break;
+      if (n > 0) got -= n;
+      if (attempt) throw new Error(`${url} isn't what the manifest says: the site may have just changed. Reload the page in a minute.`);
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+    if (key && cache) await cache.put(key, new Response(into.slice(at, at + size))).catch(() => {});
   };
   // `jobs`, `n` at a time
   const inTurn = async (jobs, n) => {
@@ -829,9 +862,9 @@ async function main() {
       await inTurn(f.parts.map((p) => {
         const from = at;
         at += p.size;
-        return () => piece(p.url, p.size, p.sha256, data, from);
+        return () => piece(p.url, p.size, p.sha256, p.content, data, from);
       }), 3);
-    } else await piece(f.url, f.size, f.sha256, data, 0);
+    } else await piece(f.url, f.size, f.sha256, f.content, data, 0);
     files.put(f.path, data, false);
   };
   // the small files eight at a time, the big ones (the table) after, one by one

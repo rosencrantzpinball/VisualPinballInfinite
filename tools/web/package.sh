@@ -84,6 +84,8 @@ import gzip, hashlib, json, os, re, sys, urllib.parse
 out, vpx, title, byline, build, source, stream = sys.argv[1:8]
 PIECE = 24 << 20
 digest = lambda data: hashlib.sha256(data).hexdigest()[:16]
+# each file's (or piece's) served bytes' hash names its version in the page's cache (`?v=`), and its contents'
+# hash (`content`) is what the page checks it fetched: a cache may hand an older copy just after the site changes
 # a file gzipped where that saves a twentieth or more (the page unzips it; hosts don't all compress), its bytes as served
 def served(path, data):
     z = gzip.compress(data, compresslevel=9, mtime=0)
@@ -104,11 +106,11 @@ for root, _, names in [w for top in ('table', 'scripts') for w in os.walk(os.pat
             for k, at in enumerate(range(0, len(data), PIECE)):
                 piece = data[at:at + PIECE]
                 bytes_, gz = served(f'{full}.{k:03d}', piece)
-                entry['parts'].append({'url': urllib.parse.quote(f'{rel}.{k:03d}'), 'size': len(piece), 'sha256': digest(bytes_), **({'gzip': True} if gz else {})})
+                entry['parts'].append({'url': urllib.parse.quote(f'{rel}.{k:03d}'), 'size': len(piece), 'sha256': digest(bytes_), 'content': digest(piece), **({'gzip': True} if gz else {})})
             os.remove(full)
         else:
             bytes_, gz = served(full, data)
-            entry.update(url=urllib.parse.quote(rel), sha256=digest(bytes_), **({'gzip': True} if gz else {}))
+            entry.update(url=urllib.parse.quote(rel), sha256=digest(bytes_), content=digest(data), **({'gzip': True} if gz else {}))
         files.append(entry)
 program_bytes, program_gz = served(os.path.join(out, 'vpi.wasm'), open(os.path.join(out, 'vpi.wasm'), 'rb').read())
 program = {'url': 'vpi.wasm', 'sha256': digest(program_bytes), **({'gzip': True} if program_gz else {})}
